@@ -17,34 +17,47 @@ def parse_payment(sig):
 def authorization(payload):
     a = (payload.get("payload") or {}).get("authorization") if isinstance(payload.get("payload"), dict) else None
     return a if isinstance(a, dict) else None
+NONCE_RE = re.compile(r"^0x[0-9a-fA-F]{64}$")
+ACCEPTED_FIELDS = ("scheme", "network", "asset", "payTo", "amount")
 def precheck(payload, req, now=None):
-    """None if acceptable, else a reason string. Only EIP-3009 (exact, transferWithAuthorization) payments are accepted; Permit2 is rejected."""
+    """None if acceptable, else a reason string. Only `exact` EIP-3009 transferWithAuthorization is accepted (Permit2 and anything
+    else rejected). `accepted` must carry all 5 fields equal to ours (addresses case-insensitive, the rest exact). Runs before the claim."""
     now = int(now if now is not None else time.time())
-    acc = payload.get("accepted")
-    if isinstance(acc, dict):
-        for k in ("scheme", "network", "asset", "payTo", "amount"):
-            if k in acc and str(acc[k]).lower() != str(req[k]).lower(): return f"accepted.{k}_mismatch"
     if is_permit2(payload): return "permit2_not_supported: pay with an EIP-3009 transferWithAuthorization (exact scheme)"
+    acc = payload.get("accepted")
+    if not isinstance(acc, dict): return "accepted_missing"
+    for k in ACCEPTED_FIELDS:
+        if acc.get(k) is None: return f"accepted.{k}_missing"
+        a, b = str(acc[k]), str(req[k])
+        if (a.lower() != b.lower()) if k in ("asset", "payTo") else (a != b): return f"accepted.{k}_mismatch"
+    if req["scheme"] != "exact": return "scheme_not_supported"
     a = authorization(payload)
     if a is None: return "eip3009_authorization_required"
     try:
-        if str(a.get("to", "")).lower() != req["payTo"].lower(): return "authorization_payee_mismatch"
-        if int(a.get("value", -1)) != int(req["amount"]): return "authorization_amount_mismatch"
-        if int(a.get("validAfter", 0)) > now: return "authorization_not_yet_valid"
-        if int(a.get("validBefore", 0)) < now + MIN_VALID_WINDOW: return "authorization_expired_or_expiring"
         if not ADDR_RE.match(str(a.get("from", ""))): return "authorization_bad_from"
+        if not NONCE_RE.match(str(a.get("nonce", ""))): return "authorization_bad_nonce"
+        if str(a.get("to", "")).lower() != req["payTo"].lower(): return "authorization_payee_mismatch"
+        if _int(a.get("value", -1)) != int(req["amount"]): return "authorization_amount_mismatch"
+        if _int(a.get("validAfter", 0)) > now: return "authorization_not_yet_valid"
+        if _int(a.get("validBefore", 0)) < now + MIN_VALID_WINDOW: return "authorization_expired_or_expiring"
     except (TypeError, ValueError): return "authorization_malformed"
     return None
+def _int(x):
+    if isinstance(x, bool) or not re.match(r"^-?\d+$", str(x)): raise ValueError("malformed")
+    return int(str(x))
 def is_permit2(payload):
     """Permit2 payloads carry no EIP-3009 nonce event, so the on-chain check could not bind the tx to this payment."""
     inner = payload.get("payload") if isinstance(payload.get("payload"), dict) else {}
     acc = payload.get("accepted") if isinstance(payload.get("accepted"), dict) else {}
     extra = acc.get("extra") if isinstance(acc.get("extra"), dict) else {}
     return any("permit2" in str(k).lower() for k in inner) or str(extra.get("assetTransferMethod", "")).lower() == "permit2"
-def replay_key(payload, sig):
+def replay_key(payload):
+    """(from, 32-byte nonce), lower-cased: the on-chain uniqueness unit of EIP-3009. Only called after precheck() passed."""
     a = authorization(payload)
-    if a and a.get("nonce") and a.get("from"): return "auth:" + str(a["from"]).lower() + ":" + str(a["nonce"]).lower()
-    return "sig:" + hashlib.sha256(sig.encode()).hexdigest()
+    return "auth:" + str(a["from"]).lower() + ":" + str(a["nonce"]).lower()
+def payload_hash(payload):
+    """sha256 of the canonical payload, stored with the claim for audit."""
+    return hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 class Replay:
     """Used payment authorizations, kept until their validBefore (+margin) or the TTL. claim() is an atomic check-and-set
     under a lock, so concurrent duplicates cannot race. Claims are never released: a signature is spent once it is seen."""
@@ -66,18 +79,32 @@ def expiry(payload, margin=60):
     except (KeyError, TypeError, ValueError): return None
 def nonce_of(payload):
     n = str((authorization(payload) or {}).get("nonce", ""))
-    return n if re.match(r"^0x[0-9a-fA-F]{1,64}$", n) else None
+    return n.lower() if NONCE_RE.match(n) else None
+FAIL_LIMITS = {"payer": 3, "ip": 10, "global": 200}
 class FailLimiter:
-    """Single-process, in-memory cooldown. Fine for one Python instance (tests, a single container); NOT for production
-    behind several instances, where each would keep its own counts. The Deno server keeps this state in KV."""
-    def __init__(s, limit=3, window=600): s.limit, s.window, s.m, s.lock = limit, window, {}, threading.Lock()
-    def blocked(s, who, now=None):
-        now = now or time.time()
-        with s.lock: return who is not None and len([t for t in s.m.get(who, []) if t > now - s.window]) >= s.limit
-    def fail(s, who, now=None):
-        if who is None: return
-        now = now or time.time()
-        with s.lock: s.m[who] = [t for t in s.m.get(who, []) if t > now - s.window] + [now]
+    """Failure cooldowns per scope (payer: settle failures of the verified signer; ip: verify + settle failures; global: all),
+    fixed buckets, blocked when current + previous bucket reach the limit (same rules as the Deno KV version).
+    Single-process, in-memory: fine for one Python instance (tests, a single container); NOT for production behind several
+    instances, where each would keep its own counts. The Deno server keeps these counters in KV."""
+    def __init__(s, limits=None, window=600): s.limits, s.window, s.m, s.lock = dict(limits or FAIL_LIMITS), window, {}, threading.Lock()
+    def _b(s, now): return int(now // s.window)
+    def count(s, scope, who, now=None):
+        now = time.time() if now is None else now; b = s._b(now)
+        with s.lock: return s.m.get((scope, who, b), 0) + s.m.get((scope, who, b - 1), 0)
+    def blocked(s, ids, now=None):
+        for sc in ("global", "ip", "payer"):
+            who = "*" if sc == "global" else ids.get(sc)
+            if who and s.count(sc, who, now) >= s.limits[sc]: return sc
+        return None
+    def fail(s, ids, now=None):
+        now = time.time() if now is None else now; b = s._b(now)
+        with s.lock:
+            for k in [k for k in s.m if k[2] < b - 1]: s.m.pop(k)
+            for sc in ("global", "ip", "payer"):
+                who = "*" if sc == "global" else ids.get(sc)
+                if who: s.m[(sc, who, b)] = s.m.get((sc, who, b), 0) + 1
+    def clear(s):
+        with s.lock: s.m.clear()
 def payer_of(payload):
     a = authorization(payload); f = str((a or {}).get("from", "")).lower()
     return f if ADDR_RE.match(f) else None

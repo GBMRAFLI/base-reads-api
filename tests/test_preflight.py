@@ -285,7 +285,7 @@ class T7(unittest.TestCase):
         p2 = {"x402Version": 2, "accepted": r, "payload": {"permit2Authorization": {"from": self.PAYER, "nonce": "1"}, "signature": "0x"}}
         acc = dict(r, extra=dict(r["extra"], assetTransferMethod="permit2"))
         for body, why in ((p2, "permit2_not_supported"), ({"x402Version": 2, "accepted": acc, "payload": {"authorization": {}}}, "permit2_not_supported"),
-                          ({"x402Version": 2, "payload": {"signature": "0x"}}, "eip3009_authorization_required")):
+                          ({"x402Version": 2, "accepted": r, "payload": {"signature": "0x"}}, "eip3009_authorization_required")):
             c, out, hd = self.run_paid(base64.b64encode(json.dumps(body).encode()).decode())
             self.assertEqual(c, 402); self.assertTrue(out["error"].startswith(why), out)
         self.assertEqual(self.calls, [])
@@ -309,6 +309,78 @@ class T7(unittest.TestCase):
             self.assertEqual(IX.required("/base/network", "evil.example/x?y")["resource"]["url"], "https://invalid-host/base/network")
             self.assertEqual(IX.required("/base/network", "h.example:8443")["resource"]["url"], "https://h.example:8443/base/network")
         finally: IX.PUBLIC = old
+class T10(T7):
+    """Auditor findings A1-A11 (Python mirror; see SECURITY.md)."""
+    def mk(self, acc=None, **auth):
+        r = IX.req_for("/base/network"); now = int(time.time())
+        a = {"from": self.PAYER, "to": r["payTo"], "value": r["amount"], "validAfter": str(now - 5), "validBefore": str(now + 300), "nonce": "0x" + os.urandom(32).hex()}
+        a.update(auth); return {"x402Version": 2, "accepted": r if acc is None else acc, "payload": {"signature": "0x", "authorization": a}}
+    def test_a1_a4_a5_precheck_exact_accepted_nonce(self):
+        r = IX.req_for("/base/network")
+        self.assertIsNone(IX.SG.precheck(self.mk(), r))
+        self.assertIsNone(IX.SG.precheck(self.mk(dict(r, payTo=r["payTo"].upper().replace("0X", "0x"))), r))
+        p = self.mk(); p.pop("accepted"); self.assertEqual(IX.SG.precheck(p, r), "accepted_missing")
+        for k in IX.SG.ACCEPTED_FIELDS:
+            acc = dict(r); acc.pop(k); self.assertEqual(IX.SG.precheck(self.mk(acc), r), f"accepted.{k}_missing")
+        self.assertEqual(IX.SG.precheck(self.mk(dict(r, scheme="EXACT")), r), "accepted.scheme_mismatch")
+        self.assertEqual(IX.SG.precheck(self.mk(dict(r, network="eip155:84532")), r), "accepted.network_mismatch")
+        for n in ("0x1", "0x" + "ab" * 31, "0x" + "zz" * 32, "ab" * 32, 7): self.assertEqual(IX.SG.precheck(self.mk(nonce=n), r), "authorization_bad_nonce")
+        n = "0x" + os.urandom(32).hex()
+        self.assertEqual(IX.SG.replay_key(self.mk(nonce=n.upper().replace("0X", "0x"))), IX.SG.replay_key(self.mk(nonce=n)))
+    def test_a1_reencoded_same_authorization_is_replay(self):
+        n = "0x" + os.urandom(32).hex(); self.assertEqual(self.run_paid(self.pay(nonce=n))[0], 200)
+        p = json.loads(base64.b64decode(self.pay(nonce=n))); re_enc = base64.b64encode(json.dumps({"payload": p["payload"], "accepted": p["accepted"], "x402Version": 2}).encode()).decode()
+        self.tx = "0x" + os.urandom(32).hex(); self.assertEqual(self.run_paid(re_enc)[0], 409)
+    def test_a6_rejected_payload_does_not_burn_nonce(self):
+        n = "0x" + os.urandom(32).hex()
+        self.assertEqual(self.run_paid(self.pay(nonce=n, value="1"))[0], 402); self.assertEqual(self.run_paid(self.pay(nonce=n))[0], 200)
+    def test_a2_payer_from_signed_authorization(self):
+        seen = []; att = "0x" + "66" * 20
+        self.settle = lambda: {"success": True, "transaction": self.tx, "payer": att, "network": IX.NETWORK, "extra": "<x>"}
+        self.check = lambda tx, r, payer: (seen.append(payer), {"settled": True})[1]
+        c, _, hd = self.run_paid(self.pay()); self.assertEqual(c, 200); self.assertEqual(seen, [self.PAYER])
+        pr = json.loads(base64.b64decode(hd["PAYMENT-RESPONSE"]))
+        self.assertEqual(sorted(pr), ["network", "payer", "success", "transaction"]); self.assertEqual(pr["payer"], self.PAYER)
+    def test_a3_limits_payer_ip_global(self):
+        L = IX.SG.FailLimiter({"payer": 3, "ip": 5, "global": 9}, 60); now = 1_000_000
+        for _ in range(3): L.fail({"payer": "p"}, now)
+        self.assertEqual(L.blocked({"payer": "p"}, now), "payer"); self.assertIsNone(L.blocked({"payer": "q"}, now)); self.assertIsNone(L.blocked({"payer": "p"}, now + 121))
+        for _ in range(5): L.fail({"ip": "1.2.3.4"}, now)
+        self.assertEqual(L.blocked({"ip": "1.2.3.4", "payer": "q"}, now), "ip"); L.fail({"ip": "5"}, now); self.assertEqual(L.blocked({"ip": "5"}, now), "global")
+        ths = [threading.Thread(target=L.fail, args=({"payer": "z"}, now)) for _ in range(50)]; [t.start() for t in ths]; [t.join() for t in ths]
+        self.assertEqual(L.count("payer", "z", now), 50)
+    def test_a3_verify_failures_count_per_ip_not_payer(self):
+        IX.fac = lambda p, body: {"isValid": False, "invalidReason": "invalid_exact_evm_payload_signature"}
+        for _ in range(10): self.assertEqual(IX.paid("/base/network", {}, "", self.pay(), "t", check=self.check, ip="9.9.9.9")[0], 402)
+        c, out, _ = IX.paid("/base/network", {}, "", self.pay(), "t", check=self.check, ip="9.9.9.9"); self.assertEqual((c, out["scope"]), (429, "ip"))
+        self.assertIsNone(IX.FAILS.blocked({"payer": self.PAYER.lower(), "ip": "8.8.8.8"}))
+    def test_a8_error_allowlist_and_rebuilt_payment_response(self):
+        self.assertEqual(IX.fac_err("insufficient_funds"), "insufficient_funds"); self.assertEqual(IX.fac_err("<script>"), "facilitator_error")
+        self.settle = lambda: {"success": False, "errorReason": "evil", "debug": "internal"}; self.chain = {"settled": False, "reason": "x"}
+        c, out, hd = self.run_paid(self.pay()); self.assertEqual((c, out["error"]), (402, "facilitator_error"))
+        self.assertEqual(json.loads(base64.b64decode(hd["PAYMENT-RESPONSE"])), {"success": False, "errorReason": "facilitator_error", "transaction": "", "network": IX.NETWORK, "payer": self.PAYER})
+    def test_a7_log_mode_refused_on_mainnet(self):
+        self.assertEqual(IX.onchain_mode("log", "eip155:8453"), "block"); self.assertEqual(IX.onchain_mode("log", "eip155:84532"), "log")
+        with self.assertRaises(SystemExit): IX.assert_onchain_mode("log", "eip155:8453")
+        old = IX.ONCHAIN_CHECK; IX.ONCHAIN_CHECK = "log"; self.chain = {"settled": False, "reason": "no_matching_usdc_transfer"}
+        try: self.assertEqual(self.run_paid(self.pay())[0], 402)
+        finally: IX.ONCHAIN_CHECK = old
+    def test_a10_iso_validation(self):
+        self.assertEqual(PF.iso_or_none("2026-10-14T12:00:21Z"), "2026-10-14T12:00:21Z")
+        for bad in ("2026-10-14", "2026-02-30T00:00:00Z", "2026-10-14T12:00:21+07:00", "<b>", 5, None): self.assertIsNone(PF.iso_or_none(bad))
+    def test_a11_pins(self):
+        root = os.path.join(os.path.dirname(__file__), "..")
+        self.assertRegex(open(os.path.join(root, "requirements.txt")).read(), r"(?m)^pycryptodome==\d+\.\d+\.\d+$")
+        self.assertRegex(open(os.path.join(root, "Dockerfile")).read(), r"(?m)^FROM python:[\w.-]+@sha256:[0-9a-f]{64}$")
+    def test_ssrf_review(self):
+        for ip in ("100.64.0.1", "::ffff:127.0.0.1", "::7f00:1", "64:ff9b::7f00:1", "2002:7f00:1::1", "2001:0:4136:e378::1", "169.254.169.254", "fd00::1", "192.0.0.8"):
+            self.assertFalse(PF.ip_allowed(ip), ip)
+        self.assertTrue(PF.ip_allowed("8.8.8.8")); self.assertTrue(PF.ip_allowed("2606:4700::1111"))
+        res = lambda h, p, *a: [(2, 1, 6, "", ("93.184.216.34", p))]
+        self.assertEqual(PF.check_url("https://example.com:22/x", res)[2], "port not allowed (443, 8443)")
+        self.assertEqual(PF.check_url("https://u:p@example.com/x", res)[2], "credentials in url not allowed")
+        self.assertIsNone(PF.check_url("https://example.com:8443/x", res)[2])
+        self.assertEqual(PF.check_url("https://100.64.0.1/x", lambda h, p, *a: [(2, 1, 6, "", ("100.64.0.1", p))])[2], "target resolves to a non-public address")
 class T8(unittest.TestCase):
     def test_well_known_and_root_facilitator(self):
         w = IX.well_known(); self.assertEqual((w["alg"], w["key_id"]), ("Ed25519", PF.public_key_info()["key_id"]))
@@ -335,11 +407,11 @@ class T9(unittest.TestCase):
         self.assertEqual(k["fingerprint_short"].replace(" ", ""), k["key_id"]); self.assertRegex(k["fingerprint_short"], r"^([0-9a-f]{4} ){3}[0-9a-f]{4}$")
         self.assertIn("created_at", k)
         os.environ["SIGNING_KEY_CREATED_AT"] = "2026-10-14T11:00:00Z"
-        os.environ["SIGNING_KEY_HISTORY"] = json.dumps([{"public_key_b64": base64.b64encode(b"\x01" * 32).decode(), "created_at": "2026-10-01", "retired_at": "2026-10-14"}, {"public_key_b64": "bad"}])
+        os.environ["SIGNING_KEY_HISTORY"] = json.dumps([{"public_key_b64": base64.b64encode(b"\x01" * 32).decode(), "created_at": "2026-10-01T00:00:00Z", "retired_at": "2026-10-14T00:00:00Z"}, {"public_key_b64": "bad"}])
         try:
             h = PF.key_history()
             self.assertEqual((h["current"]["status"], h["current"]["created_at"], h["current"]["key_id"]), ("active", "2026-10-14T11:00:00Z", k["key_id"]))
-            self.assertEqual(len(h["retired"]), 1); self.assertEqual((h["retired"][0]["status"], h["retired"][0]["retired_at"]), ("retired", "2026-10-14"))
+            self.assertEqual(len(h["retired"]), 1); self.assertEqual((h["retired"][0]["status"], h["retired"][0]["retired_at"]), ("retired", "2026-10-14T00:00:00Z"))
             self.assertNotIn("private", json.dumps(h).lower())
         finally: del os.environ["SIGNING_KEY_CREATED_AT"], os.environ["SIGNING_KEY_HISTORY"]
     def test_snapshot_meta_signed_metadata_only(self):

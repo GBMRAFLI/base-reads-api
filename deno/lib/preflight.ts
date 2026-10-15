@@ -14,7 +14,9 @@ export function ipAllowed(ip: string): boolean {
     if (/^(fe[89ab]|fc|fd|ff)/.test(s)) return false;                       // link-local, ULA, multicast
     const m = s.match(/^::ffff:(\d+\.\d+\.\d+\.\d+)$/); if (m) return ipAllowed(m[1]);
     if (s.startsWith("2001:db8") || s.startsWith("64:ff9b") || s.startsWith("100::")) return false;
-    return true;
+    if (s.startsWith("2002:") || /^2001:0{0,4}:/.test(s) || s.startsWith("::")) return false; // 6to4, Teredo, IPv4-compatible (embed IPv4)
+    return /^[23][0-9a-f]{0,3}:/.test(s);                                    // only global unicast 2000::/3
+
   }
   const [a, b] = v4(ip);
   if (a === 0 || a === 10 || a === 127 || a >= 224) return false;           // this-net, private, loopback, multicast+reserved
@@ -28,6 +30,7 @@ export function ipAllowed(ip: string): boolean {
   return true;
 }
 // Returns IPs, [] when the name does not exist, or null when DNS lookup itself is unavailable in the runtime.
+export const ALLOWED_PORTS = new Set(["443", "8443"]);
 export type Resolver = (host: string) => Promise<string[] | null>;
 export const dnsResolver: Resolver = async (host) => {
   const out: string[] = []; let usable = false;
@@ -42,6 +45,8 @@ export async function checkUrl(url: string, resolver: Resolver = dnsResolver): P
   let u: URL; try { u = new URL(url); } catch { return { u: null, err: "unparseable url" }; }
   if (u.protocol !== "https:" || !u.hostname) return { u: null, err: "url must be https://host/..." };
   if (url.length > 2048) return { u: null, err: "url too long" };
+  if (u.username || u.password) return { u: null, err: "credentials in url not allowed" };
+  if (u.port && !ALLOWED_PORTS.has(u.port)) return { u: null, err: "port not allowed (443, 8443)" };
   const host = u.hostname.replace(/^\[|\]$/g, "");
   const ips = isIpLiteral(host) ? [host] : await resolver(host);
   if (ips === null) return { u, err: null };   // no DNS API: rely on fetch (Deploy has no route to our private networks)
@@ -52,6 +57,16 @@ export async function checkUrl(url: string, resolver: Resolver = dnsResolver): P
 
 // ---------- probe (one unpaid GET, no redirects) ----------
 export type Fetcher = (u: string, init: RequestInit) => Promise<Response>;
+/** Read at most `cap` bytes of a body, then cancel the stream (never buffers an unbounded response). */
+async function readCapped(res: Response, cap: number): Promise<Uint8Array> {
+  const out = new Uint8Array(cap); let n = 0;
+  if (!res.body) return out.slice(0, 0);
+  const rd = res.body.getReader();
+  try {
+    while (n < cap) { const { value, done } = await rd.read(); if (done) break; const take = Math.min(value.length, cap - n); out.set(value.subarray(0, take), n); n += take; }
+  } catch { /* truncated */ } finally { rd.cancel().catch(() => {}); }
+  return out.slice(0, n);
+}
 export async function probe(u: URL, timeoutMs = 8000, f: Fetcher = fetch): Promise<[Record<string, unknown>, any]> {
   const t0 = performance.now();
   let res: Response;
@@ -61,7 +76,7 @@ export async function probe(u: URL, timeoutMs = 8000, f: Fetcher = fetch): Promi
     const name = (e as Error)?.name === "TimeoutError" ? "TimeoutError" : "ConnectionError";
     return [{ reachable: false, error_class: name, latency_ms: Math.round(performance.now() - t0) }, null];
   }
-  const buf = new Uint8Array(await res.arrayBuffer()).slice(0, 65536);
+  const buf = await readCapped(res, 65536);
   const lat = Math.round(performance.now() - t0);
   let ch: any = null;
   const pr = res.headers.get("payment-required");
@@ -161,7 +176,7 @@ export async function bazaarFacts(url: string, paytoList: string[], maxTrend = 1
     payout_wallet_reuse: wl, last_called_at: cur ? cur.lastCalledAt : null, payer_trend: trend };
 }
 
-export async function preflight(url: string, opts: { resolver?: Resolver; fetcher?: Fetcher; now?: number } = {}): Promise<[number, unknown]> {
+export async function preflight(url: string, opts: { resolver?: Resolver; fetcher?: Fetcher; now?: number; env?: (k: string) => string | undefined } = {}): Promise<[number, unknown]> {
   const { u, err } = await checkUrl(url, opts.resolver);
   if (!u) return [400, { error: err }];
   const base = { schema: SCHEMA, target: url, checked_at: isSoc(opts.now), disclaimer: "Deterministic observations only. Not advice to pay, buy or sell." };
@@ -171,6 +186,6 @@ export async function preflight(url: string, opts: { resolver?: Resolver; fetche
   const [valid, problems, acc] = validateChallenge(ch);
   const facts = { ...base, reachability: reach, challenge: { valid, problems, accepts: acc },
     bazaar: await bazaarFacts(url, acc.map((a) => a.payTo as string).filter(Boolean)) };
-  return [200, await sign(facts)];
+  return [200, await sign(facts, opts.env)];
 }
 function isSoc(now?: number) { return isoSec(now ?? Date.now()); }

@@ -261,7 +261,7 @@ Deno.test("well-known, key history, fingerprints, signed snapshot metadata, faci
   assert(w.fingerprint.startsWith("SHA256:")); assertEquals(w.facilitator, root(env).facilitator); assertEquals(root(env).facilitator.name, "PayAI");
   const cdp = (k: string) => k === "FACILITATOR" ? "https://api.cdp.coinbase.com/platform/v2/x402" : env(k);
   assertEquals(root(cdp).facilitator, { name: "CDP", url: "https://api.cdp.coinbase.com/platform/v2/x402", auth: "none" });
-  const hist = (k: string) => k === "SIGNING_KEY_HISTORY" ? JSON.stringify([{ public_key_b64: btoa("\x01".repeat(32)), created_at: "2026-10-01", retired_at: "2026-10-14" }, { public_key_b64: "bad" }])
+  const hist = (k: string) => k === "SIGNING_KEY_HISTORY" ? JSON.stringify([{ public_key_b64: btoa("\x01".repeat(32)), created_at: "2026-10-01T00:00:00Z", retired_at: "2026-10-14T00:00:00Z" }, { public_key_b64: "bad" }])
     : k === "SIGNING_KEY_CREATED_AT" ? "2026-10-14T11:00:00Z" : env(k);
   const h: any = await keyHistory(hist);
   assertEquals([h.current.status, h.current.created_at, h.retired.length, h.retired[0].status], ["active", "2026-10-14T11:00:00Z", 1, "retired"]);
@@ -277,19 +277,134 @@ Deno.test("Permit2 and non-EIP-3009 payloads rejected before the facilitator", a
   const r = reqFor("/base/network", env);
   const p2 = { x402Version: 2, accepted: r, payload: { permit2Authorization: { from: PAYER, nonce: "1" }, signature: "0x" } };
   const viaExtra = { x402Version: 2, accepted: { ...r, extra: { ...r.extra, assetTransferMethod: "permit2" } }, payload: { authorization: {} } };
-  for (const [body, why] of [[p2, "permit2_not_supported"], [viaExtra, "permit2_not_supported"], [{ x402Version: 2, payload: { signature: "0x" } }, "eip3009_authorization_required"]] as const) {
+  for (const [body, why] of [[p2, "permit2_not_supported"], [viaExtra, "permit2_not_supported"], [{ x402Version: 2, accepted: r, payload: { signature: "0x" } }, "eip3009_authorization_required"]] as const) {
     const [c, out] = await t.call(btoa(JSON.stringify(body)));
     assertEquals(c, 402); assert(String(out.error).startsWith(why), out.error);
   }
   assertEquals(t.calls, []);
 });
-Deno.test("FailLimiter state lives in KV: shared by separate instances, atomic under concurrency", async () => {
-  const a = new SG.FailLimiter(3, 60_000), b = new SG.FailLimiter(3, 60_000); await a.clear();
-  const who = "0x" + "aa".repeat(20);
-  await Promise.all([a.fail(who), b.fail(who), a.fail(who)]); // concurrent writers, no lost update
-  assert(await b.blocked(who)); assert(!(await b.blocked("0x" + "bb".repeat(20))));
-  assert(!(await b.blocked(who, Date.now() + 61_000))); // window expiry
-  await a.clear(); assert(!(await b.blocked(who)));
+Deno.test("A3 FailLimiter: KV counters per payer/ip/global, shared by instances, atomic, expiring", async () => {
+  const lim = { payer: 3, ip: 5, global: 9 };
+  const a = new SG.FailLimiter(lim, 60_000), b = new SG.FailLimiter(lim, 60_000); await a.clear();
+  const who = "0x" + "aa".repeat(20), now = Date.now();
+  await Promise.all([a.fail({ payer: who }, now), b.fail({ payer: who }, now), a.fail({ payer: who }, now)]); // no lost update
+  assertEquals(await b.count("payer", who, now), 3); assertEquals(await b.blocked({ payer: who }, now), "payer");
+  assertEquals(await b.blocked({ payer: "0x" + "bb".repeat(20) }, now), null);
+  assertEquals(await b.blocked({ payer: who }, now + 121_000), null); // two windows later: expired
+  for (let i = 0; i < 5; i++) await a.fail({ ip: "1.2.3.4" }, now);
+  assertEquals(await b.blocked({ ip: "1.2.3.4", payer: "0x" + "cc".repeat(20) }, now), "ip");
+  assertEquals(await b.blocked({ ip: "5.6.7.8" }, now), null); await b.fail({ ip: "5.6.7.8" }, now);
+  assertEquals(await b.blocked({ ip: "5.6.7.8" }, now), "global"); // 9 failures in total, from any source
+  const e = await (await import("../lib/store.ts")).kv().then((k) => k.get(["fail", "ip", "1.2.3.4", Math.floor(now / 60_000)]));
+  assert(e.value instanceof Deno.KvU64);
+  await a.clear(); assertEquals(await b.blocked({ payer: who, ip: "1.2.3.4" }, now), null);
+});
+Deno.test("A3 verify failures are counted per IP (not per unverified payer); settle failures per payer", async () => {
+  await resetGuards();
+  const fac = async (p: string) => p === "/verify" ? { isValid: false, invalidReason: "invalid_exact_evm_payload_signature" } : {};
+  for (let i = 0; i < 10; i++) {
+    const r = await handler(new Request("http://h/base/network", { headers: { "PAYMENT-SIGNATURE": pay() } }), { env, fac, ip: "9.9.9.9" });
+    assertEquals(r.status, 402); await r.body?.cancel();
+  }
+  const r = await handler(new Request("http://h/base/network", { headers: { "PAYMENT-SIGNATURE": pay() } }), { env, fac, ip: "9.9.9.9" });
+  assertEquals(r.status, 429); assertEquals((await r.json()).scope, "ip");
+  const t = rig({ v: { settled: true } }); const [c] = await t.call(pay()); assertEquals(c, 200); // same payer, other IP: fine
+  await resetGuards();
+  const t2 = rig({ v: { settled: false, reason: "x" } }, () => ({ success: false, errorReason: "insufficient_funds" }));
+  for (let i = 0; i < 3; i++) assertEquals((await t2.call(pay()))[0], 402);
+  const [c3, o3] = await t2.call(pay()); assertEquals([c3, o3.scope], [429, "payer"]);
+  await resetGuards();
+});
+Deno.test("A1/A4/A5 precheck: exact accepted match (all 5 fields), EIP-3009 only, 32-byte nonce", () => {
+  const r = reqFor("/base/network", env); const now = Math.floor(Date.now() / 1000);
+  const mk = (acc: any, auth: any = {}) => ({ x402Version: 2, accepted: acc, payload: { signature: "0x", authorization: { from: PAYER, to: r.payTo, value: r.amount, validAfter: String(now - 5), validBefore: String(now + 300), nonce: rnd(), ...auth } } });
+  assertEquals(SG.precheck(mk(r), r), null);
+  assertEquals(SG.precheck(mk({ ...r, payTo: r.payTo.toUpperCase().replace("0X", "0x") }), r), null); // addresses case-insensitive
+  assertEquals(SG.precheck({ ...mk(r), accepted: undefined }, r), "accepted_missing");
+  for (const k of SG.ACCEPTED_FIELDS) {
+    const acc: any = { ...r }; delete acc[k]; assertEquals(SG.precheck(mk(acc), r), `accepted.${k}_missing`);
+  }
+  assertEquals(SG.precheck(mk({ ...r, scheme: "EXACT" }), r), "accepted.scheme_mismatch");
+  assertEquals(SG.precheck(mk({ ...r, amount: r.amount + "0" }), r), "accepted.amount_mismatch");
+  assertEquals(SG.precheck(mk({ ...r, network: "eip155:84532" }), r), "accepted.network_mismatch");
+  for (const n of ["0x1", "0x" + "ab".repeat(31), "0x" + "zz".repeat(32), "ab".repeat(32), 7]) assertEquals(SG.precheck(mk(r, { nonce: n }), r), "authorization_bad_nonce");
+  assertEquals(SG.precheck({ ...mk(r), payload: { signature: "0x" } }, r), "eip3009_authorization_required");
+  const n = rnd(); assertEquals(SG.replayKey(mk(r, { nonce: n.toUpperCase().replace("0X", "0x") })), SG.replayKey(mk(r, { nonce: n })));
+});
+Deno.test("A1 replay key ignores encoding: re-ordered JSON of the same authorization is a replay", async () => {
+  await resetGuards(); const t = rig({ v: { settled: true } }); const n = rnd();
+  assertEquals((await t.call(pay("/base/network", {}, n)))[0], 200);
+  const p = JSON.parse(atob(pay("/base/network", {}, n))); const re = btoa(JSON.stringify({ payload: p.payload, accepted: p.accepted, x402Version: 2 }));
+  t.newTx(); assertEquals((await t.call(re))[0], 409);
+});
+Deno.test("A6 precheck runs before the claim: a rejected payload does not burn its nonce", async () => {
+  await resetGuards(); const t = rig({ v: { settled: true } }); const n = rnd();
+  assertEquals((await t.call(pay("/base/network", { value: "1" }, n)))[0], 402);
+  assertEquals((await t.call(pay("/base/network", {}, n)))[0], 200);
+});
+Deno.test("A2 payer comes from the signed authorization, never from the facilitator", async () => {
+  await resetGuards(); const seen: (string | undefined)[] = []; const ATT = "0x" + "66".repeat(20);
+  const fac = async (p: string) => p === "/verify" ? { isValid: true } : { success: true, transaction: rnd(), payer: ATT, network: "eip155:8453", extra: "<x>" };
+  const rpc = async (m: string) => m === "eth_getBlockByNumber" ? { number: "0x10", timestamp: "0x" + Math.floor(Date.now() / 1000).toString(16), baseFeePerGas: "0x1" } : "0x1";
+  const r = await handler(new Request("http://h/base/network", { headers: { "PAYMENT-SIGNATURE": pay() } }),
+    { env, fac, rpc, background: () => {}, check: async (_tx, _r, payer) => { seen.push(payer); return { settled: true }; } });
+  assertEquals(r.status, 200); await r.body?.cancel(); assertEquals(seen, [PAYER]);
+  const pr = JSON.parse(atob(r.headers.get("PAYMENT-RESPONSE")!)); // A8: rebuilt, facilitator extras dropped
+  assertEquals(Object.keys(pr).sort(), ["network", "payer", "success", "transaction"]); assertEquals(pr.payer, PAYER);
+});
+Deno.test("A8 facilitator error codes are allow-listed; PAYMENT-RESPONSE never echoes the facilitator body", async () => {
+  const { facErr } = await import("../main.ts");
+  assertEquals(facErr("insufficient_funds"), "insufficient_funds"); assertEquals(facErr("<script>"), "facilitator_error"); assertEquals(facErr(undefined), "facilitator_error");
+  await resetGuards();
+  const t = rig({ v: { settled: false, reason: "x" } }, () => ({ success: false, errorReason: "evil\nX-Injected: 1", transaction: "nope", debug: "internal" }));
+  const r = await handler(new Request("http://h/base/network", { headers: { "PAYMENT-SIGNATURE": pay() } }), { env, fac: async (p: string) => p === "/verify" ? { isValid: true } : { success: false, errorReason: "evil", debug: "internal" },
+    rpc: async (m: string) => m === "eth_getBlockByNumber" ? { number: "0x10", timestamp: "0x1", baseFeePerGas: "0x1" } : "0x1", background: () => {} });
+  assertEquals(r.status, 402); assertEquals((await r.json()).error, "facilitator_error");
+  const pr = JSON.parse(atob(r.headers.get("PAYMENT-RESPONSE")!));
+  assertEquals(pr, { success: false, errorReason: "facilitator_error", transaction: "", network: "eip155:8453", payer: PAYER });
+  const v = await handler(new Request("http://h/base/network", { headers: { "PAYMENT-SIGNATURE": pay() } }), { env, fac: async () => ({ isValid: false, invalidReason: "made_up" }) });
+  assertEquals(await v.json(), { error: "facilitator_error" }); void t; await resetGuards();
+});
+Deno.test("A7 ONCHAIN_CHECK=log is refused on Base mainnet", async () => {
+  const { onchainMode, assertOnchainMode } = await import("../main.ts");
+  const e = (o: Record<string, string>) => (k: string) => o[k];
+  assertEquals(onchainMode(e({ ONCHAIN_CHECK: "log" })), "block");
+  assertEquals(onchainMode(e({ ONCHAIN_CHECK: "log", NETWORK: "eip155:8453" })), "block");
+  assertEquals(onchainMode(e({ ONCHAIN_CHECK: "log", NETWORK: "eip155:84532" })), "log");
+  let threw = false; try { assertOnchainMode(e({ ONCHAIN_CHECK: "log" })); } catch { threw = true; } assert(threw);
+  assertOnchainMode(e({ ONCHAIN_CHECK: "block" }));
+  await resetGuards(); // and at runtime: facilitator success + unconfirmed chain is NOT served even with log set
+  const t = rig({ v: { settled: false, reason: "no_matching_usdc_transfer" } });
+  const res = await handler(new Request("http://h/base/network", { headers: { "PAYMENT-SIGNATURE": pay() } }),
+    { env: (k) => k === "ONCHAIN_CHECK" ? "log" : env(k), fac: async (p: string) => p === "/verify" ? { isValid: true } : { success: true, transaction: rnd(), network: "eip155:8453" },
+      rpc: async (m: string) => m === "eth_getBlockByNumber" ? { number: "0x10", timestamp: "0x1", baseFeePerGas: "0x1" } : "0x1", check: async () => ({ settled: false, reason: "no_matching_usdc_transfer" }), background: () => {} });
+  assertEquals(res.status, 402); await res.body?.cancel(); void t;
+});
+Deno.test("A9 signing key is imported non-extractable", async () => {
+  resetKey(); const { loadKey } = await import("../lib/sign.ts"); const { priv } = await loadKey(env);
+  assertEquals(priv.extractable, false);
+  let threw = false; try { await crypto.subtle.exportKey("jwk", priv); } catch { threw = true; } assert(threw);
+});
+Deno.test("A10 env is passed through; CREATED_AT / HISTORY dates must be strict ISO-8601 UTC", async () => {
+  const { isoOrNull } = await import("../lib/sign.ts");
+  assertEquals(isoOrNull("2026-10-14T12:00:21Z"), "2026-10-14T12:00:21Z"); assertEquals(isoOrNull("2026-10-14T12:00:21.251Z"), "2026-10-14T12:00:21.251Z");
+  for (const bad of ["2026-10-14", "2026-10-14 12:00:21", "2026-02-30T00:00:00Z", "2026-10-14T12:00:21+07:00", "<b>", 5, null]) assertEquals(isoOrNull(bad), null);
+  resetKey(); const E: Record<string, string> = { ...ENV, SIGNING_KEY_CREATED_AT: "2026-10-14T12:00:21Z",
+    SIGNING_KEY_HISTORY: JSON.stringify([{ public_key_b64: btoa("k".repeat(32)), created_at: "yesterday", retired_at: "2026-10-01T00:00:00Z" }]) };
+  const prev = Deno.env.get("SIGNING_KEY_PASSPHRASE"); Deno.env.delete("SIGNING_KEY_PASSPHRASE"); // proves the passed env is used, not Deno.env
+  try {
+    assertEquals((await publicKeyInfo((k) => E[k])).created_at, "2026-10-14T12:00:21Z");
+    assertEquals((await publicKeyInfo((k) => k === "SIGNING_KEY_CREATED_AT" ? "garbage" : E[k])).created_at, null);
+    const h = await keyHistory((k) => E[k]) as any; assertEquals([h.retired[0].created_at, h.retired[0].retired_at], [null, "2026-10-01T00:00:00Z"]);
+  } finally { Deno.env.set("SIGNING_KEY_PASSPHRASE", prev!); resetKey(); }
+});
+Deno.test("SSRF: ports, credentials, IPv6 tunnels with embedded IPv4", async () => {
+  const { ipAllowed } = await import("../lib/preflight.ts"); const res = async () => ["93.184.216.34"];
+  for (const ip of ["2002:7f00:1::1", "2001:0:4136:e378::1", "::7f00:1", "::ffff:127.0.0.1", "64:ff9b::7f00:1", "100.64.0.1", "fec0::1"]) assertEquals(ipAllowed(ip), false, ip);
+  assert(ipAllowed("2606:4700::1111")); assert(ipAllowed("8.8.8.8"));
+  assertEquals((await checkUrl("https://example.com:22/x", res)).err, "port not allowed (443, 8443)");
+  assertEquals((await checkUrl("https://u:p@example.com/x", res)).err, "credentials in url not allowed");
+  assertEquals((await checkUrl("https://example.com:8443/x", res)).err, null);
 });
 Deno.test("used settlement tx hashes are stored durably in KV (atomic, no expiry)", async () => {
   const tx = rnd(); const [x, y] = await Promise.all([SG.claimTx(tx), SG.claimTx(tx)]);

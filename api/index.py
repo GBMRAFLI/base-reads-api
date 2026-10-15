@@ -170,7 +170,25 @@ def snapshot_summary(limit=30):
         out.append(_SNAP_SUM[d])
     return {"source": "x402 Bazaar discovery API, crawled daily at 00:15 UTC", "snapshots": out}
 REPLAY, FAILS = SG.Replay(), SG.FailLimiter()
-ONCHAIN_CHECK = os.environ.get("ONCHAIN_CHECK", "block")   # block: serve only after the nonce-bound USDC Transfer is confirmed on Base; log: serve on facilitator success, record mismatch
+ONCHAIN_CHECK = os.environ.get("ONCHAIN_CHECK", "block")   # block: serve only after the nonce-bound USDC Transfer is confirmed on Base; log: serve on facilitator success (testnets only)
+MAINNET = "eip155:8453"
+def onchain_mode(mode=None, network=None):
+    """ONCHAIN_CHECK=log is refused on Base mainnet: block is forced there."""
+    mode, network = mode or ONCHAIN_CHECK, network or NETWORK
+    return "log" if mode == "log" and network != MAINNET else "block"
+def assert_onchain_mode(mode=None, network=None):
+    if (mode or ONCHAIN_CHECK) == "log" and (network or NETWORK) == MAINNET: raise SystemExit("ONCHAIN_CHECK=log is not allowed on Base mainnet")
+FAC_ERRORS = frozenset({"insufficient_funds", "invalid_exact_evm_payload_authorization_valid_after",
+    "invalid_exact_evm_payload_authorization_valid_before", "invalid_exact_evm_payload_authorization_value",
+    "invalid_exact_evm_payload_signature", "invalid_exact_evm_payload_recipient_mismatch", "invalid_network", "invalid_payload",
+    "invalid_payment_requirements", "invalid_scheme", "unsupported_scheme", "invalid_x402_version", "invalid_transaction_state",
+    "settle_exact_svm_block_height_exceeded", "unexpected_verify_error", "unexpected_settle_error", "payment_expired"})
+def fac_err(x): return x if isinstance(x, str) and x in FAC_ERRORS else "facilitator_error"
+def pay_resp(ok, tx, payer, why=None):
+    """PAYMENT-RESPONSE is always rebuilt from validated fields; facilitator bodies are never echoed."""
+    o = {"success": True, "transaction": tx, "network": NETWORK, "payer": payer} if ok else \
+        {"success": False, "errorReason": why, "transaction": tx or "", "network": NETWORK, "payer": payer}
+    return {"PAYMENT-RESPONSE": b64(o)}
 import threading
 _TX_LOCK, _TX_SEEN = threading.Lock(), set()
 def tx_already_used(tx):
@@ -179,69 +197,72 @@ def tx_already_used(tx):
     with _TX_LOCK:
         if t in _TX_SEEN or any((r.get("tx") or "").lower() == t for r in MS.rows("executions.jsonl")): return True
         _TX_SEEN.add(t); return False
-def no_pay(st):
-    return {"PAYMENT-RESPONSE": b64({"success": False, "errorReason": st, "network": NETWORK})}
-def paid(path, q, qs, sig, t_req, check=None):
-    """verify -> run handler -> settle -> independent on-chain check -> serve. Returns (code, body, headers).
+def no_pay(st): return pay_resp(False, None, None, str(st))
+def paid(path, q, qs, sig, t_req, check=None, ip=None):
+    """precheck -> limits -> replay claim -> verify -> handler -> settle -> independent on-chain check -> serve. Returns (code, body, headers).
     block (default): the resource is returned ONLY when Base shows a successful tx with USDC Transfer(payer -> payTo, >= amount)
-    and, for EIP-3009 payments, AuthorizationUsed(payer, nonce) in the same receipt. Facilitator success alone never serves.
-    If the receipt is not visible yet: 202 + the payment is parked; repeating the same request serves it once confirmed.
-    log: serve on facilitator success and record any on-chain mismatch (lower latency, weaker)."""
+    and AuthorizationUsed(payer, nonce) in the same receipt. Facilitator success alone never serves. The payer is always the
+    signed authorization's `from`. If the receipt is not visible yet: 202 + the payment is parked; a retry serves it once confirmed.
+    log (testnets only; refused on Base mainnet): serve on facilitator success and record any on-chain mismatch."""
     payload, err = SG.parse_payment(sig)
     if err: return 400, {"error": err}, {}
-    r = req_for(path); nonce = SG.nonce_of(payload)
+    r = req_for(path)
+    bad = SG.precheck(payload, r)   # before the claim: malformed/foreign payloads never consume a nonce slot
+    if bad: return 402, {"error": bad}, no_pay(bad)
+    who, nonce = SG.payer_of(payload), SG.nonce_of(payload); ids = {"ip": ip, "payer": who}
     check = check or (lambda tx, rq, payer: MS.verify_onchain(rpc, tx, rq["asset"], rq["payTo"], rq["amount"], payer, NETWORK, attempts=3, wait=1.0, nonce=nonce))
-    key = SG.replay_key(payload, sig)
+    lim = FAILS.blocked(ids)
+    if lim: return 429, {"error": "too many failed payments, retry later", "scope": lim}, {}
+    key = SG.replay_key(payload)
     if not REPLAY.claim(key, SG.expiry(payload)):
         pend = REPLAY.take_pending(key)
-        if pend and pend["path"] == path: return deliver_pending(key, pend, path, q, qs, r, check)
+        if pend and pend["path"] == path: return deliver_pending(key, pend, path, q, qs, r, check, who)
         if pend: REPLAY.set_pending(key, pend)
         return 409, {"error": "payment authorization already used or in flight"}, no_pay("replay")
-    bad = SG.precheck(payload, r)
-    if bad: return 402, {"error": bad}, no_pay(bad)
-    who = SG.payer_of(payload)
-    if FAILS.blocked(who): return 429, {"error": "too many failed settlements, retry later"}, {}
+    sale = lambda tx: {"success": True, "transaction": tx, "payer": who, "network": NETWORK}
     body = {"x402Version": 2, "paymentPayload": payload, "paymentRequirements": r}
     v = fac("/verify", body); t_ver = iso(time.time())
-    if not v.get("isValid"): return 402, {"error": v.get("invalidReason", "invalid")}, no_pay(v.get("invalidReason"))
+    if not v.get("isValid"):
+        why = fac_err(v.get("invalidReason")); FAILS.fail({"ip": ip}); return 402, {"error": why}, no_pay(why)
     try: code, out = handle(path, q)
     except RuntimeError: return 503, {"error": "signing unavailable, not charged"}, {}
     except Exception: return 502, {"error": "upstream error, not charged"}, {}
     if code != 200: return code, out, {}  # bad input: not settled, not charged
     st = fac("/settle", body); t_set = iso(time.time())
-    tx = st.get("transaction") if isinstance(st.get("transaction"), str) and SG.TX_RE.match(st.get("transaction")) else None
-    payer = st.get("payer") if isinstance(st.get("payer"), str) and SG.ADDR_RE.match(st.get("payer")) else who
+    tx = st.get("transaction").lower() if isinstance(st.get("transaction"), str) and SG.TX_RE.match(st.get("transaction")) else None
+    if isinstance(st.get("payer"), str) and st["payer"].lower() != who: log_mismatch(path, "facilitator_payer_differs_from_signed_from")
     times = (t_req, t_ver, t_set)
     if not st.get("success"):
-        oc = check(tx, r, payer) if tx else {"settled": False, "reason": "no_tx_hash"}
+        oc = check(tx, r, who) if tx else {"settled": False, "reason": "no_tx_hash"}
         if oc.get("settled") is True and not tx_already_used(tx):   # facilitator said failed, chain says paid: honor it
-            log_sale(path, r, dict(st, success=True, transaction=tx, payer=payer), times, dict(oc, note="settle_reported_failure_but_confirmed_onchain"), qs, True)
-            return 200, out, {"PAYMENT-RESPONSE": b64(dict(st, success=True, transaction=tx))}
-        FAILS.fail(who)
-        return 402, {"error": st.get("errorReason", "settle failed")}, {"PAYMENT-RESPONSE": b64(st)}
+            log_sale(path, r, sale(tx), times, dict(oc, note="settle_reported_failure_but_confirmed_onchain"), qs, True)
+            return 200, out, pay_resp(True, tx, who)
+        why = fac_err(st.get("errorReason")); FAILS.fail(ids)
+        return 402, {"error": why}, pay_resp(False, tx, who, why)
     if not tx: log_mismatch(path, "settle_success_without_valid_tx_hash"); return 502, {"error": "settlement response invalid, contact support with your payment"}, {}
     if tx_already_used(tx): log_mismatch(path, "settlement_tx_reused"); return 409, {"error": "settlement transaction already used"}, no_pay("replay")
-    if ONCHAIN_CHECK == "log":
-        oc = check(tx, r, payer); log_sale(path, r, st, times, oc, qs, True)
+    oc = check(tx, r, who)
+    if onchain_mode() == "log":
+        log_sale(path, r, sale(tx), times, oc, qs, True)
         if oc.get("settled") is not True: log_mismatch(path, "onchain_" + str(oc.get("reason")))
-        return 200, out, {"PAYMENT-RESPONSE": b64(st)}
-    oc = check(tx, r, payer)
-    if oc.get("settled") is True: log_sale(path, r, st, times, oc, qs, True); return 200, out, {"PAYMENT-RESPONSE": b64(st)}
+        return 200, out, pay_resp(True, tx, who)
+    if oc.get("settled") is True: log_sale(path, r, sale(tx), times, oc, qs, True); return 200, out, pay_resp(True, tx, who)
     if oc.get("settled") is None:
-        REPLAY.set_pending(key, {"path": path, "tx": tx, "payer": payer, "st": st, "times": times})
+        REPLAY.set_pending(key, {"path": path, "tx": tx, "times": times})
         return 202, {"status": "settled_pending_onchain_confirmation", "transaction": tx,
-                     "retry": "repeat the same request with the same payment header; it is served once the transfer is confirmed on Base"}, {"PAYMENT-RESPONSE": b64(st)}
-    log_sale(path, r, st, times, oc, qs, False)
-    return 402, {"error": "settlement not confirmed on-chain: " + str(oc.get("reason"))}, {"PAYMENT-RESPONSE": b64(st)}
-def deliver_pending(key, pend, path, q, qs, r, check):
-    oc = check(pend["tx"], r, pend["payer"])
-    if oc.get("settled") is None: REPLAY.set_pending(key, pend); return 202, {"status": "settled_pending_onchain_confirmation", "transaction": pend["tx"]}, {"PAYMENT-RESPONSE": b64(pend["st"])}
-    if oc.get("settled") is False: log_sale(path, r, pend["st"], pend["times"], oc, qs, False); return 402, {"error": "settlement not confirmed on-chain: " + str(oc.get("reason"))}, {}
+                     "retry": "repeat the same request with the same payment header; it is served once the transfer is confirmed on Base"}, pay_resp(True, tx, who)
+    log_sale(path, r, sale(tx), times, oc, qs, False)
+    return 402, {"error": "settlement not confirmed on-chain: " + str(oc.get("reason"))}, pay_resp(False, tx, who, "not_confirmed_onchain")
+def deliver_pending(key, pend, path, q, qs, r, check, who):
+    st = {"success": True, "transaction": pend["tx"], "payer": who, "network": NETWORK}
+    oc = check(pend["tx"], r, who)
+    if oc.get("settled") is None: REPLAY.set_pending(key, pend); return 202, {"status": "settled_pending_onchain_confirmation", "transaction": pend["tx"]}, pay_resp(True, pend["tx"], who)
+    if oc.get("settled") is False: log_sale(path, r, st, pend["times"], oc, qs, False); return 402, {"error": "settlement not confirmed on-chain: " + str(oc.get("reason"))}, {}
     try: code, out = handle(path, q)
     except Exception: REPLAY.set_pending(key, pend); return 502, {"error": "upstream error, retry the same request"}, {}
     if code != 200: REPLAY.set_pending(key, pend); return code, out, {}
-    log_sale(path, r, pend["st"], pend["times"], oc, qs, True)
-    return 200, out, {"PAYMENT-RESPONSE": b64(pend["st"])}
+    log_sale(path, r, st, pend["times"], oc, qs, True)
+    return 200, out, pay_resp(True, pend["tx"], who)
 def log_sale(path, r, st, times, oc, qs, served):
     try:
         MS.record_sale(path, r, st, times, oc, served)
@@ -273,7 +294,7 @@ class handler(BaseHTTPRequestHandler):
         t_req = iso(time.time())
         sig = s.headers.get("PAYMENT-SIGNATURE") or s.headers.get("X-PAYMENT")
         if not sig: pr = required(path, s.headers.get("Host", "")); return s._send(402, pr, {"PAYMENT-REQUIRED": b64(pr)})
-        code, out, hd = paid(path, q, qs, sig, t_req)
+        code, out, hd = paid(path, q, qs, sig, t_req, ip=s.client_address[0])
         return s._send(code, out, hd)
     def _send(s, code, obj, hd={}):
         b = json.dumps(obj).encode()
@@ -300,6 +321,7 @@ def snapshot_loop(run_once=None, sleep=time.sleep, now=time.time, stop=lambda: F
         try: run_once()
         except Exception as e: print("snapshot failed:", type(e).__name__, flush=True)
 if __name__ == "__main__":
+    assert_onchain_mode()
     if os.environ.get("SNAPSHOT_SCHEDULER", "1") == "1":
         import threading; threading.Thread(target=snapshot_loop, daemon=True, name="bazaar-snapshot").start()
     ThreadingHTTPServer((os.environ.get("HOST", "127.0.0.1"), PORT), handler).serve_forever()

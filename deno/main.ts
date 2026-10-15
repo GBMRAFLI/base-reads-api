@@ -17,7 +17,7 @@ import { ADDR, b64json, iso, pyQuery, sha256hex, unquote } from "./lib/util.ts";
 const USDCS: Record<string, string> = { "eip155:8453": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913", "eip155:84532": "0x036CbD53842c5426634e7929541eC2318f3dCF7e" };
 export type Deps = { env: (k: string) => string | undefined; rpc?: Rpc; fac?: (p: string, body: unknown) => Promise<any>;
   resolver?: Resolver; fetcher?: Fetcher; background?: (p: Promise<unknown>) => void;
-  check?: (tx: string, r: any, payer: string | undefined) => Promise<any> };
+  check?: (tx: string, r: any, payer: string | undefined) => Promise<any>; ip?: string };
 const cfg = (env: Deps["env"]) => {
   const NETWORK = env("NETWORK") ?? "eip155:8453";
   return { FAC: env("FACILITATOR") ?? "https://facilitator.payai.network", RPC: env("RPC") ?? "https://mainnet.base.org",
@@ -67,11 +67,11 @@ export async function wellKnown(env: Deps["env"]) {
     routes: { pubkey: "/x402/preflight/pubkey", key_history: "/.well-known/x402-preflight-key-history.json", paid_check: "/x402/preflight", snapshots: "/bazaar/snapshots", snapshot_meta: "/.well-known/bazaar-snapshot.json" } };
 }
 /** Free, signed metadata about the daily Bazaar snapshot series (no snapshot contents). */
-export async function snapshotMeta() {
+export async function snapshotMeta(env: Deps["env"] = (k) => Deno.env.get(k)) {
   const dates = await snapshotDates(); const last = dates.at(-1) ?? null;
   const meta = { version: 1, started_at: dates[0] ?? null, last_updated: last, total_snapshots: dates.length,
     covered_listings: last ? Object.keys(((await loadIndex(last)) as any).resources ?? {}).length : 0 };
-  const e = await sign(meta);
+  const e = await sign(meta, env);
   return { metadata: e.facts, signature: e.signature, pubkey_url: "/x402/preflight/pubkey" };
 }
 const SNAP_SUM = new Map<string, Record<string, unknown>>();
@@ -126,7 +126,7 @@ export async function handler(req: Request, d: Deps): Promise<Response> {
   }
   if (path === "/bazaar/snapshots") return send(200, await snapshotSummary());
   if (path === "/.well-known/bazaar-snapshot.json" || path === "/.well-known/x402-preflight-key-history.json") {
-    try { return send(200, path.includes("bazaar") ? await snapshotMeta() : await keyHistory(env)); }
+    try { return send(200, path.includes("bazaar") ? await snapshotMeta(env) : await keyHistory(env)); }
     catch (e) { if (e instanceof SigningUnavailable) return send(503, { error: "signing key unavailable" }); throw e; }
   }
   if (path === "/internal/export") { const [code, obj] = await exportRecords(req.headers.get("Authorization") ?? "", q, env); return send(code, obj); }
@@ -144,22 +144,45 @@ export async function handler(req: Request, d: Deps): Promise<Response> {
 
 const FAILS = new SG.FailLimiter();
 export async function resetGuards() { await FAILS.clear(); }
-const noPay = (why: unknown, network: string) => ({ "PAYMENT-RESPONSE": b64({ success: false, errorReason: why ?? null, network }) });
+export const MAINNET = "eip155:8453";
+/** ONCHAIN_CHECK=log (serve on facilitator success) is refused on Base mainnet: block is forced there. */
+export function onchainMode(env: Deps["env"]): "block" | "log" {
+  const m = env("ONCHAIN_CHECK") ?? "block";
+  return m === "log" && (env("NETWORK") ?? MAINNET) !== MAINNET ? "log" : "block";
+}
+export function assertOnchainMode(env: Deps["env"]) {
+  if (env("ONCHAIN_CHECK") === "log" && (env("NETWORK") ?? MAINNET) === MAINNET) throw new Error("ONCHAIN_CHECK=log is not allowed on Base mainnet");
+}
+/** Facilitator error codes we pass through to clients (x402 spec); anything else becomes "facilitator_error". */
+export const FAC_ERRORS = new Set(["insufficient_funds", "invalid_exact_evm_payload_authorization_valid_after",
+  "invalid_exact_evm_payload_authorization_valid_before", "invalid_exact_evm_payload_authorization_value",
+  "invalid_exact_evm_payload_signature", "invalid_exact_evm_payload_recipient_mismatch", "invalid_network", "invalid_payload",
+  "invalid_payment_requirements", "invalid_scheme", "unsupported_scheme", "invalid_x402_version", "invalid_transaction_state",
+  "settle_exact_svm_block_height_exceeded", "unexpected_verify_error", "unexpected_settle_error", "payment_expired"]);
+export const facErr = (x: unknown) => typeof x === "string" && FAC_ERRORS.has(x) ? x : "facilitator_error";
+/** PAYMENT-RESPONSE is always rebuilt from validated fields; facilitator bodies are never echoed. */
+const payResp = (network: string, ok: boolean, tx: string | null, payer: string | null, why?: string) =>
+  ({ "PAYMENT-RESPONSE": b64(ok ? { success: true, transaction: tx, network, payer } : { success: false, errorReason: why ?? null, transaction: tx ?? "", network, payer }) });
+const noPay = (why: unknown, network: string) => payResp(network, false, null, null, String(why));
 type Cfg = ReturnType<typeof cfg>;
-/** verify -> handler -> settle -> independent on-chain check -> serve (same rules as api/index.py paid()).
- * block (default): serve ONLY when Base shows the USDC Transfer(payer -> payTo, >= amount) and, for EIP-3009, AuthorizationUsed(payer, nonce)
- * in the same receipt. Facilitator success alone never serves; an unconfirmed receipt parks the payment (202) until a retry finds it. */
+/** precheck -> limits -> replay claim -> verify -> handler -> settle -> independent on-chain check -> serve (same rules as api/index.py paid()).
+ * Serve ONLY when Base shows the USDC Transfer(payer -> payTo, >= amount) and AuthorizationUsed(payer, nonce) in the same receipt.
+ * The payer is always the signed authorization's `from`, never the facilitator's word. An unconfirmed receipt parks the payment (202). */
 async function paid(path: string, q: Record<string, string>, qs: string, sig: string, tReq: string, d: Deps, c: Cfg, rpc: Rpc,
   fac: (p: string, body: unknown) => Promise<any>): Promise<[number, unknown, Record<string, string>]> {
-  const env = d.env; const mode = env("ONCHAIN_CHECK") ?? "block";
+  const env = d.env; const mode = onchainMode(env); const N = c.NETWORK;
   const [payload, err] = SG.parsePayment(sig);
   if (err || !payload) return [400, { error: err }, {}];
-  const r = reqFor(path, env); const nonce = SG.nonceOf(payload);
-  const check = d.check ?? ((tx: string, rq: any, payer: string | undefined) => verifyOnchain(rpc, tx, rq.asset, rq.payTo, rq.amount, payer, c.NETWORK, 3, 1000, undefined, nonce));
+  const r = reqFor(path, env);
+  const bad = SG.precheck(payload, r); // before the claim: malformed/foreign payloads never consume a nonce slot
+  if (bad) return [402, { error: bad }, noPay(bad, N)];
+  const who = SG.payerOf(payload)!; const nonce = SG.nonceOf(payload)!; const ids = { ip: d.ip ?? null, payer: who };
+  const check = d.check ?? ((tx: string, rq: any, payer: string | undefined) => verifyOnchain(rpc, tx, rq.asset, rq.payTo, rq.amount, payer, N, 3, 1000, undefined, nonce));
   const bg = d.background ?? (() => {});
-  const log = (stx: any, oc: any, served: boolean, times: [string, string, string]) => {
+  const sale = (tx: string) => ({ success: true, transaction: tx, payer: who, network: N });
+  const log = (tx: string, oc: any, served: boolean, times: [string, string, string]) => {
     bg((async () => {
-      try { await recordSale(path, r, stx, times, oc, served, env); await recordObservation(path, sha256hex(qs).slice(0, 16), served ? 200 : 402, null); }
+      try { await recordSale(path, r, sale(tx), times, oc, served, env); await recordObservation(path, (await sha256hex(qs)).slice(0, 16), served ? 200 : 402, null); }
       catch (e) { console.log("sales log write failed:", (e as Error).name); }
     })());
   };
@@ -167,32 +190,30 @@ async function paid(path: string, q: Record<string, string>, qs: string, sig: st
   const run = async (): Promise<[number, unknown]> => {
     if (path === "/x402/preflight") {
       const u = unquote(q.url ?? "");
-      return u ? await preflight(u, { resolver: d.resolver, fetcher: d.fetcher }) : [400, { error: "give ?url=https://..." }];
+      return u ? await preflight(u, { resolver: d.resolver, fetcher: d.fetcher, env }) : [400, { error: "give ?url=https://..." }];
     }
     return await new Chain(rpc, c.USDC).handle(path, q);
   };
-  const key = await SG.replayKey(payload, sig);
-  if (!await SG.claim(key, SG.expiry(payload))) {
+  const lim = await FAILS.blocked(ids);
+  if (lim) return [429, { error: "too many failed payments, retry later", scope: lim }, {}];
+  const key = SG.replayKey(payload);
+  if (!await SG.claim(key, SG.expiry(payload), undefined, undefined, { at: Date.now(), payload_sha256: await SG.payloadHash(payload) })) {
     const pend = await SG.takePending(key);
     if (pend && pend.path === path) {
-      const oc: any = await check(pend.tx, r, pend.payer);
-      if (oc.settled === null) { await SG.setPending(key, pend); return [202, { status: "settled_pending_onchain_confirmation", transaction: pend.tx }, { "PAYMENT-RESPONSE": b64(pend.st) }]; }
-      if (oc.settled === false) { log(pend.st, oc, false, pend.times); return [402, { error: "settlement not confirmed on-chain: " + String(oc.reason) }, {}]; }
+      const oc: any = await check(pend.tx, r, who);
+      if (oc.settled === null) { await SG.setPending(key, pend); return [202, { status: "settled_pending_onchain_confirmation", transaction: pend.tx }, payResp(N, true, pend.tx, who)]; }
+      if (oc.settled === false) { log(pend.tx, oc, false, pend.times); return [402, { error: "settlement not confirmed on-chain: " + String(oc.reason) }, {}]; }
       let code: number, out: unknown;
       try { [code, out] = await run(); } catch { await SG.setPending(key, pend); return [502, { error: "upstream error, retry the same request" }, {}]; }
       if (code !== 200) { await SG.setPending(key, pend); return [code, out, {}]; }
-      log(pend.st, oc, true, pend.times); return [200, out, { "PAYMENT-RESPONSE": b64(pend.st) }];
+      log(pend.tx, oc, true, pend.times); return [200, out, payResp(N, true, pend.tx, who)];
     }
     if (pend) await SG.setPending(key, pend);
-    return [409, { error: "payment authorization already used or in flight" }, noPay("replay", c.NETWORK)];
+    return [409, { error: "payment authorization already used or in flight" }, noPay("replay", N)];
   }
-  const bad = SG.precheck(payload, r);
-  if (bad) return [402, { error: bad }, noPay(bad, c.NETWORK)];
-  const who = SG.payerOf(payload);
-  if (await FAILS.blocked(who)) return [429, { error: "too many failed settlements, retry later" }, {}];
   const body = { x402Version: 2, paymentPayload: payload, paymentRequirements: r };
   const v = await fac("/verify", body); const tVer = iso();
-  if (!v.isValid) return [402, { error: v.invalidReason ?? "invalid" }, noPay(v.invalidReason, c.NETWORK)];
+  if (!v.isValid) { const why = facErr(v.invalidReason); await FAILS.fail({ ip: ids.ip }); return [402, { error: why }, noPay(why, N)]; }
   let code: number, out: unknown;
   try { [code, out] = await run(); } catch (e) {
     if (e instanceof SigningUnavailable) return [503, { error: "signing unavailable, not charged" }, {}];
@@ -200,32 +221,32 @@ async function paid(path: string, q: Record<string, string>, qs: string, sig: st
   }
   if (code !== 200) return [code, out, {}]; // bad input: not settled, not charged
   const st = await fac("/settle", body); const tSet = iso(); const times: [string, string, string] = [tReq, tVer, tSet];
-  const tx: string | null = typeof st.transaction === "string" && SG.TX_RE.test(st.transaction) ? st.transaction : null;
-  const payer: string | undefined = typeof st.payer === "string" && SG.ADDR_RE.test(st.payer) ? st.payer : (who ?? undefined);
+  const tx: string | null = typeof st.transaction === "string" && SG.TX_RE.test(st.transaction) ? st.transaction.toLowerCase() : null;
+  if (typeof st.payer === "string" && st.payer.toLowerCase() !== who) mismatch("facilitator_payer_differs_from_signed_from");
   if (!st.success) {
-    const oc: any = tx ? await check(tx, r, payer) : { settled: false, reason: "no_tx_hash" };
+    const oc: any = tx ? await check(tx, r, who) : { settled: false, reason: "no_tx_hash" };
     if (oc.settled === true && tx && await SG.claimTx(tx)) { // facilitator said failed, chain says paid: honor it
-      log({ ...st, success: true, transaction: tx, payer }, { ...oc, note: "settle_reported_failure_but_confirmed_onchain" }, true, times);
-      return [200, out, { "PAYMENT-RESPONSE": b64({ ...st, success: true, transaction: tx }) }];
+      log(tx, { ...oc, note: "settle_reported_failure_but_confirmed_onchain" }, true, times);
+      return [200, out, payResp(N, true, tx, who)];
     }
-    await FAILS.fail(who);
-    return [402, { error: st.errorReason ?? "settle failed" }, { "PAYMENT-RESPONSE": b64(st) }];
+    const why = facErr(st.errorReason); await FAILS.fail(ids);
+    return [402, { error: why }, payResp(N, false, tx, who, why)];
   }
   if (!tx) { mismatch("settle_success_without_valid_tx_hash"); return [502, { error: "settlement response invalid, contact support with your payment" }, {}]; }
-  if (!await SG.claimTx(tx)) { mismatch("settlement_tx_reused"); return [409, { error: "settlement transaction already used" }, noPay("replay", c.NETWORK)]; }
-  const oc: any = await check(tx, r, payer);
+  if (!await SG.claimTx(tx)) { mismatch("settlement_tx_reused"); return [409, { error: "settlement transaction already used" }, noPay("replay", N)]; }
+  const oc: any = await check(tx, r, who);
   if (mode === "log") {
-    log(st, oc, true, times); if (oc.settled !== true) mismatch("onchain_" + String(oc.reason));
-    return [200, out, { "PAYMENT-RESPONSE": b64(st) }];
+    log(tx, oc, true, times); if (oc.settled !== true) mismatch("onchain_" + String(oc.reason));
+    return [200, out, payResp(N, true, tx, who)];
   }
-  if (oc.settled === true) { log(st, oc, true, times); return [200, out, { "PAYMENT-RESPONSE": b64(st) }]; }
+  if (oc.settled === true) { log(tx, oc, true, times); return [200, out, payResp(N, true, tx, who)]; }
   if (oc.settled === null) {
-    await SG.setPending(key, { path, tx, payer: payer ?? null, st, times });
+    await SG.setPending(key, { path, tx, times });
     return [202, { status: "settled_pending_onchain_confirmation", transaction: tx,
-      retry: "repeat the same request with the same payment header; it is served once the transfer is confirmed on Base" }, { "PAYMENT-RESPONSE": b64(st) }];
+      retry: "repeat the same request with the same payment header; it is served once the transfer is confirmed on Base" }, payResp(N, true, tx, who)];
   }
-  log(st, oc, false, times);
-  return [402, { error: "settlement not confirmed on-chain: " + String(oc.reason) }, { "PAYMENT-RESPONSE": b64(st) }];
+  log(tx, oc, false, times);
+  return [402, { error: "settlement not confirmed on-chain: " + String(oc.reason) }, payResp(N, false, tx, who, "not_confirmed_onchain")];
 }
 
 if (import.meta.main) {
@@ -234,5 +255,6 @@ if (import.meta.main) {
     Deno.cron("bazaar-snapshot", "15 0 * * *", async () => { await runSnapshot(); });
     snapshotIfMissing().catch((e) => console.log("snapshot failed:", (e as Error).name));
   }
-  Deno.serve({ port: Number(env("PORT") ?? 8000) }, (req) => handler(req, { env }));
+  assertOnchainMode(env); // refuse to start with ONCHAIN_CHECK=log on Base mainnet
+  Deno.serve({ port: Number(env("PORT") ?? 8000) }, (req, info) => handler(req, { env, ip: (info.remoteAddr as Deno.NetAddr).hostname }));
 }
