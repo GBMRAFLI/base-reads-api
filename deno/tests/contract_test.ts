@@ -658,6 +658,10 @@ Deno.test("snapshot follow-ups: freshness, tiers 30/365, legacy, orphan purge, c
   // also just past the window (4 days)
   const aged4 = await bazaarFacts("https://missing.example/nope", [], 14, "2002-01-05");
   assertEquals([(aged4 as any).available, (aged4 as any).snapshot_age_days, (aged4 as any).max_age_days], [false, 4, 3]);
+  assertEquals([(aged4 as any).snapshot_date, (aged4 as any).requested_date, (aged4 as any).age_days], ["2002-01-01", "2002-01-05", 4]);
+  // L-c: age exactly 3 days is still served
+  const age3 = await bazaarFacts("https://missing.example/nope", [], 14, "2002-01-04");
+  assertEquals([(age3 as any).available, (age3 as any).reason], [true, undefined]);
 
   // H1: only reduced -> snapshot_too_old
   await wipeSnaps(k);
@@ -668,6 +672,9 @@ Deno.test("snapshot follow-ups: freshness, tiers 30/365, legacy, orphan purge, c
   } as any);
   const tooOld = await bazaarFacts("https://missing.example/nope", [], 14, "2002-03-02");
   assertEquals([(tooOld as any).available, (tooOld as any).reason, (tooOld as any).listed], [false, "snapshot_too_old", undefined]);
+  // L-c: reduced-only too-old carries auditable context
+  assertEquals([(tooOld as any).snapshot_date, (tooOld as any).requested_date, (tooOld as any).age_days, (tooOld as any).snapshot_age_days, (tooOld as any).max_age_days, (tooOld as any).snapshot_tier],
+    ["2002-03-01", "2002-03-02", 1, 1, 3, "reduced"]);
 
   // Never demote newest
   await wipeSnaps(k);
@@ -765,6 +772,33 @@ Deno.test("snapshot follow-ups: freshness, tiers 30/365, legacy, orphan purge, c
   assert(typeof (await PF.readSnapMeta("2003-01-01"))!.last_attempt_at === "string");
   await k.set(["snapdate", "2005-06-01"], { chunks: 1, tier: "full", status: null, listings: 0, gzip_bytes: 0, legacy: true }); // no last_attempt_at
   assertEquals((await PF.readSnapMeta("2005-06-01"))!.last_attempt_at ?? null, null);
+
+  // L-a: concurrent saves on one date: the loser deletes only its own chunks, winner stays loadable
+  await wipeSnaps(k);
+  const mk = (n: number) => ({ date: "2004-02-02", listings: n, hosts: { r: n }, wallet_hosts: {},
+    resources: { "https://r.example/r": { payers30d: n, calls30d: n, lastCalledAt: null, payTo: [] } }, tier: "full", status: "complete",
+    coverage: { pages_fetched: 1, max_pages: 1, items_indexed: n, bazaar_total: n, complete: true, status: "complete", partial: false, failed_pages: [] } } as any);
+  PF.setBeforeFlip(async () => { PF.setBeforeFlip(null); await saveIndex(mk(22)); }); // B runs fully inside A's window
+  let lost = "";
+  try { await saveIndex(mk(11)); } catch (e) { lost = (e as Error).message; } finally { PF.setBeforeFlip(null); }
+  assertEquals(lost, "snapdate_cas_failed");
+  clearIndexCache();
+  const win = (await PF.readSnapMeta("2004-02-02"))!;
+  assertEquals((await PF.loadIndex("2004-02-02")).listings, 22);
+  for await (const e of k.list({ prefix: ["snap", "2004-02-02"] })) assertEquals(e.key[2], win.gen);
+
+  // L-a: orphan purge removes only older gens, never an in-progress newer gen
+  const active = win.gen as string;
+  const newer = PF.newGenId(Date.now() + 60_000);
+  await k.set(["snap", "2004-02-02", newer, 0], new Uint8Array([1]));
+  await k.set(["snap", "2004-02-02", 5, 0], new Uint8Array([2])); // old numeric gen
+  await k.set(["snap", "2004-02-02", PF.newGenId(1), 0], new Uint8Array([3])); // old string gen
+  await PF.purgeOrphanGens("2004-02-02", active);
+  const left: unknown[] = []; for await (const e of k.list({ prefix: ["snap", "2004-02-02"] })) left.push(e.key[2]);
+  assert(left.includes(newer)); assert(left.includes(active)); assertEquals(left.length, 1 + win.chunks);
+  await PF.purgeOrphanGens("2004-02-02", null); // null => no-op
+  assert((await k.get(["snap", "2004-02-02", newer, 0])).value);
+  clearIndexCache();
 
   // Concurrent day gate
   await wipeSnaps(k);

@@ -18,12 +18,12 @@ install -m 755 "$R/deploy/vps/kv-backup.sh" /usr/local/sbin/base-reads-kv-backup
 install -m 644 "$R/deploy/vps/kv-backup.service" /etc/systemd/system/base-reads-kv-backup.service
 install -m 644 "$R/deploy/vps/kv-backup.timer" /etc/systemd/system/base-reads-kv-backup.timer
 PREV=$(readlink -f /opt/base-reads/app || true)
-ln -sfn "$R" /opt/base-reads/app
+ln -sfn "$R" /opt/base-reads/app.new && mv -T /opt/base-reads/app.new /opt/base-reads/app
 systemctl daemon-reload
 systemctl enable --now base-reads-kv-backup.timer
 systemctl enable base-reads && systemctl restart base-reads
 for i in $(seq 1 20); do curl -fsS -o /dev/null http://127.0.0.1:8000/llms.txt && { echo "healthy: $SHA"; exit 0; }; sleep 1; done
 echo "health check failed; rolling back to $PREV" >&2
-[ -n "$PREV" ] && ln -sfn "$PREV" /opt/base-reads/app && systemctl restart base-reads
+[ -n "$PREV" ] && ln -sfn "$PREV" /opt/base-reads/app.new && mv -T /opt/base-reads/app.new /opt/base-reads/app && systemctl restart base-reads
 exit 1
 REMOTE

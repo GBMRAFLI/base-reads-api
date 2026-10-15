@@ -1,5 +1,6 @@
-# Replace API_DOMAIN with the final hostname; Caddy obtains and renews TLS automatically.
-API_DOMAIN {
+# Temporary hostname via sslip.io (resolves to 89.116.220.218). To change: edit this line and PUBLIC_URL
+# in /etc/base-reads/env, then `systemctl reload caddy && systemctl restart base-reads`.
+89-116-220-218.sslip.io {
 	encode gzip
 	reverse_proxy 127.0.0.1:8000 {
 		header_up X-Forwarded-For {remote_host}

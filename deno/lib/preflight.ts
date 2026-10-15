@@ -168,7 +168,7 @@ export function validateChallenge(ch: any): [boolean, string[], Record<string, u
 export type SnapTier = "full" | "reduced" | "aggregate";
 export type SnapDateMeta = {
   /** Absent / legacy:true => flat ["snap", date, i] chunks (pre-generation format). */
-  gen?: number; chunks: number; tier: SnapTier;
+  gen?: number | string; chunks: number; tier: SnapTier;
   status: "complete" | "partial" | null; listings: number; gzip_bytes: number;
   legacy?: boolean;
   /** ISO time of the successful save that produced this meta; null if unknown. */
@@ -209,6 +209,16 @@ let _saveCrashAfterChunks: number | null = null;
 let _saveCrashAfterFlip = false;
 export function setSaveCrashAfterChunks(n: number | null) { _saveCrashAfterChunks = n; }
 export function setSaveCrashAfterFlip(v: boolean) { _saveCrashAfterFlip = v; }
+let _beforeFlip: (() => Promise<void>) | null = null;
+/** Test hook: runs after chunks are written, before the snapdate flip. */
+export function setBeforeFlip(f: (() => Promise<void>) | null) { _beforeFlip = f; }
+/** Unique, time-ordered generation id for one save attempt. */
+export function newGenId(now = Date.now()) { return String(now).padStart(15, "0") + "-" + crypto.randomUUID(); }
+/** True when gen `g` is strictly older than the active gen `keep` (numeric gens predate string ids). */
+export function genOlder(g: number | string, keep: number | string) {
+  if (typeof keep === "number") return typeof g === "number" && g < keep;
+  return typeof g === "number" || g < keep;
+}
 async function gz(s: string, mode: "c" | "d", data?: Uint8Array): Promise<Uint8Array> {
   const stream = mode === "c" ? new Blob([s]).stream().pipeThrough(new CompressionStream("gzip")) : new Blob([data! as Uint8Array<ArrayBuffer>]).stream().pipeThrough(new DecompressionStream("gzip"));
   return new Uint8Array(await new Response(stream).arrayBuffer());
@@ -242,19 +252,16 @@ export async function listSnapMetas(): Promise<{ date: string; meta: SnapDateMet
   }
   return out.sort((a, b) => a.date.localeCompare(b.date));
 }
-/** Purge any snap chunks for `date` whose generation !== keepGen (and purge legacy flat keys when keepGen is set). */
-export async function purgeOrphanGens(date: string, keepGen: number | null) {
+/** Purge snap chunks for `date` from generations OLDER than the active `keepGen` (plus legacy flat keys).
+ * Never touches the active gen or any newer gen (a save still in progress). keepGen null => nothing is purged. */
+export async function purgeOrphanGens(date: string, keepGen: number | string | null) {
+  if (keepGen == null) return;
   const k = await kv();
   for await (const e of k.list({ prefix: ["snap", date] })) {
     const key = e.key;
-    if (key.length === 3 && typeof key[2] === "number") {
-      // legacy flat ["snap", date, i]
-      if (keepGen != null) await k.delete(key);
-      continue;
-    }
-    if (key.length >= 4 && typeof key[2] === "number") {
-      const g = key[2] as number;
-      if (keepGen == null || g !== keepGen) await k.delete(key);
+    if (key.length === 3 && typeof key[2] === "number") { await k.delete(key); continue; } // legacy flat ["snap", date, i]
+    if (key.length >= 4 && (typeof key[2] === "number" || typeof key[2] === "string")) {
+      if (genOlder(key[2] as number | string, keepGen)) await k.delete(key);
     }
   }
 }
@@ -263,15 +270,8 @@ export async function saveIndex(idx: Index, _keep?: number, _skipRetention = fal
   if (!idx.tier) idx.tier = "full";
   const k = await kv();
   const prev = await k.get<SnapDateMeta | number>(["snapdate", idx.date]);
-  let oldGen: number | null = null;
-  let wasLegacy = false;
-  if (typeof prev.value === "number") { wasLegacy = true; }
-  else if (prev.value && typeof prev.value === "object") {
-    if (prev.value.gen == null || prev.value.legacy) wasLegacy = true;
-    else oldGen = prev.value.gen;
-  }
-  const newGen = wasLegacy || oldGen == null ? 0 : oldGen + 1;
-  // If previous was already gen'd, increment; first non-legacy write uses gen 0.
+  // Unique id per attempt: concurrent saves for one date never share chunk keys.
+  const newGen = newGenId();
   const z = await gz(JSON.stringify(idx), "c"); const n = Math.ceil(z.length / CHUNK) || 1;
   for (let i = 0; i < n; i++) {
     await k.set(["snap", idx.date, newGen, i], z.slice(i * CHUNK, (i + 1) * CHUNK));
@@ -284,15 +284,16 @@ export async function saveIndex(idx: Index, _keep?: number, _skipRetention = fal
     gen: newGen, chunks: n, tier: idx.tier, status: idx.status ?? idx.coverage?.status ?? null,
     listings: idx.listings, gzip_bytes: z.length, legacy: false, last_attempt_at: attemptedAt,
   };
+  if (_beforeFlip) await _beforeFlip();
   const flipped = await k.atomic().check(prev).set(["snapdate", idx.date], meta).commit();
   if (!flipped.ok) {
-    for (let i = 0; i < n; i++) await k.delete(["snap", idx.date, newGen, i]);
+    for (let i = 0; i < n; i++) await k.delete(["snap", idx.date, newGen, i]); // only this attempt's own chunks
     throw new Error("snapdate_cas_failed");
   }
   if (_saveCrashAfterFlip) {
     const err = new Error("save_crash_after_flip"); (err as any).name = "SaveCrashAfterFlip"; throw err;
   }
-  // L1: purge every chunk whose gen !== meta.gen (and legacy flat keys)
+  // purge only gens older than the one just activated
   await purgeOrphanGens(idx.date, newGen);
   idxCache.delete(idx.date);
   return meta;
@@ -336,11 +337,12 @@ export async function bazaarFacts(url: string, paytoList: string[], maxTrend = 1
   const metas = await listSnapMetas();
   if (!metas.length) return { available: false, reason: "no_snapshot" };
   const full = [...metas].reverse().find((m) => (m.meta.tier ?? "full") === "full");
-  if (!full) return { available: false, reason: "snapshot_too_old" };
-  if (dayAge(full.date, today) > FULL_MAX_AGE_DAYS) {
-    const snapshot_age_days = dayAge(full.date, today);
-    return { available: false, reason: "snapshot_too_old", snapshot_date: full.date, snapshot_age_days, max_age_days: FULL_MAX_AGE_DAYS };
-  }
+  // snapshot_age_days kept as an alias of age_days for backward compatibility.
+  const tooOld = (date: string, tier: string) => { const age_days = dayAge(date, today);
+    return { available: false, reason: "snapshot_too_old", snapshot_date: date, snapshot_tier: tier, requested_date: today,
+      age_days, snapshot_age_days: age_days, max_age_days: FULL_MAX_AGE_DAYS }; };
+  if (!full) { const newest = metas[metas.length - 1]; return tooOld(newest.date, newest.meta.tier ?? "full"); }
+  if (dayAge(full.date, today) > FULL_MAX_AGE_DAYS) return tooOld(full.date, "full");
   const last = full.date; const idx = await loadIndex(last); const h = hostOf(url); const key = url.split("?")[0];
   const cur = idx.resources[key] ?? null; const listedPayTo = cur?.payTo ?? [];
   const wl: Record<string, unknown> = {};
