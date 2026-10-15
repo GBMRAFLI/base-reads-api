@@ -9,7 +9,7 @@ import { CDP_HOST, enabled as cdpEnabled, headers as cdpHeaders } from "./lib/cd
 import * as SG from "./lib/settle_guard.ts";
 import { SCHEMA, snapshotDates, loadIndex } from "./lib/preflight.ts";
 import { isoOrNull, keyHistory, publicKeyInfo, sign, SigningUnavailable } from "./lib/sign.ts";
-import { scheduledSnapshot } from "./lib/snapshot.ts";
+import { scheduledSnapshot, latestSnapStatus, loadFail, mapErrorCode } from "./lib/snapshot.ts";
 import { EXPORT_FILES, rows } from "./lib/store.ts";
 import { recordObservation, recordSale, verifyOnchain } from "./lib/stream.ts";
 import { ADDR, b64json, iso, pyQuery, sha256hex, unquote } from "./lib/util.ts";
@@ -114,9 +114,28 @@ export async function wellKnown(env: Deps["env"]) {
 }
 /** Free, signed metadata about the daily Bazaar snapshot series (no snapshot contents). */
 export async function snapshotMeta(env: Deps["env"] = (k) => Deno.env.get(k)) {
-  const dates = await snapshotDates(); const last = dates.at(-1) ?? null;
-  const meta = { version: 1, started_at: dates[0] ?? null, last_updated: last, total_snapshots: dates.length,
-    covered_listings: last ? Object.keys(((await loadIndex(last)) as any).resources ?? {}).length : 0 };
+  const dates = await snapshotDates(); const last = dates.at(-1) ?? null; // last successful snapdate
+  const today = new Date().toISOString().slice(0, 10);
+  const todayFail = await loadFail(today);
+  const st = await latestSnapStatus(last);
+  const status = todayFail && (!last || today >= last) ? "failed" as const : st.status;
+  const failed_pages = todayFail && status === "failed" ? todayFail.failed_pages : st.failed_pages;
+  // L1: fixed error codes only (never free-form exception text in the signed payload)
+  const last_error = todayFail && status === "failed"
+    ? (todayFail.error_code || mapErrorCode(todayFail.error))
+    : (st.error_code ?? null);
+  // L2/L3: covered_listings == listings; last_attempt_at from stored meta or fail record only (null if unknown)
+  let covered = 0;
+  let last_attempt_at: string | null = todayFail?.at ?? null;
+  if (last) {
+    const { readSnapMeta } = await import("./lib/preflight.ts");
+    const m = await readSnapMeta(last);
+    covered = m?.listings ?? 0;
+    if (!last_attempt_at) last_attempt_at = m?.last_attempt_at ?? null;
+  }
+  const meta = { version: 1, started_at: dates[0] ?? null, last_updated: last,
+    last_attempt_at, total_snapshots: dates.length, covered_listings: covered,
+    last_status: status, last_failed_pages: failed_pages, last_error };
   const e = await sign(meta, env);
   return { metadata: e.facts, signature: e.signature, pubkey_url: "/x402/preflight/pubkey" };
 }
@@ -127,8 +146,10 @@ export async function snapshotSummary(limit = 30) {
     if (!SNAP_SUM.has(d)) {
       const idx: any = await loadIndex(d); const res: Record<string, any> = idx.resources ?? {};
       const vals = Object.values(res);
-      SNAP_SUM.set(d, { date: d, resources: vals.length, hosts: Object.keys(idx.hosts ?? {}).length, payout_wallets: Object.keys(idx.wallet_hosts ?? {}).length,
-        calls30d_total: vals.reduce((a, r) => a + (r.calls30d || 0), 0), payers30d_total: vals.reduce((a, r) => a + (r.payers30d || 0), 0) });
+      const hosts = idx.tier === "aggregate" ? (idx.aggregate?.hosts ?? 0) : Object.keys(idx.hosts ?? {}).length;
+      const wallets = idx.tier === "aggregate" ? (idx.aggregate?.payout_wallets ?? 0) : Object.keys(idx.wallet_hosts ?? {}).length;
+      SNAP_SUM.set(d, { date: d, resources: idx.tier === "full" ? vals.length : (idx.listings ?? 0), hosts, payout_wallets: wallets,
+        calls30d_total: vals.reduce((a: number, r: any) => a + (r.calls30d || 0), 0), payers30d_total: vals.reduce((a: number, r: any) => a + (r.payers30d || 0), 0) });
     }
     out.push(SNAP_SUM.get(d)!);
   }
@@ -332,7 +353,7 @@ async function paid(path: string, q: Record<string, string>, qs: string, sig: st
 if (import.meta.main) {
   const env = (k: string) => Deno.env.get(k);
   if ((env("SNAPSHOT_SCHEDULER") ?? "1") === "1") {
-    Deno.cron("bazaar-snapshot", "15 0 * * *", async () => { await scheduledSnapshot(); }); // bounded, max once per 24 h
+    Deno.cron("bazaar-snapshot", "15 0 * * *", async () => { await scheduledSnapshot(); }); // bounded, max once per UTC day
     Deno.cron("fail-counter-purge", "7 0 * * *", async () => { await FAILS.purge(); });
   }
   for (const w of startupWarnings(env)) console.warn("WARNING:", w);
