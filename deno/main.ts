@@ -9,7 +9,7 @@ import { CDP_HOST, enabled as cdpEnabled, headers as cdpHeaders } from "./lib/cd
 import * as SG from "./lib/settle_guard.ts";
 import { SCHEMA, snapshotDates, loadIndex } from "./lib/preflight.ts";
 import { isoOrNull, keyHistory, publicKeyInfo, sign, SigningUnavailable } from "./lib/sign.ts";
-import { scheduledSnapshot } from "./lib/snapshot.ts";
+import { scheduledSnapshot, latestSnapStatus, loadFail } from "./lib/snapshot.ts";
 import { EXPORT_FILES, rows } from "./lib/store.ts";
 import { recordObservation, recordSale, verifyOnchain } from "./lib/stream.ts";
 import { ADDR, b64json, iso, pyQuery, sha256hex, unquote } from "./lib/util.ts";
@@ -115,8 +115,24 @@ export async function wellKnown(env: Deps["env"]) {
 /** Free, signed metadata about the daily Bazaar snapshot series (no snapshot contents). */
 export async function snapshotMeta(env: Deps["env"] = (k) => Deno.env.get(k)) {
   const dates = await snapshotDates(); const last = dates.at(-1) ?? null;
-  const meta = { version: 1, started_at: dates[0] ?? null, last_updated: last, total_snapshots: dates.length,
-    covered_listings: last ? Object.keys(((await loadIndex(last)) as any).resources ?? {}).length : 0 };
+  const st = await latestSnapStatus(last);
+  // Prefer a same-day failure over a stale success when the latest calendar attempt failed with no index.
+  const today = new Date().toISOString().slice(0, 10);
+  const todayFail = await loadFail(today);
+  const status = todayFail && (!last || today >= last) ? "failed" : st.status;
+  const failed_pages = todayFail && status === "failed" ? todayFail.failed_pages : st.failed_pages;
+  const last_error = todayFail && status === "failed" ? todayFail.error : st.error;
+  let covered = 0;
+  if (last) {
+    try {
+      const idx: any = await loadIndex(last);
+      covered = idx.tier === "aggregate" ? (idx.listings ?? 0) : Object.keys(idx.resources ?? {}).length;
+      if (idx.tier === "reduced" || idx.tier === "aggregate") covered = idx.listings ?? covered;
+    } catch { /* ignore */ }
+  }
+  const meta = { version: 1, started_at: dates[0] ?? null, last_updated: todayFail && status === "failed" ? today : last,
+    total_snapshots: dates.length, covered_listings: covered,
+    last_status: status, last_failed_pages: failed_pages, last_error };
   const e = await sign(meta, env);
   return { metadata: e.facts, signature: e.signature, pubkey_url: "/x402/preflight/pubkey" };
 }
@@ -332,7 +348,7 @@ async function paid(path: string, q: Record<string, string>, qs: string, sig: st
 if (import.meta.main) {
   const env = (k: string) => Deno.env.get(k);
   if ((env("SNAPSHOT_SCHEDULER") ?? "1") === "1") {
-    Deno.cron("bazaar-snapshot", "15 0 * * *", async () => { await scheduledSnapshot(); }); // bounded, max once per 24 h
+    Deno.cron("bazaar-snapshot", "15 0 * * *", async () => { await scheduledSnapshot(); }); // bounded, max once per UTC day
     Deno.cron("fail-counter-purge", "7 0 * * *", async () => { await FAILS.purge(); });
   }
   for (const w of startupWarnings(env)) console.warn("WARNING:", w);

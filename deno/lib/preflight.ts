@@ -167,7 +167,10 @@ export function validateChallenge(ch: any): [boolean, string[], Record<string, u
 // ---------- Bazaar snapshot index (same shape as Python build_index) ----------
 export type Index = { date: string; listings: number; hosts: Record<string, number>; wallet_hosts: Record<string, string[]>;
   resources: Record<string, { payers30d: unknown; calls30d: unknown; lastCalledAt: unknown; payTo: string[] }>;
-  coverage?: { pages_fetched: number; max_pages: number; items_indexed: number; bazaar_total: number | null; complete: boolean } };
+  coverage?: { pages_fetched: number; max_pages: number; items_indexed: number; bazaar_total: number | null; complete: boolean;
+    status?: "complete" | "partial"; partial?: boolean; failed_pages?: number[] };
+  status?: "complete" | "partial"; tier?: "full" | "reduced" | "aggregate";
+  aggregate?: { hosts: number; payout_wallets: number } };
 export function hostOf(url: string) { try { return new URL(url).hostname.toLowerCase(); } catch { return ""; } }
 export class IndexAssembler {
   hosts: Record<string, number> = {}; wallets = new Map<string, Set<string>>(); res: Index["resources"] = {}; n = 0;
@@ -193,15 +196,17 @@ async function gz(s: string, mode: "c" | "d", data?: Uint8Array): Promise<Uint8A
   const stream = mode === "c" ? new Blob([s]).stream().pipeThrough(new CompressionStream("gzip")) : new Blob([data! as Uint8Array<ArrayBuffer>]).stream().pipeThrough(new DecompressionStream("gzip"));
   return new Uint8Array(await new Response(stream).arrayBuffer());
 }
-export async function saveIndex(idx: Index, keep = 60) {
-  const k = await kv(); const z = await gz(JSON.stringify(idx), "c"); const n = Math.ceil(z.length / CHUNK);
+/** Persist a snapshot index. Tiered retention (see applyTierRetention) demotes old days; this never deletes day history.
+ *  `keep` is ignored (retained for call-site compatibility). Pass skipRetention when demoting to avoid recursion. */
+export async function saveIndex(idx: Index, _keep?: number, skipRetention = false) {
+  if (!idx.tier) idx.tier = "full";
+  const k = await kv();
+  // Replace any previous chunks for this date (demotion / rewrite).
+  for await (const e of k.list({ prefix: ["snap", idx.date] })) await k.delete(e.key);
+  const z = await gz(JSON.stringify(idx), "c"); const n = Math.ceil(z.length / CHUNK);
   for (let i = 0; i < n; i++) await k.set(["snap", idx.date, i], z.slice(i * CHUNK, (i + 1) * CHUNK));
-  await k.set(["snapdate", idx.date], n);
-  const dates = await snapshotDates();
-  for (const d of dates.slice(0, Math.max(0, dates.length - keep))) {
-    for await (const e of k.list({ prefix: ["snap", d] })) await k.delete(e.key);
-    await k.delete(["snapdate", d]);
-  }
+  await k.set(["snapdate", idx.date], { chunks: n, tier: idx.tier, status: idx.status ?? idx.coverage?.status ?? null });
+  void skipRetention; // demotion is driven explicitly by applyTierRetention in snapshot.ts
 }
 export async function snapshotDates(): Promise<string[]> {
   const k = await kv(); const out: string[] = [];
@@ -232,15 +237,18 @@ export async function bazaarFacts(url: string, paytoList: string[], maxTrend = 1
   // Optional prepay-check/v1 fields when the Deno snapshot is capped (coverage.complete !== true):
   // listed:null + listed_reason:"not_in_indexed_part" if the resource was not found in the indexed pages;
   // host_listing_count_is_min / payout_wallet_reuse_is_min mark those counts as lower bounds (same field names kept for compatibility).
-  const coverage = idx.coverage ?? { complete: null as boolean | null };
-  const incomplete = coverage.complete !== true;
+  // listed:false only when coverage.complete === true (M2). Otherwise null + reason when not found.
+  const coverage = idx.coverage
+    ? { ...idx.coverage, status: idx.coverage.status ?? idx.status, complete: idx.coverage.complete }
+    : { complete: null as boolean | null, status: idx.status ?? null };
+  const isComplete = coverage.complete === true;
   const found = cur !== null;
   const out: Record<string, unknown> = { available: true, snapshot_date: last,
-    listed: found ? true : (incomplete ? null : false), listed_payTo: listedPayTo,
+    listed: found ? true : (isComplete ? false : null), listed_payTo: listedPayTo,
     host_listing_count: idx.hosts[h] ?? 0, payout_wallet_reuse: wl,
     last_called_at: cur ? cur.lastCalledAt : null, payer_trend: trend, coverage };
-  if (!found && incomplete) out.listed_reason = "not_in_indexed_part";
-  if (incomplete) { out.host_listing_count_is_min = true; out.payout_wallet_reuse_is_min = true; }
+  if (!found && !isComplete) out.listed_reason = "not_in_indexed_part";
+  if (!isComplete) { out.host_listing_count_is_min = true; out.payout_wallet_reuse_is_min = true; }
   return out;
 }
 
