@@ -204,9 +204,11 @@ async function paid(path: string, q: Record<string, string>, qs: string, sig: st
     }
     return await new Chain(rpc, c.USDC).handle(path, q);
   };
-  const release = await SG.acquireSlots(ids);
-  if (!release) return [429, { error: "too many concurrent payments, retry shortly", scope: "concurrency" }, {}];
-  try { return await paidLocked(); } finally { await release(); }
+  const busy: [number, unknown, Record<string, string>] = [429, { error: "too many concurrent payments, retry shortly", scope: "concurrency" }, {}];
+  const release = await SG.acquireSlots({ ip: ids.ip }); // per-IP slot now; per-payer slot only after verify (L1)
+  if (!release) return busy;
+  const held: { payer: (() => Promise<void>) | null } = { payer: null };
+  try { return await paidLocked(); } finally { if (held.payer) await held.payer(); await release(); }
   async function paidLocked(): Promise<[number, unknown, Record<string, string>]> {
   const lim = await FAILS.blocked(ids); // checked while holding a slot: bursts cannot overshoot by more than the slot count
   if (lim) return [429, { error: "too many failed payments, retry later", scope: lim }, {}];
@@ -228,6 +230,9 @@ async function paid(path: string, q: Record<string, string>, qs: string, sig: st
   const body = { x402Version: 2, paymentPayload: payload, paymentRequirements: r };
   const v = await fac("/verify", body); const tVer = iso();
   if (!v.isValid) { const why = facErr(v.invalidReason); await FAILS.fail({ ip: ids.ip }, "verify"); return [402, { error: why }, noPay(why, N)]; }
+  held.payer = await SG.acquireSlots({ payer: who }); // L1: a forged `from` never reaches this line
+  if (!held.payer) { await SG.unclaim(key); return busy; } // not settled: the same authorization may be retried
+  if (await FAILS.blocked({ payer: who })) { await SG.unclaim(key); return [429, { error: "too many failed payments, retry later", scope: "payer" }, {}]; }
   let code: number, out: unknown;
   try { [code, out] = await run(); } catch (e) {
     if (e instanceof SigningUnavailable) return [503, { error: "signing unavailable, not charged" }, {}];

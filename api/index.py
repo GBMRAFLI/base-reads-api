@@ -211,11 +211,15 @@ def paid(path, q, qs, sig, t_req, check=None, ip=None):
     if bad: return 402, {"error": bad}, no_pay(bad)
     who, nonce = SG.payer_of(payload), SG.nonce_of(payload); ids = {"ip": ip, "payer": who}
     check = check or (lambda tx, rq, payer: MS.verify_onchain(rpc, tx, rq["asset"], rq["payTo"], rq["amount"], payer, NETWORK, attempts=3, wait=1.0, nonce=nonce))
-    release = SLOTS.acquire(ids)
-    if release is None: return 429, {"error": "too many concurrent payments, retry shortly", "scope": "concurrency"}, {}
-    try: return _paid_locked(path, q, qs, payload, r, who, ids, check, t_req)
-    finally: release()
-def _paid_locked(path, q, qs, payload, r, who, ids, check, t_req):
+    release = SLOTS.acquire({"ip": ip})   # per-IP slot now; per-payer slot only after verify (L1)
+    if release is None: return BUSY
+    held = []
+    try: return _paid_locked(path, q, qs, payload, r, who, ids, check, t_req, held)
+    finally:
+        for h in held: h()
+        release()
+BUSY = (429, {"error": "too many concurrent payments, retry shortly", "scope": "concurrency"}, {})
+def _paid_locked(path, q, qs, payload, r, who, ids, check, t_req, held):
     ip = ids["ip"]
     lim = FAILS.blocked(ids)   # checked while holding a slot: bursts cannot overshoot by more than the slot count
     if lim: return 429, {"error": "too many failed payments, retry later", "scope": lim}, {}
@@ -230,6 +234,10 @@ def _paid_locked(path, q, qs, payload, r, who, ids, check, t_req):
     v = fac("/verify", body); t_ver = iso(time.time())
     if not v.get("isValid"):
         why = fac_err(v.get("invalidReason")); FAILS.fail({"ip": ip}, "verify"); return 402, {"error": why}, no_pay(why)
+    rp = SLOTS.acquire({"payer": who})   # L1: a forged `from` never reaches this line
+    if rp is None: REPLAY.unclaim(key); return BUSY
+    held.append(rp)
+    if FAILS.blocked({"payer": who}): REPLAY.unclaim(key); return 429, {"error": "too many failed payments, retry later", "scope": "payer"}, {}
     try: code, out = handle(path, q)
     except RuntimeError: return 503, {"error": "signing unavailable, not charged"}, {}
     except Exception: return 502, {"error": "upstream error, not charged"}, {}

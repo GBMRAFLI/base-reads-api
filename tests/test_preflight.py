@@ -368,6 +368,20 @@ class T10(T7):
         self.assertLessEqual(self.calls.count("/settle"), 3 - 1 + IX.SG.SLOTS["payer"]); self.assertIn(429, out)
         S = IX.SG.Slots({"payer": 1, "ip": 1}); rel = S.acquire({"payer": "p", "ip": "1.1.1.1"}); self.assertIsNotNone(rel)
         self.assertIsNone(S.acquire({"payer": "p"})); rel(); self.assertIsNotNone(S.acquire({"payer": "p"}))
+    def test_l1_forged_from_never_holds_payer_slot(self):
+        gate = threading.Event(); good = IX.fac
+        def bad(p, body): gate.wait(2); return {"isValid": False, "invalidReason": "invalid_exact_evm_payload_signature"}
+        IX.fac = bad; out = []
+        ths = [threading.Thread(target=lambda i=i: out.append(IX.paid("/base/network", {}, "", self.pay(), "t", check=self.check, ip=f"10.9.{i}.1")[0])) for i in range(2 * IX.SG.SLOTS["payer"])]
+        [t.start() for t in ths]; time.sleep(0.2)
+        self.assertEqual(IX.SLOTS.m.get(("payer", self.PAYER), 0), 0)   # forged requests parked in /verify hold no payer slot
+        gate.set(); [t.join() for t in ths]; self.assertEqual(sorted(set(out)), [402])
+        IX.fac = good; self.assertEqual(self.run_paid(self.pay())[0], 200)
+    def test_l1_payer_busy_after_verify_releases_authorization(self):
+        held = [IX.SLOTS.acquire({"payer": self.PAYER}) for _ in range(IX.SG.SLOTS["payer"])]; sig = self.pay()
+        c, out, _ = self.run_paid(sig); self.assertEqual((c, out["scope"]), (429, "concurrency")); self.assertNotIn("/settle", self.calls)
+        for h in held: h()
+        self.assertEqual(self.run_paid(sig)[0], 200)
     def test_n5_extra_cidrs_require_test_flag(self):
         self.assertEqual(PF._extra_cidrs({}), [])
         with self.assertRaises(SystemExit): PF._extra_cidrs({"PREFLIGHT_EXTRA_ALLOWED_CIDRS": "10.0.0.0/8"})

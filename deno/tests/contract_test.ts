@@ -468,3 +468,37 @@ Deno.test("A10 startup warnings for invalid CREATED_AT / HISTORY dates", async (
   assertEquals(w({ SIGNING_KEY_HISTORY: JSON.stringify([{ created_at: "yesterday", retired_at: "2026-10-01T00:00:00Z" }]) }), ["SIGNING_KEY_HISTORY[0].created_at is not strict ISO-8601 UTC; published as null"]);
   assertEquals(w({ SIGNING_KEY_HISTORY: "{" }).length, 1);
 });
+Deno.test("L1 payer slot is taken only after verify: forged `from` floods cannot 429 the real payer", async () => {
+  await resetGuards();
+  let open!: () => void; const gate = new Promise<void>((r) => open = r);
+  const fac = async (p: string) => { if (p === "/verify") { await gate; return { isValid: false, invalidReason: "invalid_exact_evm_payload_signature" }; } return {}; };
+  const forged = Array.from({ length: 2 * SG.SLOTS.payer }, (_, i) =>
+    handler(new Request("http://h/base/network", { headers: { "PAYMENT-SIGNATURE": pay() } }), { env, fac, ip: `10.9.${i}.1` }));
+  await new Promise((r) => setTimeout(r, 50)); // all forged requests are now parked inside /verify
+  const rel = await SG.acquireSlots({ payer: PAYER }, { payer: 1, ip: 1 }); assert(rel, "payer slot 0 must still be free while forged requests are in flight");
+  await rel!(); open();
+  for (const r of await Promise.all(forged)) { assertEquals(r.status, 402); await r.body?.cancel(); }
+  const t = rig({ v: { settled: true } }); assertEquals((await t.call(pay()))[0], 200);
+  await resetGuards();
+});
+Deno.test("L1 payer slots full after verify -> 429 and the authorization is released for retry (not burnt)", async () => {
+  await resetGuards();
+  const held = []; for (let i = 0; i < SG.SLOTS.payer; i++) held.push(await SG.acquireSlots({ payer: PAYER }));
+  const t = rig({ v: { settled: true } }); const sig = pay();
+  const [c1, o1] = await t.call(sig); assertEquals([c1, o1.scope], [429, "concurrency"]); assert(!t.calls.includes("/settle"));
+  for (const h of held) await h!();
+  assertEquals((await t.call(sig))[0], 200);
+  await resetGuards();
+});
+Deno.test("L2 slot TTL covers worst case; release is versionstamp-checked and never frees a re-taken slot", async () => {
+  await resetGuards();
+  assert(SG.SLOT_TTL_MS >= 180_000 && SG.SLOT_TTL_MS <= 200_000);
+  const { kv } = await import("../lib/store.ts"); const k = await kv();
+  const rel = await SG.acquireSlots({ payer: "0xslot" }, { payer: 1, ip: 1 }); assert(rel);
+  const key = ["inflight", "payer", "0xslot", 0];
+  await k.set(key, { token: "someone-else" }, { expireIn: 60_000 }); // simulate: ours expired, another request took it
+  await rel!();
+  assertEquals(((await k.get(key)).value as any)?.token, "someone-else");
+  assertEquals(await SG.acquireSlots({ payer: "0xslot" }, { payer: 1, ip: 1 }), null);
+  await k.delete(key); await resetGuards();
+});

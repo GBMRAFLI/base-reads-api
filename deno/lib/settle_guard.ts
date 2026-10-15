@@ -66,6 +66,8 @@ function canonicalJson(o: unknown): string {
 }
 /** Atomic check-and-set of a used payment authorization in KV, kept until validBefore (+60 s) or the TTL, whichever is later.
  * Never released: a signature is spent once seen, so concurrent or later duplicates are rejected consistently across isolates. */
+/** Undo a claim this request made (versionstamp-free: only used right after our own claim, before any settle). */
+export async function unclaim(key: string) { await (await kv()).delete(["nonce", key]); }
 export async function claim(key: string, expiresAtSec: number | null = null, ttlMs = 3600_000, nowMs = Date.now(), meta: unknown = nowMs): Promise<boolean> {
   const k = await kv(); const kk = ["nonce", key];
   const expireIn = Math.max(ttlMs, expiresAtSec ? expiresAtSec * 1000 - nowMs : 0);
@@ -150,17 +152,27 @@ export class FailLimiter {
   async clear() { const k = await kv(); for (const p of ["fail", "failalert", "inflight"]) for await (const e of k.list({ prefix: [p] })) await k.delete(e.key); }
 }
 /** Concurrency slots so a parallel burst cannot slip past blocked() before its failures are counted: at most `payer`
- * in-flight paid requests per payer and `ip` per IP (/64). Each slot is an atomic set-if-absent key with expireIn (crash-safe),
- * released when the request finishes. Worst-case overshoot of a failure limit is therefore bounded by the slot count. */
+ * in-flight paid requests per payer and `ip` per IP (/64). Each slot is an atomic set-if-absent key with expireIn (crash-safe).
+ * The IP slot is taken first; the payer slot only after the facilitator verified the signature (an unverified `from`
+ * cannot occupy a victim's slots). Each slot stores a random token and is released with a versionstamp-checked delete,
+ * so a slot that expired and was re-taken by another request is never freed by the original holder.
+ * SLOT_TTL_MS covers the worst-case request (2 x 40 s facilitator + probe + on-chain check). */
 export const SLOTS = { payer: 4, ip: 8 };
-export async function acquireSlots(ids: { ip?: string | null; payer?: string | null }, slots = SLOTS, ttlMs = 120_000): Promise<(() => Promise<void>) | null> {
-  const k = await kv(); const held: Deno.KvKey[] = [];
-  const release = async () => { for (const h of held) await k.delete(h); };
+export const SLOT_TTL_MS = 190_000;
+type Held = { key: Deno.KvKey; vs: string };
+async function releaseHeld(held: Held[]) {
+  const k = await kv();
+  for (const h of held) await k.atomic().check({ key: h.key, versionstamp: h.vs }).delete(h.key).commit();
+}
+export async function acquireSlots(ids: { ip?: string | null; payer?: string | null }, slots = SLOTS, ttlMs = SLOT_TTL_MS): Promise<(() => Promise<void>) | null> {
+  const k = await kv(); const held: Held[] = [];
+  const release = () => releaseHeld(held);
   for (const [scope, who] of [["payer", ids.payer], ["ip", ipKey(ids.ip)]] as const) {
     if (!who) continue; let got = false;
     for (let i = 0; i < slots[scope] && !got; i++) {
       const key = ["inflight", scope, who, i];
-      if ((await k.atomic().check({ key, versionstamp: null }).set(key, Date.now(), { expireIn: ttlMs }).commit()).ok) { held.push(key); got = true; }
+      const r = await k.atomic().check({ key, versionstamp: null }).set(key, { at: Date.now(), token: crypto.randomUUID() }, { expireIn: ttlMs }).commit();
+      if (r.ok) { held.push({ key, vs: r.versionstamp }); got = true; }
     }
     if (!got) { await release(); return null; }
   }

@@ -68,6 +68,9 @@ class Replay:
             for k in [k for k, t in s.m.items() if t < now]: s.m.pop(k, None); s.pending.pop(k, None)
             if key in s.m: return False
             s.m[key] = max(expires_at or 0, now + s.ttl); return True
+    def unclaim(s, key):
+        """Undo our own claim before any settle (payer busy/blocked after verify), so the same authorization can be retried."""
+        with s.lock: s.m.pop(key, None)
     def set_pending(s, key, rec):
         with s.lock: s.pending[key] = rec
     def take_pending(s, key):
