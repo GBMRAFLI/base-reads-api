@@ -222,7 +222,7 @@ class T7(unittest.TestCase):
         self.calls = []; self.tx = "0x" + os.urandom(32).hex(); self.settle = lambda: {"success": True, "transaction": self.tx, "payer": self.PAYER, "network": IX.NETWORK}
         def fac(p, body): self.calls.append(p); return {"isValid": True, "payer": self.PAYER} if p == "/verify" else self.settle()
         self.old = (IX.fac, IX.handle); IX.fac = fac; IX.handle = lambda path, q: (200, {"ok": True})
-        IX.REPLAY, IX.FAILS = IX.SG.Replay(), IX.SG.FailLimiter()
+        IX.REPLAY, IX.FAILS, IX.SLOTS = IX.SG.Replay(), IX.SG.FailLimiter(), IX.SG.Slots()
         self.chain = {"settled": True, "block": 1}; self.check = lambda tx, r, payer: dict(self.chain)
     def tearDown(self): IX.fac, IX.handle = self.old
     def run_paid(self, sig, path="/base/network"): return IX.paid(path, {}, "", sig, "t", check=self.check)
@@ -341,19 +341,49 @@ class T10(T7):
         c, _, hd = self.run_paid(self.pay()); self.assertEqual(c, 200); self.assertEqual(seen, [self.PAYER])
         pr = json.loads(base64.b64decode(hd["PAYMENT-RESPONSE"]))
         self.assertEqual(sorted(pr), ["network", "payer", "success", "transaction"]); self.assertEqual(pr["payer"], self.PAYER)
-    def test_a3_limits_payer_ip_global(self):
-        L = IX.SG.FailLimiter({"payer": 3, "ip": 5, "global": 9}, 60); now = 1_000_000
-        for _ in range(3): L.fail({"payer": "p"}, now)
+    def test_a3_n1_limits_payer_ip_global_alert_only(self):
+        L = IX.SG.FailLimiter({"payer": 3, "ip": 5}, 60, global_alert=4); now = 1_000_000
+        for _ in range(3): L.fail({"payer": "p"}, "settle", now)
         self.assertEqual(L.blocked({"payer": "p"}, now), "payer"); self.assertIsNone(L.blocked({"payer": "q"}, now)); self.assertIsNone(L.blocked({"payer": "p"}, now + 121))
-        for _ in range(5): L.fail({"ip": "1.2.3.4"}, now)
-        self.assertEqual(L.blocked({"ip": "1.2.3.4", "payer": "q"}, now), "ip"); L.fail({"ip": "5"}, now); self.assertEqual(L.blocked({"ip": "5"}, now), "global")
-        ths = [threading.Thread(target=L.fail, args=({"payer": "z"}, now)) for _ in range(50)]; [t.start() for t in ths]; [t.join() for t in ths]
+        for _ in range(5): L.fail({"ip": "1.2.3.4", "payer": "v"}, "verify", now)
+        self.assertEqual(L.blocked({"ip": "1.2.3.4", "payer": "q"}, now), "ip"); self.assertEqual(L.count("payer", "v", now), 0)
+        self.assertEqual(L.count("global", "*", now), 3)                                  # verify failures never count globally
+        L.fail({}, "settle", now); L.fail({}, "settle", now)
+        self.assertIsNone(L.blocked({"ip": "5.5.5.5", "payer": "q"}, now))                  # global never blocks
+        self.assertEqual(len(L.alerts), 1); L.fail({}, "settle", now); self.assertEqual(len(L.alerts), 1)   # alert once per window
+        for i in range(5): L.fail({"ip": f"2001:db8:1:2::{i + 1}"}, "verify", now)
+        self.assertEqual(L.blocked({"ip": "2001:db8:1:2:ffff::9"}, now), "ip"); self.assertIsNone(L.blocked({"ip": "2001:db8:1:3::1"}, now))
+        self.assertEqual([IX.SG.ip_key("2001:DB8:1:2::1"), IX.SG.ip_key("::ffff:1.2.3.4"), IX.SG.ip_key("1.2.3.4")], ["2001:db8:1:2::/64", "1.2.3.4", "1.2.3.4"])
+        ths = [threading.Thread(target=L.fail, args=({"payer": "z"}, "settle", now)) for _ in range(50)]; [t.start() for t in ths]; [t.join() for t in ths]
         self.assertEqual(L.count("payer", "z", now), 50)
+    def test_n1_junk_from_many_ips_never_locks_out_buyers(self):
+        good = IX.fac; IX.fac = lambda p, body: {"isValid": False, "invalidReason": "invalid_exact_evm_payload_signature"}
+        for ip in range(40):
+            for _ in range(10): IX.paid("/base/network", {}, "", self.pay(), "t", check=self.check, ip=f"10.0.{ip}.1")
+        IX.fac = good; self.assertEqual(self.run_paid(self.pay())[0], 200)
+    def test_n3_parallel_burst_bounded_by_slots(self):
+        self.settle = lambda: (time.sleep(0.02), {"success": False, "errorReason": "insufficient_funds"})[1]; self.chain = {"settled": False, "reason": "x"}
+        out = []; ths = [threading.Thread(target=lambda: out.append(self.run_paid(self.pay())[0])) for _ in range(30)]
+        [t.start() for t in ths]; [t.join() for t in ths]
+        self.assertLessEqual(self.calls.count("/settle"), 3 - 1 + IX.SG.SLOTS["payer"]); self.assertIn(429, out)
+        S = IX.SG.Slots({"payer": 1, "ip": 1}); rel = S.acquire({"payer": "p", "ip": "1.1.1.1"}); self.assertIsNotNone(rel)
+        self.assertIsNone(S.acquire({"payer": "p"})); rel(); self.assertIsNotNone(S.acquire({"payer": "p"}))
+    def test_n5_extra_cidrs_require_test_flag(self):
+        self.assertEqual(PF._extra_cidrs({}), [])
+        with self.assertRaises(SystemExit): PF._extra_cidrs({"PREFLIGHT_EXTRA_ALLOWED_CIDRS": "10.0.0.0/8"})
+        self.assertEqual(PF._extra_cidrs({"PREFLIGHT_EXTRA_ALLOWED_CIDRS": "10.0.0.0/8", "PREFLIGHT_TEST_MODE": "1"}), [PF.ipaddress.ip_network("10.0.0.0/8")])
+    def test_a10_startup_warnings(self):
+        self.assertEqual(PF.startup_warnings({"SIGNING_KEY_CREATED_AT": "2026-10-14T12:00:21Z"}), []); self.assertEqual(PF.startup_warnings({}), [])
+        self.assertEqual(len(PF.startup_warnings({"SIGNING_KEY_CREATED_AT": "2026-10-14"})), 1)
+        self.assertEqual(PF.startup_warnings({"SIGNING_KEY_HISTORY": json.dumps([{"created_at": "yesterday", "retired_at": "2026-10-01T00:00:00Z"}])}),
+                         ["SIGNING_KEY_HISTORY[0].created_at is not strict ISO-8601 UTC; published as null"])
+        self.assertEqual(len(PF.startup_warnings({"SIGNING_KEY_HISTORY": "{"})), 1)
     def test_a3_verify_failures_count_per_ip_not_payer(self):
         IX.fac = lambda p, body: {"isValid": False, "invalidReason": "invalid_exact_evm_payload_signature"}
         for _ in range(10): self.assertEqual(IX.paid("/base/network", {}, "", self.pay(), "t", check=self.check, ip="9.9.9.9")[0], 402)
         c, out, _ = IX.paid("/base/network", {}, "", self.pay(), "t", check=self.check, ip="9.9.9.9"); self.assertEqual((c, out["scope"]), (429, "ip"))
         self.assertIsNone(IX.FAILS.blocked({"payer": self.PAYER.lower(), "ip": "8.8.8.8"}))
+        self.assertEqual(IX.FAILS.count("global", "*"), 0)
     def test_a8_error_allowlist_and_rebuilt_payment_response(self):
         self.assertEqual(IX.fac_err("insufficient_funds"), "insufficient_funds"); self.assertEqual(IX.fac_err("<script>"), "facilitator_error")
         self.settle = lambda: {"success": False, "errorReason": "evil", "debug": "internal"}; self.chain = {"settled": False, "reason": "x"}
@@ -370,7 +400,9 @@ class T10(T7):
         for bad in ("2026-10-14", "2026-02-30T00:00:00Z", "2026-10-14T12:00:21+07:00", "<b>", 5, None): self.assertIsNone(PF.iso_or_none(bad))
     def test_a11_pins(self):
         root = os.path.join(os.path.dirname(__file__), "..")
-        self.assertRegex(open(os.path.join(root, "requirements.txt")).read(), r"(?m)^pycryptodome==\d+\.\d+\.\d+$")
+        req = open(os.path.join(root, "requirements.txt")).read()
+        self.assertRegex(req, r"(?m)^pycryptodome==\d+\.\d+\.\d+ \\$"); self.assertGreaterEqual(req.count("--hash=sha256:"), 1)
+        for f in ("Dockerfile", ".github/workflows/test.yml"): self.assertIn("--require-hashes", open(os.path.join(root, f)).read(), f)
         self.assertRegex(open(os.path.join(root, "Dockerfile")).read(), r"(?m)^FROM python:[\w.-]+@sha256:[0-9a-f]{64}$")
     def test_ssrf_review(self):
         for ip in ("100.64.0.1", "::ffff:127.0.0.1", "::7f00:1", "64:ff9b::7f00:1", "2002:7f00:1::1", "2001:0:4136:e378::1", "169.254.169.254", "fd00::1", "192.0.0.8"):

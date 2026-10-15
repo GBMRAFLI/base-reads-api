@@ -169,7 +169,7 @@ def snapshot_summary(limit=30):
                             "calls30d_total": sum((r.get("calls30d") or 0) for r in res.values()), "payers30d_total": sum((r.get("payers30d") or 0) for r in res.values())}
         out.append(_SNAP_SUM[d])
     return {"source": "x402 Bazaar discovery API, crawled daily at 00:15 UTC", "snapshots": out}
-REPLAY, FAILS = SG.Replay(), SG.FailLimiter()
+REPLAY, FAILS, SLOTS = SG.Replay(), SG.FailLimiter(), SG.Slots()
 ONCHAIN_CHECK = os.environ.get("ONCHAIN_CHECK", "block")   # block: serve only after the nonce-bound USDC Transfer is confirmed on Base; log: serve on facilitator success (testnets only)
 MAINNET = "eip155:8453"
 def onchain_mode(mode=None, network=None):
@@ -211,7 +211,13 @@ def paid(path, q, qs, sig, t_req, check=None, ip=None):
     if bad: return 402, {"error": bad}, no_pay(bad)
     who, nonce = SG.payer_of(payload), SG.nonce_of(payload); ids = {"ip": ip, "payer": who}
     check = check or (lambda tx, rq, payer: MS.verify_onchain(rpc, tx, rq["asset"], rq["payTo"], rq["amount"], payer, NETWORK, attempts=3, wait=1.0, nonce=nonce))
-    lim = FAILS.blocked(ids)
+    release = SLOTS.acquire(ids)
+    if release is None: return 429, {"error": "too many concurrent payments, retry shortly", "scope": "concurrency"}, {}
+    try: return _paid_locked(path, q, qs, payload, r, who, ids, check, t_req)
+    finally: release()
+def _paid_locked(path, q, qs, payload, r, who, ids, check, t_req):
+    ip = ids["ip"]
+    lim = FAILS.blocked(ids)   # checked while holding a slot: bursts cannot overshoot by more than the slot count
     if lim: return 429, {"error": "too many failed payments, retry later", "scope": lim}, {}
     key = SG.replay_key(payload)
     if not REPLAY.claim(key, SG.expiry(payload)):
@@ -223,7 +229,7 @@ def paid(path, q, qs, sig, t_req, check=None, ip=None):
     body = {"x402Version": 2, "paymentPayload": payload, "paymentRequirements": r}
     v = fac("/verify", body); t_ver = iso(time.time())
     if not v.get("isValid"):
-        why = fac_err(v.get("invalidReason")); FAILS.fail({"ip": ip}); return 402, {"error": why}, no_pay(why)
+        why = fac_err(v.get("invalidReason")); FAILS.fail({"ip": ip}, "verify"); return 402, {"error": why}, no_pay(why)
     try: code, out = handle(path, q)
     except RuntimeError: return 503, {"error": "signing unavailable, not charged"}, {}
     except Exception: return 502, {"error": "upstream error, not charged"}, {}
@@ -237,7 +243,7 @@ def paid(path, q, qs, sig, t_req, check=None, ip=None):
         if oc.get("settled") is True and not tx_already_used(tx):   # facilitator said failed, chain says paid: honor it
             log_sale(path, r, sale(tx), times, dict(oc, note="settle_reported_failure_but_confirmed_onchain"), qs, True)
             return 200, out, pay_resp(True, tx, who)
-        why = fac_err(st.get("errorReason")); FAILS.fail(ids)
+        why = fac_err(st.get("errorReason")); FAILS.fail(ids, "settle")
         return 402, {"error": why}, pay_resp(False, tx, who, why)
     if not tx: log_mismatch(path, "settle_success_without_valid_tx_hash"); return 502, {"error": "settlement response invalid, contact support with your payment"}, {}
     if tx_already_used(tx): log_mismatch(path, "settlement_tx_reused"); return 409, {"error": "settlement transaction already used"}, no_pay("replay")
@@ -321,6 +327,7 @@ def snapshot_loop(run_once=None, sleep=time.sleep, now=time.time, stop=lambda: F
         try: run_once()
         except Exception as e: print("snapshot failed:", type(e).__name__, flush=True)
 if __name__ == "__main__":
+    for w in PF.startup_warnings(): print("WARNING:", w, flush=True)
     assert_onchain_mode()
     if os.environ.get("SNAPSHOT_SCHEDULER", "1") == "1":
         import threading; threading.Thread(target=snapshot_loop, daemon=True, name="bazaar-snapshot").start()

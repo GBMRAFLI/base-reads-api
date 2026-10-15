@@ -44,6 +44,19 @@ def iso_or_none(x):
     try: time.strptime(x[:19], "%Y-%m-%dT%H:%M:%S")
     except ValueError: return None
     return x
+def startup_warnings(env=os.environ):
+    """Non-fatal configuration problems, logged once at startup."""
+    w = []; ca = env.get("SIGNING_KEY_CREATED_AT")
+    if ca and not iso_or_none(ca): w.append("SIGNING_KEY_CREATED_AT is not strict ISO-8601 UTC (YYYY-MM-DDTHH:MM:SSZ); published as null")
+    try:
+        h = json.loads(env.get("SIGNING_KEY_HISTORY") or "[]")
+        if not isinstance(h, list): w.append("SIGNING_KEY_HISTORY is not a JSON list; ignored")
+        else:
+            for i, k in enumerate(h):
+                for f in ("created_at", "retired_at"):
+                    if isinstance(k, dict) and k.get(f) is not None and not iso_or_none(k[f]): w.append(f"SIGNING_KEY_HISTORY[{i}].{f} is not strict ISO-8601 UTC; published as null")
+    except ValueError: w.append("SIGNING_KEY_HISTORY is not valid JSON; ignored")
+    return w
 def _created_at():
     if os.environ.get("SIGNING_KEY_CREATED_AT"): return iso_or_none(os.environ["SIGNING_KEY_CREATED_AT"])
     if not os.environ.get("SIGNING_KEY_ENC_B64") and os.path.exists(KEY_PATH):
@@ -73,7 +86,16 @@ def verify(envelope):
 
 # ---------- target URL safety (no SSRF, no DNS rebinding) ----------
 import http.client, ssl
-_EXTRA = [ipaddress.ip_network(c.strip()) for c in os.environ.get("PREFLIGHT_EXTRA_ALLOWED_CIDRS", "").split(",") if c.strip()]  # local proxy testing only
+def _extra_cidrs(env=os.environ):
+    """PREFLIGHT_EXTRA_ALLOWED_CIDRS bypasses the address checks (local proxy tests only). Refuse to start with it
+    unless PREFLIGHT_TEST_MODE=1 is also set, so it cannot be left on in production by accident."""
+    raw = env.get("PREFLIGHT_EXTRA_ALLOWED_CIDRS", "")
+    if not raw.strip(): return []
+    if env.get("PREFLIGHT_TEST_MODE") != "1":
+        raise SystemExit("PREFLIGHT_EXTRA_ALLOWED_CIDRS is set without PREFLIGHT_TEST_MODE=1: refusing to start (it disables SSRF address checks)")
+    print("WARNING: PREFLIGHT_EXTRA_ALLOWED_CIDRS active (test mode): SSRF address checks relaxed for", raw, flush=True)
+    return [ipaddress.ip_network(c.strip()) for c in raw.split(",") if c.strip()]
+_EXTRA = _extra_cidrs()
 _EMBED_V4 = [ipaddress.ip_network(n) for n in ("::ffff:0:0/96", "::/96", "64:ff9b::/96", "64:ff9b:1::/48", "2002::/16", "2001::/32")]
 def ip_allowed(ip):
     """Only globally routable unicast. is_global also excludes shared/CGNAT 100.64/10, which is_private does not.

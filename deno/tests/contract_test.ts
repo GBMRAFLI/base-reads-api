@@ -75,7 +75,7 @@ Deno.test("SSRF guard rejects non-public answers", async () => {
   assertEquals((await checkUrl("https://ok.example/", res(["93.184.216.34"]))).err, null);
   for (const u of ["http://example.com", "https://127.0.0.1/x", "https://[::1]/", "file:///etc/passwd"]) assertEquals((await checkUrl(u, res(["93.184.216.34"]))).u, null, u);
   assertEquals((await checkUrl("https://nx.example/", res([]))).err, "dns_unresolvable");
-  assertEquals((await checkUrl("https://ok.example/", async () => null)).err, null);            // DNS API unavailable
+  assertEquals((await checkUrl("https://ok.example/", async () => null)).err, "dns resolution unavailable"); // N2: refuse
   assertEquals((await checkUrl("https://10.0.0.1/", async () => null)).u, null);               // literals still checked
 });
 Deno.test("preflight end-to-end: signed facts, bazaar facts from KV snapshot", async () => {
@@ -223,7 +223,8 @@ Deno.test("pending confirmation parks the payment and the same request is served
 Deno.test("duplicate signature: concurrent requests race on KV atomic check-and-set, exactly one wins", async () => {
   await resetGuards(); const t = rig({ v: { settled: true } }, undefined, 20); const sig = pay();
   const codes = (await Promise.all(Array.from({ length: 8 }, () => t.call(sig)))).map((x) => x[0]).sort();
-  assertEquals(codes, [200, 409, 409, 409, 409, 409, 409, 409]); assertEquals(t.calls.filter((x) => x === "/settle").length, 1);
+  assertEquals(codes.filter((c) => c === 200).length, 1); assert(codes.every((c) => [200, 409, 429].includes(c))); // 429 = concurrency slot (N3)
+  assertEquals(t.calls.filter((x) => x === "/settle").length, 1);
   assertEquals((await t.call(sig))[0], 409); // and later, consistently
 });
 Deno.test("prechecks before any facilitator call; settlement tx reuse; failed settle cooldown", async () => {
@@ -283,21 +284,50 @@ Deno.test("Permit2 and non-EIP-3009 payloads rejected before the facilitator", a
   }
   assertEquals(t.calls, []);
 });
-Deno.test("A3 FailLimiter: KV counters per payer/ip/global, shared by instances, atomic, expiring", async () => {
-  const lim = { payer: 3, ip: 5, global: 9 };
-  const a = new SG.FailLimiter(lim, 60_000), b = new SG.FailLimiter(lim, 60_000); await a.clear();
+Deno.test("A3/N1/N3 FailLimiter: KV sum counters per payer and IP (/64), global alert-only, shared by instances", async () => {
+  const a = new SG.FailLimiter({ payer: 3, ip: 5 }, 60_000, 4), b = new SG.FailLimiter({ payer: 3, ip: 5 }, 60_000, 4); await a.clear();
   const who = "0x" + "aa".repeat(20), now = Date.now();
-  await Promise.all([a.fail({ payer: who }, now), b.fail({ payer: who }, now), a.fail({ payer: who }, now)]); // no lost update
-  assertEquals(await b.count("payer", who, now), 3); assertEquals(await b.blocked({ payer: who }, now), "payer");
+  await Promise.all(Array.from({ length: 50 }, (_, i) => (i % 2 ? a : b).fail({ payer: who }, "settle", now))); // N3: sum() never loses an increment
+  assertEquals(await b.count("payer", who, now), 50); assertEquals(await b.blocked({ payer: who }, now), "payer");
   assertEquals(await b.blocked({ payer: "0x" + "bb".repeat(20) }, now), null);
-  assertEquals(await b.blocked({ payer: who }, now + 121_000), null); // two windows later: expired
-  for (let i = 0; i < 5; i++) await a.fail({ ip: "1.2.3.4" }, now);
-  assertEquals(await b.blocked({ ip: "1.2.3.4", payer: "0x" + "cc".repeat(20) }, now), "ip");
-  assertEquals(await b.blocked({ ip: "5.6.7.8" }, now), null); await b.fail({ ip: "5.6.7.8" }, now);
-  assertEquals(await b.blocked({ ip: "5.6.7.8" }, now), "global"); // 9 failures in total, from any source
-  const e = await (await import("../lib/store.ts")).kv().then((k) => k.get(["fail", "ip", "1.2.3.4", Math.floor(now / 60_000)]));
+  assertEquals(await b.blocked({ payer: who }, now + 121_000), null); // two windows later
+  const e = await (await import("../lib/store.ts")).kv().then((k) => k.get(["fail", "payer", who, Math.floor(now / 60_000)]));
   assert(e.value instanceof Deno.KvU64);
-  await a.clear(); assertEquals(await b.blocked({ payer: who, ip: "1.2.3.4" }, now), null);
+  // N1: global counts settle failures only, never blocks, alerts once per window
+  assert(await b.count("global", "*", now) >= 50); assertEquals(await b.blocked({ ip: "5.6.7.8", payer: "0x" + "cc".repeat(20) }, now), null);
+  const n = a.alerts.length + b.alerts.length; assertEquals(n, 1); await a.fail({}, "settle", now); assertEquals(a.alerts.length + b.alerts.length, 1);
+  // verify failures: IP only, never payer or global
+  const g0 = await b.count("global", "*", now);
+  for (let i = 0; i < 5; i++) await a.fail({ ip: "1.2.3.4", payer: "0x" + "dd".repeat(20) }, "verify", now);
+  assertEquals(await b.blocked({ ip: "1.2.3.4" }, now), "ip"); assertEquals(await b.count("payer", "0x" + "dd".repeat(20), now), 0); assertEquals(await b.count("global", "*", now), g0);
+  // IPv6 keyed on /64
+  for (let i = 0; i < 5; i++) await a.fail({ ip: `2001:db8:1:2::${i + 1}` }, "verify", now);
+  assertEquals(await b.blocked({ ip: "2001:db8:1:2:ffff::9" }, now), "ip"); assertEquals(await b.blocked({ ip: "2001:db8:1:3::1" }, now), null);
+  assertEquals([SG.ipKey("2001:DB8:1:2::1"), SG.ipKey("2001:db8:0:0:1::"), SG.ipKey("::ffff:1.2.3.4"), SG.ipKey("1.2.3.4")], ["2001:db8:1:2::/64", "2001:db8:0:0::/64", "1.2.3.4", "1.2.3.4"]);
+  // purge removes buckets older than the previous window (sum cannot carry expireIn)
+  assert(await a.purge(now + 600_000) > 0); assertEquals(await b.count("payer", who, now), 0);
+  await a.clear();
+});
+Deno.test("N1 junk signatures from many IPs never lock out other buyers", async () => {
+  await resetGuards();
+  const fac = async (p: string) => p === "/verify" ? { isValid: false, invalidReason: "invalid_exact_evm_payload_signature" } : {};
+  for (let ip = 0; ip < 40; ip++) for (let i = 0; i < 10; i++) {
+    const r = await handler(new Request("http://h/base/network", { headers: { "PAYMENT-SIGNATURE": pay() } }), { env, fac, ip: `10.0.${ip}.1` }); await r.body?.cancel();
+  }
+  const t = rig({ v: { settled: true } }); assertEquals((await t.call(pay()))[0], 200);
+  await resetGuards();
+});
+Deno.test("N3 blocked() race: a parallel burst cannot overshoot the payer limit by more than the slot count", async () => {
+  await resetGuards();
+  const t = rig({ v: { settled: false, reason: "x" } }, () => ({ success: false, errorReason: "insufficient_funds" }), 20);
+  const res = await Promise.all(Array.from({ length: 30 }, () => t.call(pay())));
+  const settles = t.calls.filter((c) => c === "/settle").length;
+  assert(settles <= 3 - 1 + SG.SLOTS.payer, `settles=${settles}`);
+  assert(res.some(([c]) => c === 429));
+  const rel = await SG.acquireSlots({ payer: "p", ip: "1.1.1.1" }, { payer: 1, ip: 1 }); assert(rel);
+  assertEquals(await SG.acquireSlots({ payer: "p" }, { payer: 1, ip: 1 }), null); await rel!();
+  assert(await SG.acquireSlots({ payer: "p" }, { payer: 1, ip: 1 }));
+  await resetGuards();
 });
 Deno.test("A3 verify failures are counted per IP (not per unverified payer); settle failures per payer", async () => {
   await resetGuards();
@@ -308,12 +338,32 @@ Deno.test("A3 verify failures are counted per IP (not per unverified payer); set
   }
   const r = await handler(new Request("http://h/base/network", { headers: { "PAYMENT-SIGNATURE": pay() } }), { env, fac, ip: "9.9.9.9" });
   assertEquals(r.status, 429); assertEquals((await r.json()).scope, "ip");
-  const t = rig({ v: { settled: true } }); const [c] = await t.call(pay()); assertEquals(c, 200); // same payer, other IP: fine
+  const t = rig({ v: { settled: true } }); const [c] = await t.call(pay()); assertEquals(c, 200);
   await resetGuards();
   const t2 = rig({ v: { settled: false, reason: "x" } }, () => ({ success: false, errorReason: "insufficient_funds" }));
   for (let i = 0; i < 3; i++) assertEquals((await t2.call(pay()))[0], 402);
   const [c3, o3] = await t2.call(pay()); assertEquals([c3, o3.scope], [429, "payer"]);
   await resetGuards();
+});
+Deno.test("N2 pinned probe: connects to the checked IP with the original host for SNI/Host; parses chunked + content-length", async () => {
+  const { pinnedGet, parseHttp, probe } = await import("../lib/preflight.ts");
+  const seen: unknown[] = [];
+  const fake = (resp: string) => async (ip: string, port: number, host: string) => {
+    seen.push([ip, port, host]); let sent = "";
+    return { readable: new Response(resp).body!, writable: new WritableStream<Uint8Array>({ write(c) { sent += new TextDecoder().decode(c); seen.push(sent); } }), close() {} };
+  };
+  const ch = btoa(JSON.stringify({ x402Version: 2, accepts: [] }));
+  const r = await pinnedGet(new URL("https://api.example.com:8443/p?q=1"), "93.184.216.34", 2000, fake(`HTTP/1.1 402 Payment Required\r\nPayment-Required: ${ch}\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n`));
+  assertEquals(seen[0], ["93.184.216.34", 8443, "api.example.com"]);
+  assert(String(seen[1]).startsWith("GET /p?q=1 HTTP/1.1\r\nHost: api.example.com:8443\r\n"));
+  assertEquals([r.status, new TextDecoder().decode(r.body), r.headers.get("payment-required")], [402, "hello world", ch]);
+  assertEquals(new TextDecoder().decode(parseHttp(new TextEncoder().encode("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nokEXTRA")).body), "ok");
+  const [reach] = await probe(new URL("https://api.example.com/"), 2000, undefined, "93.184.216.34", fake("HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"));
+  assertEquals([reach.reachable, reach.http_status], [true, 200]);
+  const [noIp] = await probe(new URL("https://api.example.com/"), 2000); assertEquals(noIp.reachable, false); // never falls back to fetch
+  const slow = async () => ({ readable: new ReadableStream<Uint8Array>(), writable: new WritableStream<Uint8Array>(), close() {} });
+  const [to] = await probe(new URL("https://api.example.com/"), 50, undefined, "93.184.216.34", slow); assertEquals(to.error_class, "TimeoutError");
+  assertEquals((await checkUrl("https://x.example/", async () => [])).err, "dns_unresolvable");
 });
 Deno.test("A1/A4/A5 precheck: exact accepted match (all 5 fields), EIP-3009 only, 32-byte nonce", () => {
   const r = reqFor("/base/network", env); const now = Math.floor(Date.now() / 1000);
@@ -409,4 +459,12 @@ Deno.test("SSRF: ports, credentials, IPv6 tunnels with embedded IPv4", async () 
 Deno.test("used settlement tx hashes are stored durably in KV (atomic, no expiry)", async () => {
   const tx = rnd(); const [x, y] = await Promise.all([SG.claimTx(tx), SG.claimTx(tx)]);
   assertEquals([x, y].sort(), [false, true]); assertEquals(await SG.claimTx(tx), false);
+});
+Deno.test("A10 startup warnings for invalid CREATED_AT / HISTORY dates", async () => {
+  const { startupWarnings } = await import("../main.ts");
+  const w = (o: Record<string, string>) => startupWarnings((k) => o[k]);
+  assertEquals(w({ SIGNING_KEY_CREATED_AT: "2026-10-14T12:00:21Z" }), []); assertEquals(w({}), []);
+  assertEquals(w({ SIGNING_KEY_CREATED_AT: "2026-10-14" }).length, 1);
+  assertEquals(w({ SIGNING_KEY_HISTORY: JSON.stringify([{ created_at: "yesterday", retired_at: "2026-10-01T00:00:00Z" }]) }), ["SIGNING_KEY_HISTORY[0].created_at is not strict ISO-8601 UTC; published as null"]);
+  assertEquals(w({ SIGNING_KEY_HISTORY: "{" }).length, 1);
 });

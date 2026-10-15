@@ -8,7 +8,7 @@ import DISCOVERY from "./lib/discovery.json" with { type: "json" };
 import { CDP_HOST, enabled as cdpEnabled, headers as cdpHeaders } from "./lib/cdp_auth.ts";
 import * as SG from "./lib/settle_guard.ts";
 import { SCHEMA, snapshotDates, loadIndex } from "./lib/preflight.ts";
-import { keyHistory, publicKeyInfo, sign, SigningUnavailable } from "./lib/sign.ts";
+import { isoOrNull, keyHistory, publicKeyInfo, sign, SigningUnavailable } from "./lib/sign.ts";
 import { snapshotIfMissing, runSnapshot } from "./lib/snapshot.ts";
 import { EXPORT_FILES, rows } from "./lib/store.ts";
 import { recordObservation, recordSale, verifyOnchain } from "./lib/stream.ts";
@@ -150,6 +150,16 @@ export function onchainMode(env: Deps["env"]): "block" | "log" {
   const m = env("ONCHAIN_CHECK") ?? "block";
   return m === "log" && (env("NETWORK") ?? MAINNET) !== MAINNET ? "log" : "block";
 }
+/** Non-fatal configuration problems, logged once at startup. */
+export function startupWarnings(env: Deps["env"]): string[] {
+  const w: string[] = []; const ca = env("SIGNING_KEY_CREATED_AT");
+  if (ca && !isoOrNull(ca)) w.push("SIGNING_KEY_CREATED_AT is not strict ISO-8601 UTC (YYYY-MM-DDTHH:MM:SSZ); published as null");
+  try { const h = JSON.parse(env("SIGNING_KEY_HISTORY") || "[]");
+    if (!Array.isArray(h)) w.push("SIGNING_KEY_HISTORY is not a JSON list; ignored");
+    else h.forEach((k: any, i: number) => { for (const f of ["created_at", "retired_at"]) if (k?.[f] != null && !isoOrNull(k[f])) w.push(`SIGNING_KEY_HISTORY[${i}].${f} is not strict ISO-8601 UTC; published as null`); });
+  } catch { w.push("SIGNING_KEY_HISTORY is not valid JSON; ignored"); }
+  return w;
+}
 export function assertOnchainMode(env: Deps["env"]) {
   if (env("ONCHAIN_CHECK") === "log" && (env("NETWORK") ?? MAINNET) === MAINNET) throw new Error("ONCHAIN_CHECK=log is not allowed on Base mainnet");
 }
@@ -194,10 +204,14 @@ async function paid(path: string, q: Record<string, string>, qs: string, sig: st
     }
     return await new Chain(rpc, c.USDC).handle(path, q);
   };
-  const lim = await FAILS.blocked(ids);
+  const release = await SG.acquireSlots(ids);
+  if (!release) return [429, { error: "too many concurrent payments, retry shortly", scope: "concurrency" }, {}];
+  try { return await paidLocked(); } finally { await release(); }
+  async function paidLocked(): Promise<[number, unknown, Record<string, string>]> {
+  const lim = await FAILS.blocked(ids); // checked while holding a slot: bursts cannot overshoot by more than the slot count
   if (lim) return [429, { error: "too many failed payments, retry later", scope: lim }, {}];
-  const key = SG.replayKey(payload);
-  if (!await SG.claim(key, SG.expiry(payload), undefined, undefined, { at: Date.now(), payload_sha256: await SG.payloadHash(payload) })) {
+  const key = SG.replayKey(payload!);
+  if (!await SG.claim(key, SG.expiry(payload!), undefined, undefined, { at: Date.now(), payload_sha256: await SG.payloadHash(payload!) })) {
     const pend = await SG.takePending(key);
     if (pend && pend.path === path) {
       const oc: any = await check(pend.tx, r, who);
@@ -213,7 +227,7 @@ async function paid(path: string, q: Record<string, string>, qs: string, sig: st
   }
   const body = { x402Version: 2, paymentPayload: payload, paymentRequirements: r };
   const v = await fac("/verify", body); const tVer = iso();
-  if (!v.isValid) { const why = facErr(v.invalidReason); await FAILS.fail({ ip: ids.ip }); return [402, { error: why }, noPay(why, N)]; }
+  if (!v.isValid) { const why = facErr(v.invalidReason); await FAILS.fail({ ip: ids.ip }, "verify"); return [402, { error: why }, noPay(why, N)]; }
   let code: number, out: unknown;
   try { [code, out] = await run(); } catch (e) {
     if (e instanceof SigningUnavailable) return [503, { error: "signing unavailable, not charged" }, {}];
@@ -229,7 +243,7 @@ async function paid(path: string, q: Record<string, string>, qs: string, sig: st
       log(tx, { ...oc, note: "settle_reported_failure_but_confirmed_onchain" }, true, times);
       return [200, out, payResp(N, true, tx, who)];
     }
-    const why = facErr(st.errorReason); await FAILS.fail(ids);
+    const why = facErr(st.errorReason); await FAILS.fail(ids, "settle");
     return [402, { error: why }, payResp(N, false, tx, who, why)];
   }
   if (!tx) { mismatch("settle_success_without_valid_tx_hash"); return [502, { error: "settlement response invalid, contact support with your payment" }, {}]; }
@@ -248,13 +262,16 @@ async function paid(path: string, q: Record<string, string>, qs: string, sig: st
   log(tx, oc, false, times);
   return [402, { error: "settlement not confirmed on-chain: " + String(oc.reason) }, payResp(N, false, tx, who, "not_confirmed_onchain")];
 }
+}
 
 if (import.meta.main) {
   const env = (k: string) => Deno.env.get(k);
   if ((env("SNAPSHOT_SCHEDULER") ?? "1") === "1") {
     Deno.cron("bazaar-snapshot", "15 0 * * *", async () => { await runSnapshot(); });
+    Deno.cron("fail-counter-purge", "7 * * * *", async () => { await FAILS.purge(); });
     snapshotIfMissing().catch((e) => console.log("snapshot failed:", (e as Error).name));
   }
+  for (const w of startupWarnings(env)) console.warn("WARNING:", w);
   assertOnchainMode(env); // refuse to start with ONCHAIN_CHECK=log on Base mainnet
   Deno.serve({ port: Number(env("PORT") ?? 8000) }, (req, info) => handler(req, { env, ip: (info.remoteAddr as Deno.NetAddr).hostname }));
 }

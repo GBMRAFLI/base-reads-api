@@ -80,31 +80,67 @@ def expiry(payload, margin=60):
 def nonce_of(payload):
     n = str((authorization(payload) or {}).get("nonce", ""))
     return n.lower() if NONCE_RE.match(n) else None
-FAIL_LIMITS = {"payer": 3, "ip": 10, "global": 200}
+import ipaddress
+def ip_key(ip):
+    """Per-IP limit key: IPv4 as-is, IPv6 collapsed to its /64 (IPv4-mapped IPv6 -> the IPv4)."""
+    if not ip: return None
+    try: a = ipaddress.ip_address(str(ip).strip("[]").split("%")[0])
+    except ValueError: return str(ip)
+    if a.version == 6 and a.ipv4_mapped: return str(a.ipv4_mapped)
+    if a.version == 4: return str(a)
+    n = ipaddress.ip_network(f"{a}/64", strict=False); return str(n)
+FAIL_LIMITS = {"payer": 3, "ip": 10}
+GLOBAL_ALERT = 1000
 class FailLimiter:
-    """Failure cooldowns per scope (payer: settle failures of the verified signer; ip: verify + settle failures; global: all),
-    fixed buckets, blocked when current + previous bucket reach the limit (same rules as the Deno KV version).
-    Single-process, in-memory: fine for one Python instance (tests, a single container); NOT for production behind several
-    instances, where each would keep its own counts. The Deno server keeps these counters in KV."""
-    def __init__(s, limits=None, window=600): s.limits, s.window, s.m, s.lock = dict(limits or FAIL_LIMITS), window, {}, threading.Lock()
+    """Failure cooldowns (same rules as the Deno KV version). BLOCKING scopes: payer (settle failures of the verified signer),
+    ip (verify + settle failures; IPv6 keyed on /64). global: settle failures only, ALERT-ONLY (logged once per window,
+    never blocks), so junk verify failures from a few IPs cannot lock out every buyer.
+    Single-process, in-memory: fine for one Python instance (tests, a single container); NOT for production behind
+    several instances, where each would keep its own counts. The Deno server keeps these counters in KV."""
+    def __init__(s, limits=None, window=600, global_alert=GLOBAL_ALERT):
+        s.limits, s.window, s.global_alert, s.m, s.lock, s.alerts, s._alerted = dict(limits or FAIL_LIMITS), window, global_alert, {}, threading.Lock(), [], set()
     def _b(s, now): return int(now // s.window)
     def count(s, scope, who, now=None):
         now = time.time() if now is None else now; b = s._b(now)
         with s.lock: return s.m.get((scope, who, b), 0) + s.m.get((scope, who, b - 1), 0)
     def blocked(s, ids, now=None):
-        for sc in ("global", "ip", "payer"):
-            who = "*" if sc == "global" else ids.get(sc)
+        for sc in ("ip", "payer"):
+            who = ip_key(ids.get("ip")) if sc == "ip" else ids.get("payer")
             if who and s.count(sc, who, now) >= s.limits[sc]: return sc
         return None
-    def fail(s, ids, now=None):
+    def fail(s, ids, kind, now=None):
+        """kind "verify": per-IP only (payer not proven yet). kind "settle": payer + IP + global (alert-only)."""
         now = time.time() if now is None else now; b = s._b(now)
+        keys = []
+        if ip_key(ids.get("ip")): keys.append(("ip", ip_key(ids.get("ip"))))
+        if kind == "settle":
+            if ids.get("payer"): keys.append(("payer", ids["payer"]))
+            keys.append(("global", "*"))
         with s.lock:
             for k in [k for k in s.m if k[2] < b - 1]: s.m.pop(k)
-            for sc in ("global", "ip", "payer"):
-                who = "*" if sc == "global" else ids.get(sc)
-                if who: s.m[(sc, who, b)] = s.m.get((sc, who, b), 0) + 1
+            for sc, who in keys: s.m[(sc, who, b)] = s.m.get((sc, who, b), 0) + 1
+            g = s.m.get(("global", "*", b), 0) + s.m.get(("global", "*", b - 1), 0)
+            if kind == "settle" and g >= s.global_alert and b not in s._alerted:
+                s._alerted.add(b); msg = f"ALERT: {s.global_alert}+ settle failures in the last window (global, alert-only, nothing blocked)"
+                s.alerts.append(msg); print(msg, flush=True)
     def clear(s):
-        with s.lock: s.m.clear()
+        with s.lock: s.m.clear(); s._alerted.clear()
+SLOTS = {"payer": 4, "ip": 8}
+class Slots:
+    """Concurrency slots (same as Deno acquireSlots): at most SLOTS in-flight paid requests per payer and per IP (/64), so a
+    parallel burst cannot slip past blocked() before its failures are counted. acquire() returns a release callable or None."""
+    def __init__(s, slots=None): s.slots, s.m, s.lock = dict(slots or SLOTS), {}, threading.Lock()
+    def acquire(s, ids):
+        keys = [(sc, w) for sc, w in (("payer", ids.get("payer")), ("ip", ip_key(ids.get("ip")))) if w]
+        with s.lock:
+            if any(s.m.get(k, 0) >= s.slots[k[0]] for k in keys): return None
+            for k in keys: s.m[k] = s.m.get(k, 0) + 1
+        def release():
+            with s.lock:
+                for k in keys:
+                    s.m[k] -= 1
+                    if s.m[k] <= 0: s.m.pop(k)
+        return release
 def payer_of(payload):
     a = authorization(payload); f = str((a or {}).get("from", "")).lower()
     return f if ADDR_RE.match(f) else None

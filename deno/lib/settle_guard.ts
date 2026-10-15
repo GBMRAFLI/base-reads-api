@@ -90,39 +90,80 @@ export async function claimTx(tx: string): Promise<boolean> {
   const k = await kv(); const kk = ["txused", tx.toLowerCase()];
   return (await k.atomic().check({ key: kk, versionstamp: null }).set(kk, Date.now()).commit()).ok;
 }
-/** Failure cooldowns in Deno KV, shared by every instance: atomic counters ["fail", scope, who, bucket] (Deno.KvU64,
- * incremented by versionstamp compare-and-set, so no lost updates) with expireIn. A scope is blocked when the current + previous fixed bucket reach its limit.
- * Scopes: payer (settle failures; payer is the verified signer), ip (verify + settle failures), global (all failures). */
-export type Scope = "payer" | "ip" | "global";
-export const FAIL_LIMITS: Record<Scope, number> = { payer: 3, ip: 10, global: 200 };
+/** Per-IP limit key: IPv4 as-is, IPv6 collapsed to its /64 (one subscriber/host usually owns a whole /64). */
+export function ipKey(ip: string | null | undefined): string | null {
+  if (!ip) return null;
+  const s = ip.toLowerCase().replace(/^\[|\]$/g, "").split("%")[0];
+  if (!s.includes(":")) return s;
+  const m = s.match(/^::ffff:(\d+\.\d+\.\d+\.\d+)$/); if (m) return m[1];
+  const [h, t] = s.split("::"); const head = h ? h.split(":") : [], tail = t !== undefined && t ? t.split(":") : [];
+  const groups = t === undefined ? head : [...head, ...Array(Math.max(0, 8 - head.length - tail.length)).fill("0"), ...tail];
+  return groups.slice(0, 4).map((g) => (parseInt(g || "0", 16) || 0).toString(16)).join(":") + "::/64";
+}
+/** Failure cooldowns in Deno KV, shared by every instance. Counters ["fail", scope, who, bucket] are Deno.KvU64 incremented with
+ * kv.atomic().sum() (server-side, never loses an increment). KV `sum` takes no expireIn, so the same atomic op deletes the
+ * bucket two windows back, and purge() (hourly cron) removes the rest. A scope blocks when current + previous bucket >= limit.
+ * Scopes that BLOCK: payer (settle failures of the verified signer), ip (verify + settle failures; IPv6 keyed on /64).
+ * global: settle failures only, ALERT-ONLY (logs once per window above the threshold, never blocks: junk verify
+ * failures from a few IPs must not lock out every buyer). */
+export type Scope = "payer" | "ip";
+export const FAIL_LIMITS: Record<Scope, number> = { payer: 3, ip: 10 };
+export const GLOBAL_ALERT = 1000;
 export class FailLimiter {
-  constructor(public limits: Record<Scope, number> = FAIL_LIMITS, public windowMs = 600_000) {}
+  alerts: string[] = [];
+  constructor(public limits: Record<Scope, number> = FAIL_LIMITS, public windowMs = 600_000, public globalAlert = GLOBAL_ALERT) {}
   private bucket(now: number) { return Math.floor(now / this.windowMs); }
-  async count(scope: Scope, who: string, now = Date.now()) {
+  async count(scope: Scope | "global", who: string, now = Date.now()) {
     const k = await kv(); const b = this.bucket(now);
     const [x, y] = await k.getMany<Deno.KvU64[]>([["fail", scope, who, b], ["fail", scope, who, b - 1]]);
     return Number(x.value?.value ?? 0n) + Number(y.value?.value ?? 0n);
   }
-  /** First scope that is over its limit, or null. */
+  /** First blocking scope over its limit, or null. The global counter is never consulted here. */
   async blocked(ids: Partial<Record<Scope, string | null>>, now = Date.now()): Promise<Scope | null> {
-    for (const s of ["global", "ip", "payer"] as Scope[]) {
-      const who = s === "global" ? "*" : ids[s]; if (!who) continue;
+    for (const s of ["ip", "payer"] as Scope[]) {
+      const who = s === "ip" ? ipKey(ids.ip) : ids.payer; if (!who) continue;
       if (await this.count(s, who, now) >= this.limits[s]) return s;
     }
     return null;
   }
-  async fail(ids: Partial<Record<Scope, string | null>>, now = Date.now()) {
-    const k = await kv(); const b = this.bucket(now);
-    for (const s of ["global", "ip", "payer"] as Scope[]) {
-      const who = s === "global" ? "*" : ids[s]; if (!who) continue;
-      const key = ["fail", s, who, b];
-      for (let i = 0; i < 20; i++) { // atomic increment: compare-and-set on the versionstamp, entry expires after 2 windows
-        const e = await k.get<Deno.KvU64>(key);
-        const n = new Deno.KvU64((e.value?.value ?? 0n) + 1n);
-        if ((await k.atomic().check(e).set(key, n, { expireIn: 2 * this.windowMs }).commit()).ok) break;
+  /** kind "verify": per-IP only (the payer is not proven yet). kind "settle": payer + IP + global (alert-only). */
+  async fail(ids: Partial<Record<Scope, string | null>>, kind: "verify" | "settle", now = Date.now()) {
+    const k = await kv(); const b = this.bucket(now); const tx = k.atomic();
+    const add = (s: string, who: string) => tx.sum(["fail", s, who, b], 1n).delete(["fail", s, who, b - 2]);
+    const ip = ipKey(ids.ip); if (ip) add("ip", ip);
+    if (kind === "settle") { if (ids.payer) add("payer", ids.payer); add("global", "*"); }
+    await tx.commit();
+    if (kind === "settle" && await this.count("global", "*", now) >= this.globalAlert) {
+      const ak = ["failalert", b];
+      if ((await k.atomic().check({ key: ak, versionstamp: null }).set(ak, true, { expireIn: this.windowMs * 2 }).commit()).ok) {
+        const msg = `ALERT: ${this.globalAlert}+ settle failures in the last window (global, alert-only, nothing blocked)`;
+        this.alerts.push(msg); console.warn(msg);
       }
     }
   }
-  async clear() { const k = await kv(); for await (const e of k.list({ prefix: ["fail"] })) await k.delete(e.key); }
+  /** Delete counter buckets older than the previous window (sum() cannot carry an expiry). */
+  async purge(now = Date.now()) {
+    const k = await kv(); const b = this.bucket(now); let n = 0;
+    for await (const e of k.list({ prefix: ["fail"] })) if ((e.key[3] as number) < b - 1) { await k.delete(e.key); n++; }
+    return n;
+  }
+  async clear() { const k = await kv(); for (const p of ["fail", "failalert", "inflight"]) for await (const e of k.list({ prefix: [p] })) await k.delete(e.key); }
+}
+/** Concurrency slots so a parallel burst cannot slip past blocked() before its failures are counted: at most `payer`
+ * in-flight paid requests per payer and `ip` per IP (/64). Each slot is an atomic set-if-absent key with expireIn (crash-safe),
+ * released when the request finishes. Worst-case overshoot of a failure limit is therefore bounded by the slot count. */
+export const SLOTS = { payer: 4, ip: 8 };
+export async function acquireSlots(ids: { ip?: string | null; payer?: string | null }, slots = SLOTS, ttlMs = 120_000): Promise<(() => Promise<void>) | null> {
+  const k = await kv(); const held: Deno.KvKey[] = [];
+  const release = async () => { for (const h of held) await k.delete(h); };
+  for (const [scope, who] of [["payer", ids.payer], ["ip", ipKey(ids.ip)]] as const) {
+    if (!who) continue; let got = false;
+    for (let i = 0; i < slots[scope] && !got; i++) {
+      const key = ["inflight", scope, who, i];
+      if ((await k.atomic().check({ key, versionstamp: null }).set(key, Date.now(), { expireIn: ttlMs }).commit()).ok) { held.push(key); got = true; }
+    }
+    if (!got) { await release(); return null; }
+  }
+  return release;
 }
 export function payerOf(p: Record<string, any>) { const f = String(authorization(p)?.from ?? "").toLowerCase(); return ADDR_RE.test(f) ? f : null; }
