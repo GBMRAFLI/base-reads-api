@@ -1,4 +1,4 @@
-// GBMRAFLI Base Reads on Deno Deploy: receive-only x402 v2 seller on Base mainnet. Never signs or sends funds.
+// Base Reads on Deno Deploy: receive-only x402 v2 seller on Base mainnet. Never signs or sends funds.
 // Same routes, 402 challenges, signed facts, export endpoint and record format as api/index.py. Zero LLM.
 import { pyDumps } from "./lib/canonical.ts";
 import { Chain, makeRpc, type Rpc } from "./lib/chain.ts";
@@ -61,7 +61,7 @@ export const stripRef = (qs: string) => qs.split("&").filter((x) => x && !x.star
 export function llmsTxt(env: Deps["env"]) {
   const c = cfg(env); const N = c.NETWORK;
   const net = N === "eip155:8453" ? "Base mainnet" : N === "eip155:84532" ? "Base Sepolia" : N;
-  const L = ["# GBMRAFLI Base Reads", "", `> Pay-per-call read API for ${net} over x402 v2. Each paid route answers GET without payment with HTTP 402 and a PAYMENT-REQUIRED challenge; retry with a PAYMENT-SIGNATURE header to get JSON.`, "",
+  const L = ["# Base Reads", "", `> Pay-per-call read API for ${net} over x402 v2. Each paid route answers GET without payment with HTTP 402 and a PAYMENT-REQUIRED challenge; retry with a PAYMENT-SIGNATURE header to get JSON.`, "",
     "## Payment", "", "- Protocol: x402 v2, scheme exact", `- Network: ${N} (${net})`, `- Asset: USDC ${c.USDC}`, "- Authorization: EIP-3009 transferWithAuthorization only (Permit2 is rejected)",
     "- Responses are served only after the transfer is confirmed on-chain", "- Optional ?ref=<tag> (A-Z a-z 0-9 . _ -, max 64) is recorded for attribution and never changes price or challenge", "",
     "## Paid routes (GET, JSON)", "",
@@ -74,13 +74,13 @@ export function llmsTxt(env: Deps["env"]) {
 }
 export function root(env: Deps["env"]) {
   const c = cfg(env);
-  return { service: "GBMRAFLI Base Reads", network: c.NETWORK, protocol: "x402 v2", facilitator: facilitatorInfo(env),
+  return { service: "Base Reads", network: c.NETWORK, protocol: "x402 v2", facilitator: facilitatorInfo(env),
     free: ["/llms.txt", "/.well-known/x402-preflight", "/.well-known/x402-preflight-key-history.json", "/.well-known/bazaar-snapshot.json", "/x402/preflight/pubkey", "/bazaar/snapshots"],
     routes: Object.fromEntries(Object.entries(ROUTES).map(([k, v]) => [k, { price_usdc: v[0] / 1e6, description: v[1] }])) };
 }
 export async function wellKnown(env: Deps["env"]) {
   const pub = await publicKeyInfo(env);
-  return { service: "GBMRAFLI Base Reads", schema: SCHEMA, alg: "Ed25519", key_id: pub.key_id, public_key_b64: pub.public_key_b64,
+  return { service: "Base Reads", schema: SCHEMA, alg: "Ed25519", key_id: pub.key_id, public_key_b64: pub.public_key_b64,
     fingerprint: pub.fingerprint, fingerprint_short: pub.fingerprint_short, created_at: pub.created_at,
     verify: ["Take the paid /x402/preflight response body: {facts, signature}.",
       "Serialize facts as canonical JSON: keys sorted, separators (',', ':'), ASCII-only escapes (Python json.dumps(facts, sort_keys=True, separators=(',', ':'))).",

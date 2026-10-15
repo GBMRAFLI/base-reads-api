@@ -1,4 +1,4 @@
-"""GBMRAFLI Base Reads: receive-only x402 v2 seller on Base mainnet. Never signs or sends funds.
+"""Base Reads: receive-only x402 v2 seller on Base mainnet. Never signs or sends funds.
 Zero-LLM: every route is 100% deterministic code (JSON-RPC reads only)."""
 import json, os, re, base64, time, urllib.request, urllib.parse, sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -134,7 +134,7 @@ def export(auth, q):
     return 200, {"payTo": PAY_TO, "network": NETWORK, "asset": USDC, "exportedAt": MS.iso(), "records": out}
 REPO_URL = os.environ.get("REPO_URL", "https://github.com/GBMRAFLI/base-reads-api")
 def root():
-    return {"service": "GBMRAFLI Base Reads", "network": NETWORK, "protocol": "x402 v2", "facilitator": facilitator_info(),
+    return {"service": "Base Reads", "network": NETWORK, "protocol": "x402 v2", "facilitator": facilitator_info(),
             "free": ["/llms.txt", "/.well-known/x402-preflight", "/.well-known/x402-preflight-key-history.json", "/.well-known/bazaar-snapshot.json", "/x402/preflight/pubkey", "/bazaar/snapshots"],
             "routes": {k: {"price_usdc": v[0] / 1e6, "description": v[1]} for k, v in ROUTES.items()}}
 REF_RE = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
@@ -149,7 +149,7 @@ def strip_ref(qs):
     return "&".join(x for x in qs.split("&") if x and not x.startswith("ref=") and x != "ref")
 def llms_txt():
     net = "Base mainnet" if NETWORK == "eip155:8453" else "Base Sepolia" if NETWORK == "eip155:84532" else NETWORK
-    L = ["# GBMRAFLI Base Reads", "", f"> Pay-per-call read API for {net} over x402 v2. Each paid route answers GET without payment with HTTP 402 and a PAYMENT-REQUIRED challenge; retry with a PAYMENT-SIGNATURE header to get JSON.", "",
+    L = ["# Base Reads", "", f"> Pay-per-call read API for {net} over x402 v2. Each paid route answers GET without payment with HTTP 402 and a PAYMENT-REQUIRED challenge; retry with a PAYMENT-SIGNATURE header to get JSON.", "",
          "## Payment", "", "- Protocol: x402 v2, scheme exact", f"- Network: {NETWORK} ({net})", f"- Asset: USDC {USDC}", "- Authorization: EIP-3009 transferWithAuthorization only (Permit2 is rejected)",
          "- Responses are served only after the transfer is confirmed on-chain", "- Optional ?ref=<tag> (A-Z a-z 0-9 . _ -, max 64) is recorded for attribution and never changes price or challenge", "",
          "## Paid routes (GET, JSON)", ""]
@@ -166,7 +166,7 @@ def facilitator_info():
     return {"name": name, "url": FAC, "auth": "cdp_jwt" if cdp_auth.enabled(FAC) else "none"}
 def well_known():
     pub = PF.public_key_info()
-    return {"service": "GBMRAFLI Base Reads", "schema": PF.SCHEMA, "alg": "Ed25519", "key_id": pub["key_id"], "public_key_b64": pub["public_key_b64"],
+    return {"service": "Base Reads", "schema": PF.SCHEMA, "alg": "Ed25519", "key_id": pub["key_id"], "public_key_b64": pub["public_key_b64"],
             "fingerprint": pub["fingerprint"], "fingerprint_short": pub["fingerprint_short"], "created_at": pub["created_at"],
             "verify": ["Take the paid /x402/preflight response body: {facts, signature}.",
                        "Serialize facts as canonical JSON: keys sorted, separators (',', ':'), ASCII-only escapes (Python json.dumps(facts, sort_keys=True, separators=(',', ':'))).",
