@@ -57,11 +57,19 @@ install -d -o root -g root -m 700 /etc/base-reads /var/backups/base-reads
 sed "s/API_DOMAIN_PLACEHOLDER/$API_DOMAIN/" "$(dirname "$0")/Caddyfile" > /etc/caddy/Caddyfile.new
 caddy validate --config /etc/caddy/Caddyfile.new --adapter caddyfile >/dev/null && mv /etc/caddy/Caddyfile.new /etc/caddy/Caddyfile && systemctl restart caddy
 
-# sshd: keys only. Only applied when root already has an authorized key, and validated before reload.
-if [ -s /root/.ssh/authorized_keys ]; then
+# sshd: keys only. Applied only when root, or the sudo user running this script, already has an authorized key,
+# and validated with sshd -t before reload. With PermitRootLogin prohibit-password, root logs in only by key:
+# make sure your key works for root (or for $SUDO_USER) before running this.
+has_key=0
+[ -s /root/.ssh/authorized_keys ] && has_key=1
+if [ -n "${SUDO_USER:-}" ]; then
+  uh=$(getent passwd "$SUDO_USER" | cut -d: -f6)
+  [ -n "$uh" ] && [ -s "$uh/.ssh/authorized_keys" ] && has_key=1
+fi
+if [ "$has_key" = 1 ]; then
   printf 'PasswordAuthentication no\nKbdInteractiveAuthentication no\nPermitRootLogin prohibit-password\nPubkeyAuthentication yes\n' > /etc/ssh/sshd_config.d/10-key-only.conf
   if sshd -t; then systemctl reload ssh; else rm -f /etc/ssh/sshd_config.d/10-key-only.conf; echo "sshd config invalid; left unchanged" >&2; fi
 else
-  echo "no /root/.ssh/authorized_keys: password login left enabled" >&2
+  echo "no authorized_keys for root or \$SUDO_USER: password login left enabled" >&2
 fi
 echo "setup done; fill /etc/base-reads/env (root:600), then run deploy.sh"

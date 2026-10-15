@@ -852,7 +852,7 @@ Deno.test("deploy/listings.json matches routes and ref rules", async () => {
   const { buildRoutes } = await import("../../deploy/gen_listings.ts");
   const { cleanRef } = await import("../main.ts");
   assertEquals(L.routes, buildRoutes()); // regenerate with deploy/gen_listings.ts if this fails
-  assert(/^https:\/\/[a-z0-9.-]+$/.test(L.base_url), "base_url: https origin, no trailing slash");
+  assert(L.base_url === "https://API_DOMAIN_PLACEHOLDER" || /^https:\/\/[a-z0-9.-]+$/.test(L.base_url), "base_url: placeholder or https origin, no trailing slash");
   const refs: string[] = [];
   for (const [name, d] of Object.entries(L.directories as Record<string, any>)) {
     if (d.ref == null) continue;
@@ -879,11 +879,53 @@ Deno.test("isLoopback / bindHost / clientIp with mapped and 127/8 peers", async 
 
 Deno.test("/healthz: booleans only, 200 with key + KV, 503 without key", async () => {
   const { handler } = await import("../main.ts");
-  const good = await handler(new Request("http://h/healthz"), { env });
+  const good = await handler(new Request("http://h/healthz"), { env, ip: "127.0.0.1" });
   assertEquals([good.status, await good.json()], [200, { ok: true, signing: true, store: true }]);
   resetKey();
-  const bad = await handler(new Request("http://h/healthz"), { env: (k: string) => k.startsWith("SIGNING_KEY") ? undefined : env(k) });
+  const bad = await handler(new Request("http://h/healthz"), { env: (k: string) => k.startsWith("SIGNING_KEY") ? undefined : env(k), ip: "::1" });
   const body = await bad.text(); resetKey();
   assertEquals([bad.status, JSON.parse(body)], [503, { ok: false, signing: false, store: true }]);
   assert(!body.includes(ENV.SIGNING_KEY_PASSPHRASE));
+  for (const ip of ["203.0.113.9", undefined]) {
+    const r = await handler(new Request("http://h/healthz"), { env, ip }); assertEquals(r.status, 404); await r.body?.cancel();
+  }
+  // behind the proxy, a public client resolves to its own IP -> 404
+  const { clientIp } = await import("../main.ts");
+  const viaProxy = clientIp(new Request("http://h/healthz", { headers: { "x-forwarded-for": "203.0.113.9" } }), "127.0.0.1", (k) => k === "TRUST_PROXY" ? "1" : undefined);
+  assertEquals((await handler(new Request("http://h/healthz"), { env, ip: viaProxy })).status, 404);
+});
+
+Deno.test("kv-merge: restored KV keeps newer replay + accounting keys from the live KV", async () => {
+  const { mergeProtected, PROTECTED } = await import("../../deploy/vps/kv-merge.ts");
+  const dir = await Deno.makeTempDir(); const live = dir + "/live.sqlite3"; const old = dir + "/old.sqlite3";
+  const a = await Deno.openKv(old);
+  await a.set(["txused", "0xold"], { at: 1 }); await a.set(["rec", "sales", "1"], { n: 1 }); await a.set(["snap", "x"], 1);
+  a.close();
+  const b = await Deno.openKv(live);
+  await b.set(["txused", "0xold"], { at: 1 }); await b.set(["txused", "0xnew"], { at: 2 });
+  await b.set(["nonce", "0xpayer", "n1"], { used: true }, { expireIn: 60_000 });
+  await b.set(["pending", "k1"], { s: 1 }, { expireIn: 60_000 }); await b.set(["inflight", "p", "0xpayer"], { at: 3 }, { expireIn: 60_000 });
+  await b.set(["rec", "sales", "1"], { n: 1 }); await b.set(["rec", "sales", "2"], { n: 2 });
+  await b.set(["snap", "x"], 2); // not protected: the restored value stays
+  b.close();
+  const counts = await mergeProtected(live, old);
+  assertEquals(counts, { txused: 1, nonce: 1, rec: 1, pending: 1, inflight: 1 });
+  assertEquals(Object.keys(PROTECTED).sort(), ["inflight", "nonce", "pending", "rec", "txused"]);
+  const c = await Deno.openKv(old);
+  for (const k of [["txused", "0xold"], ["txused", "0xnew"], ["nonce", "0xpayer", "n1"], ["pending", "k1"], ["inflight", "p", "0xpayer"], ["rec", "sales", "1"], ["rec", "sales", "2"]]) {
+    assert((await c.get(k)).versionstamp !== null, JSON.stringify(k));
+  }
+  assertEquals((await c.get(["snap", "x"])).value, 1);
+  c.close(); await Deno.remove(dir, { recursive: true });
+});
+
+Deno.test("deploy.sh: KV backup/restore only in --restore-kv mode, service stopped before the copy", async () => {
+  const s = await Deno.readTextFile(new URL("../../deploy/vps/deploy.sh", import.meta.url));
+  const backup = s.indexOf(".backup '$SAVE/kv.sqlite3'"); const guard1 = s.lastIndexOf('if [ "$RESTORE_KV" = 1 ]', backup);
+  const stop = s.indexOf("systemctl stop base-reads", guard1);
+  assert(guard1 > 0 && stop > guard1 && stop < backup, "backup must be guarded and preceded by stop");
+  const restore = s.indexOf('mv "$KVF.restore" "$KVF"'); const guard2 = s.lastIndexOf('if [ "$RESTORE_KV" = 1 ]', restore);
+  const merge = s.indexOf("kv-merge.ts", guard2);
+  assert(guard2 > guard1 && merge > guard2 && merge < restore, "restore must be guarded and preceded by the merge");
+  assertEquals(s.split('mv "$KVF.restore" "$KVF"').length, 2);
 });

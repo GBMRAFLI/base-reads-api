@@ -6,6 +6,8 @@
 
 API_DOMAIN_PLACEHOLDER {
 	encode gzip
+	# /healthz is for local deploy checks only (the app also rejects non-loopback peers)
+	respond /healthz 404
 	reverse_proxy 127.0.0.1:8000 {
 		header_up X-Forwarded-For {remote_host}
 	}

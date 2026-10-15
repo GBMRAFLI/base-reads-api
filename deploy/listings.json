@@ -1,6 +1,6 @@
 {
-  "base_url": "https://89-116-220-218.sslip.io",
-  "_note": "All URLs are base_url + path. To move domains: change base_url (and PUBLIC_URL on the server), run `deno run -A deploy/gen_listings.ts <new base_url>`, then resubmit each directory below. null = not decided / not known yet.",
+  "base_url": "https://API_DOMAIN_PLACEHOLDER",
+  "_note": "All URLs are base_url + path. Set the real origin with `deno run -A deploy/gen_listings.ts https://<your-domain>` (or edit base_url) before submitting; to move domains: change base_url (and PUBLIC_URL on the server), run `deno run -A deploy/gen_listings.ts <new base_url>`, then resubmit each directory below. null = not decided / not known yet.",
   "service": {
     "name": "Base Reads",
     "summary": "Pay-per-call read API for Base over x402 v2. Deterministic data, no advice.",

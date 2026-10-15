@@ -13,7 +13,11 @@ export function buildRoutes() {
 }
 if (import.meta.main) {
   const cur = JSON.parse(await Deno.readTextFile(FILE));
-  if (Deno.args[0]) cur.base_url = Deno.args[0].replace(/\/+$/, "");
+  if (Deno.args[0]) {
+    const u = Deno.args[0].replace(/\/+$/, "");
+    if (!/^https:\/\/[a-z0-9.-]+$/.test(u)) { console.error("base_url must be https://<hostname>"); Deno.exit(2); }
+    cur.base_url = u;
+  }
   cur.routes = buildRoutes();
   const tmp = new URL("./listings.json.tmp", import.meta.url);
   await Deno.writeTextFile(tmp, JSON.stringify(cur, null, 2) + "\n");
