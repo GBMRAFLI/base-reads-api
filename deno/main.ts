@@ -164,7 +164,8 @@ const b64 = (o: unknown) => b64json(o, pyDumps);
 /** HEAD on free routes: same status and headers as GET, no body. Paid routes keep their previous behaviour (501). */
 export async function handler(req: Request, d: Deps): Promise<Response> {
   if (req.method === "HEAD") {
-    const u = new URL(req.url); if (!FREE_PATHS.has(u.pathname)) return send(501, { error: "unsupported method" });
+    const raw = req.url.slice(req.url.indexOf("/", 8)); const qi = raw.indexOf("?"); // same raw path as GET routing
+    if (!FREE_PATHS.has(qi < 0 ? raw : raw.slice(0, qi))) return send(501, { error: "unsupported method" });
     const r = await handleGet(new Request(req.url, { method: "GET", headers: req.headers }), d); await r.body?.cancel();
     return new Response(null, { status: r.status, headers: r.headers });
   }

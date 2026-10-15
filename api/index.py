@@ -371,7 +371,8 @@ class handler(BaseHTTPRequestHandler):
             s.send_response(code); s.send_header("Content-Type", ctype); s.send_header("Content-Length", str(len(b))); s.send_header("X-Content-Type-Options", "nosniff")
             s.send_header("Access-Control-Allow-Origin", "*"); s.send_header("Access-Control-Expose-Headers", "PAYMENT-REQUIRED, PAYMENT-RESPONSE")
             for k, v in hd.items(): s.send_header(k, v)
-            s.end_headers(); s.wfile.write(b)
+            s.end_headers()
+            if not s.head: s.wfile.write(b)  # HEAD: same headers (incl. Content-Length), no body
         except BrokenPipeError: pass
 def next_run_delay(now, hh=0, mm=15):
     """Seconds until the next hh:mm UTC."""

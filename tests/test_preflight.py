@@ -130,6 +130,15 @@ class T1(unittest.TestCase):
             try: self.assertEqual(req("GET", "/.well-known/402index-verify.txt")[2], b"tok-from-env")
             finally: os.environ.pop("INDEX_VERIFY_TOKEN")
             self.assertEqual(req("GET", "/.well-known/402index-verify.txt")[2], IX.VERIFY_402INDEX_DEFAULT.encode())
+            import socket
+            for p in ("/llms.txt", "/openapi.json", "/favicon.ico", "/"):
+                sk = socket.create_connection(("127.0.0.1", 18769)); sk.sendall(f"HEAD {p} HTTP/1.0\r\nHost: x\r\n\r\n".encode()); raw = b""
+                while True:
+                    c = sk.recv(65536)
+                    if not c: break
+                    raw += c
+                sk.close(); head, _, body = raw.partition(b"\r\n\r\n")
+                self.assertEqual(body, b"", p); self.assertIn(b"Content-Length: " + str(len(req("GET", p)[2])).encode(), head)
         finally: srv.shutdown()
         self.assertEqual(PF.UA, "base-reads-prepay-check/1.0")
         for k in IX.ROUTES: self.assertIn("queryParams", IX.bazaar(k)["schema"]["properties"]["input"]["properties"], k)

@@ -574,3 +574,11 @@ Deno.test("HEAD on free routes, nosniff, favicon, openapi payTo/contact/cache, e
   assertEquals(await v1.text(), "tok-from-env");
   const v2 = await handler(new Request("http://h.example/.well-known/402index-verify.txt"), { env }); assertEquals(await v2.text(), VERIFY_402INDEX_DEFAULT);
 });
+Deno.test("HEAD gate uses the raw request path like GET routing", async () => {
+  for (const p of ["/./llms.txt", "/x/../llms.txt", "/llms.txt/", "/%6Clms.txt", "/llms.txt;x"]) {
+    const g = await handler(new Request("http://h.example" + p), { env }); await g.body?.cancel();
+    const h = await handler(new Request("http://h.example" + p, { method: "HEAD" }), { env }); await h.body?.cancel();
+    assertEquals(h.status, g.status === 200 ? 200 : 501, p); // HEAD answers exactly where GET serves a free route
+  }
+  const h = await handler(new Request("http://h.example/llms.txt?x=1", { method: "HEAD" }), { env }); assertEquals([h.status, h.body], [200, null]);
+});
