@@ -678,7 +678,7 @@ Deno.test("snapshot follow-ups: freshness, tiers 30/365, legacy, orphan purge, c
   const factsAfter = await bazaarFacts("https://missing.example/x", [], 14, "2000-01-03");
   assertEquals([(factsAfter as any).available, (factsAfter as any).listed], [true, false]);
 
-  // M3/L4 Founder tiers: 31–364 reduced, 365+ aggregate (non-newest)
+  // M3/L4 retention tiers: 31–364 reduced, 365+ aggregate (non-newest)
   await saveIndex({
     date: "2000-01-15", listings: 3, hosts: { c: 3 },
     wallet_hosts: { ["0x" + "44".repeat(20)]: ["c", "d"] },
