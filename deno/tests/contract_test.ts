@@ -7,6 +7,7 @@ import { rid } from "../lib/util.ts";
 import { useKv, rows } from "../lib/store.ts";
 import { recordSale, verifyOnchain, TRANSFER } from "../lib/stream.ts";
 import { bazaar, facClient, handler, reqFor, required, resetGuards, root, snapshotMeta, wellKnown } from "../main.ts";
+import * as SG from "../lib/settle_guard.ts";
 import { keyHistory } from "../lib/sign.ts";
 import { AUTH_USED } from "../lib/stream.ts";
 import { headers as cdpHeaders, jwt as cdpJwt } from "../lib/cdp_auth.ts";
@@ -103,10 +104,11 @@ Deno.test("paid flow: verify -> serve -> settle -> on-chain check -> same record
   const r = reqFor("/base/network", env);
   const calls: string[] = [];
   const fac = async (p: string) => { calls.push(p); return p === "/verify" ? { isValid: true } : { success: true, payer: W2, transaction: tx, network: "eip155:8453" }; };
-  const rpc = async (m: string) => m === "eth_getTransactionReceipt" ? rc(W2, r.payTo, 1000, r.asset)
+  const nonce = rnd(); const rcpt = rc(W2, r.payTo, 1000, r.asset); rcpt.logs.push({ address: r.asset, topics: [AUTH_USED, pad(W2), nonce], data: "0x" });
+  const rpc = async (m: string) => m === "eth_getTransactionReceipt" ? rcpt
     : m === "eth_getBlockByNumber" ? { number: "0x10", timestamp: "0x" + Math.floor(Date.now() / 1000).toString(16), baseFeePerGas: "0x3b9aca00" } : "0x3b9aca00";
   let bg: Promise<unknown> | null = null;
-  const res = await handler(new Request("http://h/base/network", { headers: { "PAYMENT-SIGNATURE": btoa(JSON.stringify({ t: 1 })) } }), { env, fac, rpc, background: (p) => { bg = p; } });
+  const res = await handler(new Request("http://h/base/network", { headers: { "PAYMENT-SIGNATURE": pay("/base/network", { from: W2 }, nonce) } }), { env, fac, rpc, background: (p) => { bg = p; } });
   assertEquals(res.status, 200); assertEquals(calls, ["/verify", "/settle"]);
   const body = await res.json(); assertEquals(body.chain_id, 8453); assertEquals(body.base_fee_gwei, 1);
   assert(res.headers.get("PAYMENT-RESPONSE")); await bg;
@@ -127,11 +129,11 @@ Deno.test("paid flow: verify -> serve -> settle -> on-chain check -> same record
 });
 Deno.test("not charged on bad input or upstream error; invalid payment -> 402", async () => {
   const calls: string[] = []; const fac = async (p: string) => { calls.push(p); return { isValid: true }; };
-  let r = await handler(new Request("http://h/base/usdc-balance?address=0xbad", { headers: { "X-PAYMENT": btoa(JSON.stringify({ t: 2 })) } }), { env, fac });
+  let r = await handler(new Request("http://h/base/usdc-balance?address=0xbad", { headers: { "X-PAYMENT": pay("/base/usdc-balance") } }), { env, fac });
   assertEquals(r.status, 400); await r.body?.cancel(); assertEquals(calls, ["/verify"]);
-  r = await handler(new Request("http://h/base/network", { headers: { "X-PAYMENT": btoa(JSON.stringify({ t: 3 })) } }), { env, fac, rpc: () => Promise.reject(new Error("down")) });
+  r = await handler(new Request("http://h/base/network", { headers: { "X-PAYMENT": pay() } }), { env, fac, rpc: () => Promise.reject(new Error("down")) });
   assertEquals(r.status, 502); await r.body?.cancel(); assert(!calls.includes("/settle"));
-  r = await handler(new Request("http://h/base/network", { headers: { "X-PAYMENT": btoa(JSON.stringify({ t: 4 })) } }), { env, fac: async () => ({ isValid: false, invalidReason: "insufficient_funds" }) });
+  r = await handler(new Request("http://h/base/network", { headers: { "X-PAYMENT": pay() } }), { env, fac: async () => ({ isValid: false, invalidReason: "insufficient_funds" }) });
   assertEquals(r.status, 402); assertEquals(await r.json(), { error: "insufficient_funds" });
   r = await handler(new Request("http://h/base/network", { headers: { "X-PAYMENT": "%%%" } }), { env }); assertEquals(r.status, 400); await r.body?.cancel();
   r = await handler(new Request("http://h/nope"), { env }); assertEquals(r.status, 404); await r.body?.cancel();
@@ -206,26 +208,26 @@ function rig(chain: { v: any }, settle?: () => any, delay = 0) {
   return { calls, call, newTx: () => { tx = rnd(); } };
 }
 Deno.test("serve only after on-chain confirmation; facilitator success alone never serves", async () => {
-  resetGuards();
+  await resetGuards();
   for (const v of [{ settled: false, reason: "nonce_not_in_settlement_tx" }, { settled: null }]) {
     const t = rig({ v }); const [code] = await t.call(pay()); assert(code !== 200, JSON.stringify(v));
   }
   const ok = rig({ v: { settled: true } }); const [c, b] = await ok.call(pay()); assertEquals([c, b.chain_id], [200, 8453]);
 });
 Deno.test("pending confirmation parks the payment and the same request is served exactly once later", async () => {
-  resetGuards(); const chain = { v: { settled: null } as any }; const t = rig(chain); const sig = pay();
+  await resetGuards(); const chain = { v: { settled: null } as any }; const t = rig(chain); const sig = pay();
   assertEquals((await t.call(sig))[0], 202); assertEquals((await t.call(sig))[0], 202);
   chain.v = { settled: true }; assertEquals((await t.call(sig))[0], 200); assertEquals((await t.call(sig))[0], 409);
   assertEquals(t.calls.filter((x) => x === "/settle").length, 1);
 });
 Deno.test("duplicate signature: concurrent requests race on KV atomic check-and-set, exactly one wins", async () => {
-  resetGuards(); const t = rig({ v: { settled: true } }, undefined, 20); const sig = pay();
+  await resetGuards(); const t = rig({ v: { settled: true } }, undefined, 20); const sig = pay();
   const codes = (await Promise.all(Array.from({ length: 8 }, () => t.call(sig)))).map((x) => x[0]).sort();
   assertEquals(codes, [200, 409, 409, 409, 409, 409, 409, 409]); assertEquals(t.calls.filter((x) => x === "/settle").length, 1);
   assertEquals((await t.call(sig))[0], 409); // and later, consistently
 });
 Deno.test("prechecks before any facilitator call; settlement tx reuse; failed settle cooldown", async () => {
-  resetGuards(); const now = Math.floor(Date.now() / 1000); const t = rig({ v: { settled: true } });
+  await resetGuards(); const now = Math.floor(Date.now() / 1000); const t = rig({ v: { settled: true } });
   for (const [over, why] of [[{ validBefore: String(now + 2) }, "authorization_expired_or_expiring"], [{ validAfter: String(now + 60) }, "authorization_not_yet_valid"],
     [{ to: "0x" + "99".repeat(20) }, "authorization_payee_mismatch"], [{ value: "1" }, "authorization_amount_mismatch"]] as [Record<string, string>, string][]) {
     const [c, b] = await t.call(pay("/base/network", over)); assertEquals([c, b.error], [402, why]);
@@ -268,4 +270,28 @@ Deno.test("well-known, key history, fingerprints, signed snapshot metadata, faci
   for (const p of ["/.well-known/x402-preflight", "/.well-known/bazaar-snapshot.json", "/.well-known/x402-preflight-key-history.json", "/bazaar/snapshots"]) {
     const res = await handler(new Request("http://h" + p), { env }); assertEquals(res.status, 200, p); await res.body?.cancel();
   }
+});
+
+Deno.test("Permit2 and non-EIP-3009 payloads rejected before the facilitator", async () => {
+  await resetGuards(); const chain = { v: { settled: true } }; const t = rig(chain);
+  const r = reqFor("/base/network", env);
+  const p2 = { x402Version: 2, accepted: r, payload: { permit2Authorization: { from: PAYER, nonce: "1" }, signature: "0x" } };
+  const viaExtra = { x402Version: 2, accepted: { ...r, extra: { ...r.extra, assetTransferMethod: "permit2" } }, payload: { authorization: {} } };
+  for (const [body, why] of [[p2, "permit2_not_supported"], [viaExtra, "permit2_not_supported"], [{ x402Version: 2, payload: { signature: "0x" } }, "eip3009_authorization_required"]] as const) {
+    const [c, out] = await t.call(btoa(JSON.stringify(body)));
+    assertEquals(c, 402); assert(String(out.error).startsWith(why), out.error);
+  }
+  assertEquals(t.calls, []);
+});
+Deno.test("FailLimiter state lives in KV: shared by separate instances, atomic under concurrency", async () => {
+  const a = new SG.FailLimiter(3, 60_000), b = new SG.FailLimiter(3, 60_000); await a.clear();
+  const who = "0x" + "aa".repeat(20);
+  await Promise.all([a.fail(who), b.fail(who), a.fail(who)]); // concurrent writers, no lost update
+  assert(await b.blocked(who)); assert(!(await b.blocked("0x" + "bb".repeat(20))));
+  assert(!(await b.blocked(who, Date.now() + 61_000))); // window expiry
+  await a.clear(); assert(!(await b.blocked(who)));
+});
+Deno.test("used settlement tx hashes are stored durably in KV (atomic, no expiry)", async () => {
+  const tx = rnd(); const [x, y] = await Promise.all([SG.claimTx(tx), SG.claimTx(tx)]);
+  assertEquals([x, y].sort(), [false, true]); assertEquals(await SG.claimTx(tx), false);
 });

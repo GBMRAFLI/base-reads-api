@@ -18,14 +18,15 @@ def authorization(payload):
     a = (payload.get("payload") or {}).get("authorization") if isinstance(payload.get("payload"), dict) else None
     return a if isinstance(a, dict) else None
 def precheck(payload, req, now=None):
-    """None if acceptable, else a reason string. Only checks fields that are present (other schemes go to the facilitator)."""
+    """None if acceptable, else a reason string. Only EIP-3009 (exact, transferWithAuthorization) payments are accepted; Permit2 is rejected."""
     now = int(now if now is not None else time.time())
     acc = payload.get("accepted")
     if isinstance(acc, dict):
         for k in ("scheme", "network", "asset", "payTo", "amount"):
             if k in acc and str(acc[k]).lower() != str(req[k]).lower(): return f"accepted.{k}_mismatch"
+    if is_permit2(payload): return "permit2_not_supported: pay with an EIP-3009 transferWithAuthorization (exact scheme)"
     a = authorization(payload)
-    if a is None: return None
+    if a is None: return "eip3009_authorization_required"
     try:
         if str(a.get("to", "")).lower() != req["payTo"].lower(): return "authorization_payee_mismatch"
         if int(a.get("value", -1)) != int(req["amount"]): return "authorization_amount_mismatch"
@@ -34,6 +35,12 @@ def precheck(payload, req, now=None):
         if not ADDR_RE.match(str(a.get("from", ""))): return "authorization_bad_from"
     except (TypeError, ValueError): return "authorization_malformed"
     return None
+def is_permit2(payload):
+    """Permit2 payloads carry no EIP-3009 nonce event, so the on-chain check could not bind the tx to this payment."""
+    inner = payload.get("payload") if isinstance(payload.get("payload"), dict) else {}
+    acc = payload.get("accepted") if isinstance(payload.get("accepted"), dict) else {}
+    extra = acc.get("extra") if isinstance(acc.get("extra"), dict) else {}
+    return any("permit2" in str(k).lower() for k in inner) or str(extra.get("assetTransferMethod", "")).lower() == "permit2"
 def replay_key(payload, sig):
     a = authorization(payload)
     if a and a.get("nonce") and a.get("from"): return "auth:" + str(a["from"]).lower() + ":" + str(a["nonce"]).lower()
@@ -61,6 +68,8 @@ def nonce_of(payload):
     n = str((authorization(payload) or {}).get("nonce", ""))
     return n if re.match(r"^0x[0-9a-fA-F]{1,64}$", n) else None
 class FailLimiter:
+    """Single-process, in-memory cooldown. Fine for one Python instance (tests, a single container); NOT for production
+    behind several instances, where each would keep its own counts. The Deno server keeps this state in KV."""
     def __init__(s, limit=3, window=600): s.limit, s.window, s.m, s.lock = limit, window, {}, threading.Lock()
     def blocked(s, who, now=None):
         now = now or time.time()

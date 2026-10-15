@@ -143,7 +143,7 @@ export async function handler(req: Request, d: Deps): Promise<Response> {
 }
 
 const FAILS = new SG.FailLimiter();
-export function resetGuards() { FAILS.m.clear(); }
+export async function resetGuards() { await FAILS.clear(); }
 const noPay = (why: unknown, network: string) => ({ "PAYMENT-RESPONSE": b64({ success: false, errorReason: why ?? null, network }) });
 type Cfg = ReturnType<typeof cfg>;
 /** verify -> handler -> settle -> independent on-chain check -> serve (same rules as api/index.py paid()).
@@ -189,7 +189,7 @@ async function paid(path: string, q: Record<string, string>, qs: string, sig: st
   const bad = SG.precheck(payload, r);
   if (bad) return [402, { error: bad }, noPay(bad, c.NETWORK)];
   const who = SG.payerOf(payload);
-  if (FAILS.blocked(who)) return [429, { error: "too many failed settlements, retry later" }, {}];
+  if (await FAILS.blocked(who)) return [429, { error: "too many failed settlements, retry later" }, {}];
   const body = { x402Version: 2, paymentPayload: payload, paymentRequirements: r };
   const v = await fac("/verify", body); const tVer = iso();
   if (!v.isValid) return [402, { error: v.invalidReason ?? "invalid" }, noPay(v.invalidReason, c.NETWORK)];
@@ -208,7 +208,7 @@ async function paid(path: string, q: Record<string, string>, qs: string, sig: st
       log({ ...st, success: true, transaction: tx, payer }, { ...oc, note: "settle_reported_failure_but_confirmed_onchain" }, true, times);
       return [200, out, { "PAYMENT-RESPONSE": b64({ ...st, success: true, transaction: tx }) }];
     }
-    FAILS.fail(who);
+    await FAILS.fail(who);
     return [402, { error: st.errorReason ?? "settle failed" }, { "PAYMENT-RESPONSE": b64(st) }];
   }
   if (!tx) { mismatch("settle_success_without_valid_tx_hash"); return [502, { error: "settlement response invalid, contact support with your payment" }, {}]; }

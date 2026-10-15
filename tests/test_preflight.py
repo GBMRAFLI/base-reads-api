@@ -280,6 +280,15 @@ class T7(unittest.TestCase):
         self.assertEqual(self.calls, [])  # rejected before any facilitator call
         p = json.loads(base64.b64decode(self.pay())); p["accepted"]["amount"] = "1"
         self.assertEqual(self.run_paid(base64.b64encode(json.dumps(p).encode()).decode())[1]["error"], "accepted.amount_mismatch")
+    def test_permit2_and_non_eip3009_rejected_before_facilitator(self):
+        r = IX.req_for("/base/network")
+        p2 = {"x402Version": 2, "accepted": r, "payload": {"permit2Authorization": {"from": self.PAYER, "nonce": "1"}, "signature": "0x"}}
+        acc = dict(r, extra=dict(r["extra"], assetTransferMethod="permit2"))
+        for body, why in ((p2, "permit2_not_supported"), ({"x402Version": 2, "accepted": acc, "payload": {"authorization": {}}}, "permit2_not_supported"),
+                          ({"x402Version": 2, "payload": {"signature": "0x"}}, "eip3009_authorization_required")):
+            c, out, hd = self.run_paid(base64.b64encode(json.dumps(body).encode()).decode())
+            self.assertEqual(c, 402); self.assertTrue(out["error"].startswith(why), out)
+        self.assertEqual(self.calls, [])
     def test_bad_or_huge_header(self):
         self.assertEqual(self.run_paid("x" * 20000)[0], 400); self.assertEqual(self.run_paid("%%%")[0], 400)
     def test_failed_settle_burns_signature_then_cooldown(self):

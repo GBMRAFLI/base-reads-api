@@ -23,8 +23,9 @@ export function precheck(p: Record<string, any>, req: Req, now = Math.floor(Date
   if (acc && typeof acc === "object" && !Array.isArray(acc))
     for (const k of ["scheme", "network", "asset", "payTo", "amount"])
       if (k in acc && String(acc[k]).toLowerCase() !== String(req[k]).toLowerCase()) return `accepted.${k}_mismatch`;
+  if (isPermit2(p)) return "permit2_not_supported: pay with an EIP-3009 transferWithAuthorization (exact scheme)";
   const a = authorization(p);
-  if (!a) return null;
+  if (!a) return "eip3009_authorization_required";
   try {
     if (String(a.to ?? "").toLowerCase() !== String(req.payTo).toLowerCase()) return "authorization_payee_mismatch";
     if (int(a.value, -1) !== BigInt(req.amount)) return "authorization_amount_mismatch";
@@ -33,6 +34,12 @@ export function precheck(p: Record<string, any>, req: Req, now = Math.floor(Date
     if (!ADDR_RE.test(String(a.from ?? ""))) return "authorization_bad_from";
   } catch { return "authorization_malformed"; }
   return null;
+}
+/** Permit2 payloads carry no EIP-3009 nonce event, so the on-chain check could not bind the tx to this payment. */
+export function isPermit2(p: Record<string, any>) {
+  const inner = p.payload && typeof p.payload === "object" ? p.payload : {};
+  const extra = p.accepted?.extra && typeof p.accepted.extra === "object" ? p.accepted.extra : {};
+  return Object.keys(inner).some((k) => k.toLowerCase().includes("permit2")) || String(extra.assetTransferMethod ?? "").toLowerCase() === "permit2";
 }
 export async function replayKey(p: Record<string, any>, sig: string) {
   const a = authorization(p);
@@ -60,15 +67,29 @@ export async function takePending(key: string): Promise<any | null> {
   const r = await k.atomic().check(e).delete(["pending", key]).commit();
   return r.ok ? e.value : null;
 }
-/** Atomically mark a settlement tx as used; false if it was already used for a served sale. */
+/** Durable, atomic: a settlement tx hash is stored in KV (no expiry) the first time it backs a sale; false if already used. */
 export async function claimTx(tx: string): Promise<boolean> {
   const k = await kv(); const kk = ["txused", tx.toLowerCase()];
   return (await k.atomic().check({ key: kk, versionstamp: null }).set(kk, Date.now()).commit()).ok;
 }
+/** Failed-settlement cooldown kept in Deno KV, so every instance/isolate sees the same counts.
+ * Updates use an atomic compare-and-set on the entry's versionstamp (retried on conflict). */
 export class FailLimiter {
-  m = new Map<string, number[]>();
   constructor(public limit = 3, public windowMs = 600_000) {}
-  blocked(who: string | null, now = Date.now()) { return !!who && (this.m.get(who) ?? []).filter((t) => t > now - this.windowMs).length >= this.limit; }
-  fail(who: string | null, now = Date.now()) { if (who) this.m.set(who, [...(this.m.get(who) ?? []).filter((t) => t > now - this.windowMs), now]); }
+  async blocked(who: string | null, now = Date.now()) {
+    if (!who) return false;
+    const e = await (await kv()).get<number[]>(["fails", who]);
+    return (e.value ?? []).filter((t) => t > now - this.windowMs).length >= this.limit;
+  }
+  async fail(who: string | null, now = Date.now()) {
+    if (!who) return;
+    const k = await kv();
+    for (let i = 0; i < 10; i++) {
+      const e = await k.get<number[]>(["fails", who]);
+      const next = [...(e.value ?? []).filter((t) => t > now - this.windowMs), now];
+      if ((await k.atomic().check(e).set(["fails", who], next, { expireIn: this.windowMs }).commit()).ok) return;
+    }
+  }
+  async clear() { const k = await kv(); for await (const e of k.list({ prefix: ["fails"] })) await k.delete(e.key); }
 }
 export function payerOf(p: Record<string, any>) { const f = String(authorization(p)?.from ?? "").toLowerCase(); return ADDR_RE.test(f) ? f : null; }
