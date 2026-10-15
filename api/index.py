@@ -135,7 +135,7 @@ def export(auth, q):
 REPO_URL = os.environ.get("REPO_URL", "https://github.com/GBMRAFLI/base-reads-api")
 def root():
     return {"service": "Base Reads", "network": NETWORK, "protocol": "x402 v2", "facilitator": facilitator_info(),
-            "free": ["/llms.txt", "/.well-known/x402-preflight", "/.well-known/x402-preflight-key-history.json", "/.well-known/bazaar-snapshot.json", "/x402/preflight/pubkey", "/bazaar/snapshots"],
+            "free": ["/llms.txt", "/openapi.json", "/.well-known/402index-verify.txt", "/.well-known/x402-preflight", "/.well-known/x402-preflight-key-history.json", "/.well-known/bazaar-snapshot.json", "/x402/preflight/pubkey", "/bazaar/snapshots"],
             "routes": {k: {"price_usdc": v[0] / 1e6, "description": v[1]} for k, v in ROUTES.items()}}
 REF_RE = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
 def clean_ref(qs):
@@ -154,11 +154,26 @@ def llms_txt():
          "- Responses are served only after the transfer is confirmed on-chain", "- Optional ?ref=<tag> (A-Z a-z 0-9 . _ -, max 64) is recorded for attribution and never changes price or challenge", "",
          "## Paid routes (GET, JSON)", ""]
     L += [f"- {k} ({v[0] / 1e6:.3f} USDC): {v[1]}" for k, v in ROUTES.items()]
-    L += ["", "## Discovery (free)", "", "- / : service index with routes and prices", "- /bazaar/snapshots : daily Bazaar snapshot summary",
+    L += ["", "## Discovery (free)", "", "- / : service index with routes and prices", "- /openapi.json : OpenAPI 3.1 description of the paid routes with prices", "- /bazaar/snapshots : daily Bazaar snapshot summary",
           "- /.well-known/bazaar-snapshot.json : signed snapshot series metadata", "- /.well-known/x402-preflight : Pre-pay Check schema and signing key",
           "- /.well-known/x402-preflight-key-history.json : signing key history", "- /x402/preflight/pubkey : Ed25519 public key for verifying signed facts",
           "- Each 402 challenge carries extensions.bazaar (input schema and output example) for x402 Bazaar listing", "", "Facts only, no investment advice.", ""]
     return "\n".join(L)
+VERIFY_402INDEX = "be918d4df21371f971ccaa589e4ed1adbe9a077a824950b1db21cebfbbf5ae3c"  # served with no trailing newline: exact token, byte-for-byte
+def openapi():
+    """OpenAPI 3.1 for the paid routes, generated from ROUTES + discovery.json so prices cannot drift from the 402 challenge."""
+    paths = {}
+    for k, (price, desc, ex) in ROUTES.items():
+        d = DISCOVERY[k]
+        params = [{"name": n, "in": "query", "required": n in d["required"], "description": sch.get("description", ""), "schema": {kk: vv for kk, vv in sch.items() if kk != "description"}} for n, sch in d["params"].items()]
+        paths[k] = {"get": {"operationId": k.strip("/").replace("/", "_").replace("-", "_"), "summary": desc.split(". ")[0][:120], "description": desc, "parameters": params,
+            "responses": {"200": {"description": "Result (served after the payment is confirmed on-chain)", "content": {"application/json": {"example": d["output"]}}},
+                          "402": {"description": "Payment required: x402 v2 challenge in the PAYMENT-REQUIRED header and body"}},
+            "x-payment-info": {"protocols": ["x402"], "pricingMode": "fixed", "price": f"{price / 1e6:.3f}", "amount": str(price), "currency": "USDC", "asset": USDC, "network": NETWORK}}}
+    return {"openapi": "3.1.0", "info": {"title": "Base Reads", "version": "1.0.0",
+            "description": "Pay-per-call read API for Base over x402 v2. Deterministic data, no advice.",
+            "x-guidance": "Call any path with GET. Without payment you get HTTP 402 and a PAYMENT-REQUIRED challenge (x402 v2, exact scheme, USDC on Base). Sign an EIP-3009 transferWithAuthorization for the stated amount and retry with the PAYMENT-SIGNATURE header; the JSON is returned once the transfer is confirmed on-chain."},
+            "paths": paths}
 def facilitator_info():
     """Which facilitator verifies/settles payments, derived from FACILITATOR (never hardcoded in responses)."""
     h = (urllib.parse.urlsplit(FAC).hostname or "").lower()
@@ -314,6 +329,8 @@ class handler(BaseHTTPRequestHandler):
         if path in ("/", "/index.json"):
             return s._send(200, root())
         if path == "/llms.txt": return s._send(200, llms_txt(), {"Cache-Control": "public, max-age=3600"}, ctype="text/plain; charset=utf-8")
+        if path == "/openapi.json": return s._send(200, openapi())
+        if path == "/.well-known/402index-verify.txt": return s._send(200, VERIFY_402INDEX, ctype="text/plain; charset=utf-8")
         if path == "/.well-known/x402-preflight":
             try: return s._send(200, well_known())
             except RuntimeError: return s._send(503, {"error": "signing key unavailable"})

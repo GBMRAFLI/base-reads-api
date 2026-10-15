@@ -92,6 +92,21 @@ class T1(unittest.TestCase):
                     except urllib.error.HTTPError as e: self.assertEqual(e.code, 402); got.append((e.read(), e.headers["PAYMENT-REQUIRED"]))
                 self.assertEqual(len(set(got)), 1, k)
         finally: srv.shutdown()
+    def test_openapi_prices_match_402_and_verify_file(self):
+        srv = IX.ThreadingHTTPServer(("127.0.0.1", 18768), IX.handler); threading.Thread(target=srv.serve_forever, daemon=True).start()
+        try:
+            o = json.loads(urllib.request.urlopen("http://127.0.0.1:18768/openapi.json").read())
+            self.assertEqual((o["openapi"], o["info"]["title"]), ("3.1.0", "Base Reads")); self.assertNotIn("contact", o["info"])
+            self.assertEqual(list(o["paths"]), list(IX.ROUTES))
+            for k in IX.ROUTES:
+                try: urllib.request.urlopen("http://127.0.0.1:18768" + k); self.fail(k)
+                except urllib.error.HTTPError as e: self.assertEqual(e.code, 402); amt = json.loads(e.read())["accepts"][0]["amount"]
+                pi = o["paths"][k]["get"]["x-payment-info"]
+                self.assertEqual(pi["amount"], amt); self.assertEqual(round(float(pi["price"]) * 1e6), int(amt))
+                self.assertEqual((pi["protocols"], pi["currency"]), (["x402"], "USDC")); self.assertIn("402", o["paths"][k]["get"]["responses"])
+            r = urllib.request.urlopen("http://127.0.0.1:18768/.well-known/402index-verify.txt")
+            self.assertTrue(r.headers["Content-Type"].startswith("text/plain")); self.assertEqual(r.read(), b"be918d4df21371f971ccaa589e4ed1adbe9a077a824950b1db21cebfbbf5ae3c")
+        finally: srv.shutdown()
     def test_ref_newline_rejected_first_wins_and_hash_ignores_ref(self):
         self.assertIsNone(IX.clean_ref("ref=abc%0A")); self.assertIsNone(IX.clean_ref("ref=abc%0D%0A"))
         self.assertEqual(IX.clean_ref("ref=first&ref=second"), "first")
