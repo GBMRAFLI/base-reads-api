@@ -1,0 +1,6 @@
+[Unit]
+Description=Base Reads KV backup
+[Service]
+Type=oneshot
+EnvironmentFile=-/etc/base-reads/env
+ExecStart=/usr/local/sbin/base-reads-kv-backup

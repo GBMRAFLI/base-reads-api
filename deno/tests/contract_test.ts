@@ -1,4 +1,5 @@
-import { assert, assertEquals } from "jsr:@std/assert@1";
+import * as LG from "../lib/ledger.ts";
+import { assert, assertEquals, assertThrows } from "jsr:@std/assert@1";
 import { canonical, pyDumps } from "../lib/canonical.ts";
 import { decryptPem, publicKeyInfo, resetKey, sign, verify } from "../lib/sign.ts";
 import { checkUrl, IndexAssembler, validateChallenge, preflight, saveIndex, bazaarFacts, clearIndexCache } from "../lib/preflight.ts";
@@ -658,6 +659,10 @@ Deno.test("snapshot follow-ups: freshness, tiers 30/365, legacy, orphan purge, c
   // also just past the window (4 days)
   const aged4 = await bazaarFacts("https://missing.example/nope", [], 14, "2002-01-05");
   assertEquals([(aged4 as any).available, (aged4 as any).snapshot_age_days, (aged4 as any).max_age_days], [false, 4, 3]);
+  assertEquals([(aged4 as any).snapshot_date, (aged4 as any).requested_date, (aged4 as any).age_days], ["2002-01-01", "2002-01-05", 4]);
+  // L-c: age exactly 3 days is still served
+  const age3 = await bazaarFacts("https://missing.example/nope", [], 14, "2002-01-04");
+  assertEquals([(age3 as any).available, (age3 as any).reason], [true, undefined]);
 
   // H1: only reduced -> snapshot_too_old
   await wipeSnaps(k);
@@ -668,6 +673,9 @@ Deno.test("snapshot follow-ups: freshness, tiers 30/365, legacy, orphan purge, c
   } as any);
   const tooOld = await bazaarFacts("https://missing.example/nope", [], 14, "2002-03-02");
   assertEquals([(tooOld as any).available, (tooOld as any).reason, (tooOld as any).listed], [false, "snapshot_too_old", undefined]);
+  // L-c: reduced-only too-old carries auditable context
+  assertEquals([(tooOld as any).snapshot_date, (tooOld as any).requested_date, (tooOld as any).age_days, (tooOld as any).snapshot_age_days, (tooOld as any).max_age_days, (tooOld as any).snapshot_tier],
+    ["2002-03-01", "2002-03-02", 1, 1, 3, "reduced"]);
 
   // Never demote newest
   await wipeSnaps(k);
@@ -755,6 +763,7 @@ Deno.test("snapshot follow-ups: freshness, tiers 30/365, legacy, orphan purge, c
     tier: "full", status: "complete",
     coverage: { pages_fetched: 1, max_pages: 1, items_indexed: 8, bazaar_total: 8, complete: true, status: "complete", partial: false, failed_pages: [] } } as any);
   const keep = (await PF.readSnapMeta("2003-01-01"))!.gen!;
+  await PF.purgeOrphanGens("2003-01-01", keep, Date.now() + 2 * PF.GEN_PURGE_GRACE_MS); // past the grace period
   let orphan = 0;
   for await (const e of k.list({ prefix: ["snap", "2003-01-01"] })) {
     if (e.key.length >= 4 && e.key[2] !== keep) orphan++;
@@ -765,6 +774,40 @@ Deno.test("snapshot follow-ups: freshness, tiers 30/365, legacy, orphan purge, c
   assert(typeof (await PF.readSnapMeta("2003-01-01"))!.last_attempt_at === "string");
   await k.set(["snapdate", "2005-06-01"], { chunks: 1, tier: "full", status: null, listings: 0, gzip_bytes: 0, legacy: true }); // no last_attempt_at
   assertEquals((await PF.readSnapMeta("2005-06-01"))!.last_attempt_at ?? null, null);
+
+  // L-a: concurrent saves on one date: the loser deletes only its own chunks, winner stays loadable
+  await wipeSnaps(k);
+  const mk = (n: number) => ({ date: "2004-02-02", listings: n, hosts: { r: n }, wallet_hosts: {},
+    resources: { "https://r.example/r": { payers30d: n, calls30d: n, lastCalledAt: null, payTo: [] } }, tier: "full", status: "complete",
+    coverage: { pages_fetched: 1, max_pages: 1, items_indexed: n, bazaar_total: n, complete: true, status: "complete", partial: false, failed_pages: [] } } as any);
+  PF.setBeforeFlip(async () => { PF.setBeforeFlip(null); await saveIndex(mk(22)); }); // B runs fully inside A's window
+  let lost = "";
+  try { await saveIndex(mk(11)); } catch (e) { lost = (e as Error).message; } finally { PF.setBeforeFlip(null); }
+  assertEquals(lost, "snapdate_cas_failed");
+  clearIndexCache();
+  const win = (await PF.readSnapMeta("2004-02-02"))!;
+  assertEquals((await PF.loadIndex("2004-02-02")).listings, 22);
+  for await (const e of k.list({ prefix: ["snap", "2004-02-02"] })) assertEquals(e.key[2], win.gen);
+
+  // L-a/L7: purge keeps the active gen and any gen younger than the grace period (in-progress, even if it sorts
+  // older after a clock step-back); removes numeric gens and string gens past the grace period.
+  const active = win.gen as string; const now = Date.now(); const G = PF.GEN_PURGE_GRACE_MS;
+  const newer = PF.newGenId(now + 60_000);
+  const steppedBack = PF.newGenId(now - 5 * 60_000); // sorts older than active, but recent
+  const stale = PF.newGenId(now - 2 * G);
+  const staleNewerThanActive = "zzz-malformed"; // sorts after every id, time not parseable => purgeable
+  for (const g of [newer, steppedBack, stale, staleNewerThanActive]) await k.set(["snap", "2004-02-02", g, 0], new Uint8Array([1]));
+  await k.set(["snap", "2004-02-02", 5, 0], new Uint8Array([2])); // old numeric gen
+  await PF.purgeOrphanGens("2004-02-02", active, now);
+  const left: unknown[] = []; for await (const e of k.list({ prefix: ["snap", "2004-02-02"] })) left.push(e.key[2]);
+  assert(left.includes(newer)); assert(left.includes(active)); assert(left.includes(steppedBack));
+  assert(!left.includes(stale)); assert(!left.includes(staleNewerThanActive)); assert(!left.includes(5));
+  // later, past the grace period, everything but the active gen goes
+  await PF.purgeOrphanGens("2004-02-02", active, now + 3 * G);
+  const left2: unknown[] = []; for await (const e of k.list({ prefix: ["snap", "2004-02-02"] })) left2.push(e.key[2]);
+  assertEquals(new Set(left2), new Set([active]));
+  await PF.purgeOrphanGens("2004-02-02", null); // null => no-op
+  clearIndexCache();
 
   // Concurrent day gate
   await wipeSnaps(k);
@@ -793,3 +836,179 @@ Deno.test("snapshot follow-ups: freshness, tiers 30/365, legacy, orphan purge, c
   await wipeSnaps(k);
 });
 
+
+Deno.test("clientIp: proxy header only trusted from loopback with TRUST_PROXY=1", async () => {
+  const { clientIp } = await import("../main.ts");
+  const r = new Request("http://h/", { headers: { "x-forwarded-for": "6.6.6.6, 203.0.113.9" } });
+  const on = (k: string) => k === "TRUST_PROXY" ? "1" : undefined;
+  if (clientIp(r, "127.0.0.1", on) !== "203.0.113.9") throw new Error("last hop");
+  if (clientIp(r, "198.51.100.1", on) !== "198.51.100.1") throw new Error("non-loopback peer");
+  if (clientIp(r, "127.0.0.1", () => undefined) !== "127.0.0.1") throw new Error("flag off");
+  const bad = new Request("http://h/", { headers: { "x-forwarded-for": "evil<>" } });
+  if (clientIp(bad, "127.0.0.1", on) !== "127.0.0.1") throw new Error("garbage");
+});
+
+Deno.test("deploy/listings.json matches routes and ref rules", async () => {
+  const L = JSON.parse(await Deno.readTextFile(new URL("../../deploy/listings.json", import.meta.url)));
+  const { buildRoutes } = await import("../../deploy/gen_listings.ts");
+  const { cleanRef } = await import("../main.ts");
+  assertEquals(L.routes, buildRoutes()); // regenerate with deploy/gen_listings.ts if this fails
+  assert(L.base_url === "https://API_DOMAIN_PLACEHOLDER" || /^https:\/\/[a-z0-9.-]+$/.test(L.base_url), "base_url: placeholder or https origin, no trailing slash");
+  const refs: string[] = [];
+  for (const [name, d] of Object.entries(L.directories as Record<string, any>)) {
+    if (d.ref == null) continue;
+    assertEquals(cleanRef("ref=" + encodeURIComponent(d.ref)), d.ref, `ref for ${name} must survive cleanRef`);
+    refs.push(d.ref);
+  }
+  assertEquals(new Set(refs).size, refs.length, "ref values must be unique per directory");
+  const v = L.directories["402index"].verify.path;
+  const { FREE_PATHS } = await import("../main.ts");
+  assert(FREE_PATHS.has(v));
+  for (const p of Object.values(L.discovery_paths) as string[]) assert(FREE_PATHS.has(p), p);
+});
+
+Deno.test("isLoopback / bindHost / clientIp with mapped and 127/8 peers", async () => {
+  const { isLoopback, bindHost, clientIp } = await import("../main.ts");
+  for (const ip of ["127.0.0.1", "127.1.2.3", "::1", "::ffff:127.0.0.1", "[::1]", "0:0:0:0:0:0:0:1"]) assert(isLoopback(ip), ip);
+  for (const ip of ["128.0.0.1", "10.0.0.1", "::ffff:10.0.0.1", "127.0.0.256", "::2", ""]) assert(!isLoopback(ip), ip);
+  const r = new Request("http://h/", { headers: { "x-forwarded-for": "203.0.113.9" } });
+  const on = (k: string) => k === "TRUST_PROXY" ? "1" : undefined;
+  assertEquals(clientIp(r, "::ffff:127.0.0.1", on), "203.0.113.9");
+  assertEquals(clientIp(r, "127.0.0.5", on), "203.0.113.9");
+  assertEquals([bindHost(on), bindHost(() => undefined), bindHost((k) => k === "HOST" ? "10.1.1.1" : on(k))], ["127.0.0.1", "0.0.0.0", "10.1.1.1"]);
+});
+
+Deno.test("/healthz: booleans only, 200 with key + KV, 503 without key", async () => {
+  const { handler } = await import("../main.ts");
+  const good = await handler(new Request("http://h/healthz"), { env, ip: "127.0.0.1" });
+  assertEquals([good.status, await good.json()], [200, { ok: true, signing: true, store: true }]);
+  resetKey();
+  const bad = await handler(new Request("http://h/healthz"), { env: (k: string) => k.startsWith("SIGNING_KEY") ? undefined : env(k), ip: "::1" });
+  const body = await bad.text(); resetKey();
+  assertEquals([bad.status, JSON.parse(body)], [503, { ok: false, signing: false, store: true }]);
+  assert(!body.includes(ENV.SIGNING_KEY_PASSPHRASE));
+  for (const ip of ["203.0.113.9", undefined]) {
+    const r = await handler(new Request("http://h/healthz"), { env, ip }); assertEquals(r.status, 404); await r.body?.cancel();
+  }
+  // behind the proxy, a public client resolves to its own IP -> 404
+  const { clientIp } = await import("../main.ts");
+  const viaProxy = clientIp(new Request("http://h/healthz", { headers: { "x-forwarded-for": "203.0.113.9" } }), "127.0.0.1", (k) => k === "TRUST_PROXY" ? "1" : undefined);
+  assertEquals((await handler(new Request("http://h/healthz"), { env, ip: viaProxy })).status, 404);
+});
+
+Deno.test("kv-merge: restored KV keeps newer accounting + in-flight keys from the live KV", async () => {
+  const { mergeProtected, PROTECTED } = await import("../../deploy/vps/kv-merge.ts");
+  const dir = await Deno.makeTempDir(); const live = dir + "/live.sqlite3"; const old = dir + "/old.sqlite3";
+  const a = await Deno.openKv(old);
+  await a.set(["txused", "0xold"], { at: 1 }); await a.set(["rec", "sales", "1"], { n: 1 }); await a.set(["snap", "x"], 1);
+  a.close();
+  const b = await Deno.openKv(live);
+  await b.set(["txused", "0xold"], { at: 1 }); await b.set(["txused", "0xnew"], { at: 2 });
+  await b.set(["nonce", "0xpayer", "n1"], { used: true }, { expireIn: 60_000 });
+  await b.set(["pending", "k1"], { s: 1 }, { expireIn: 60_000 }); await b.set(["inflight", "p", "0xpayer"], { at: 3 }, { expireIn: 60_000 });
+  await b.set(["rec", "sales", "1"], { n: 1 }); await b.set(["rec", "sales", "2"], { n: 2 });
+  await b.set(["snap", "x"], 2); // not protected: the restored value stays
+  b.close();
+  const counts = await mergeProtected(live, old);
+  assertEquals(counts, { rec: 1, pending: 1, inflight: 1 });
+  assertEquals(Object.keys(PROTECTED).sort(), ["inflight", "pending", "rec"]); // replay state lives in the ledger, not here
+  const c = await Deno.openKv(old);
+  for (const k of [["pending", "k1"], ["inflight", "p", "0xpayer"], ["rec", "sales", "1"], ["rec", "sales", "2"]]) {
+    assert((await c.get(k)).versionstamp !== null, JSON.stringify(k));
+  }
+  assertEquals((await c.get(["snap", "x"])).value, 1);
+  c.close(); await Deno.remove(dir, { recursive: true });
+});
+
+Deno.test("deploy.sh: KV backup/restore only in --restore-kv mode, service stopped before the copy", async () => {
+  const s = await Deno.readTextFile(new URL("../../deploy/vps/deploy.sh", import.meta.url));
+  const backup = s.indexOf(".backup '$SAVE/kv.sqlite3'"); const guard1 = s.lastIndexOf('if [ "$RESTORE_KV" = 1 ]', backup);
+  const stop = s.indexOf("systemctl stop base-reads", guard1);
+  assert(guard1 > 0 && stop > guard1 && stop < backup, "backup must be guarded and preceded by stop");
+  const restore = s.indexOf('mv "$KVF.restore" "$KVF"'); const guard2 = s.lastIndexOf('if [ "$RESTORE_KV" = 1 ]', restore);
+  const merge = s.indexOf("kv-merge.ts", guard2);
+  assert(guard2 > guard1 && merge > guard2 && merge < restore, "restore must be guarded and preceded by the merge");
+  assertEquals(s.split('mv "$KVF.restore" "$KVF"').length, 2);
+  assert(!/LEDGER/.test(s.replace(/^#.*$/gm, "")), "deploy.sh must never touch the payment ledger");
+});
+
+Deno.test("ledger: rolling the KV back to before a payment never re-opens its authorization (402 on reuse)", async () => {
+  await resetGuards(); const { kv } = await import("../lib/store.ts"); const k = await kv();
+  const t = rig({ v: { settled: true } }); const nonceX = rnd(); const sig = pay("/base/network", {}, nonceX);
+  // KV snapshot taken before the payment (replay-relevant prefixes)
+  const before = new Set<string>(); for await (const e of k.list({ prefix: ["nonce"] })) before.add(JSON.stringify(e.key));
+  assertEquals((await t.call(sig))[0], 200);
+  const key = "auth:" + PAYER.toLowerCase() + ":" + nonceX.toLowerCase();
+  assert(LG.isConsumed("auth", key), "nonce X recorded in the ledger");
+  // roll the KV back: drop everything written since the snapshot (nonce lock + pending)
+  for await (const e of k.list({ prefix: ["nonce"] })) if (!before.has(JSON.stringify(e.key))) await k.delete(e.key);
+  await k.delete(["pending", key]); await k.delete(["authused", key]); // ledger-only from here
+  assertEquals((await k.get(["nonce", key])).versionstamp, null);
+  assert(LG.isConsumed("auth", key), "ledger untouched by the KV rollback");
+  const [code, body] = await t.call(sig);
+  assertEquals([code, body.error], [402, "payment authorization already used"]);
+  assertEquals(t.calls.filter((x) => x === "/settle").length, 1); // never settled twice
+});
+
+Deno.test("ledger file: append-only, fsync-durable settings, survives reopen, imports old KV keys", async () => {
+  const dir = await Deno.makeTempDir(); const p = dir + "/ledger.sqlite3";
+  LG.openLedger(p);
+  assert(LG.consume("auth", "auth:0xa:0x1")); assert(!LG.consume("auth", "AUTH:0xA:0x1")); // case-insensitive, first use only
+  assert(LG.consume("tx", "0xT1")); assert(!LG.consume("tx", "0xt1"));
+  const db = LG.openLedger(p);
+  assertEquals((db.prepare("PRAGMA synchronous").get() as any).synchronous, 2); // FULL
+  assertEquals((db.prepare("PRAGMA journal_mode").get() as any).journal_mode, "wal");
+  assertThrows(() => db.exec("DELETE FROM consumed")); assertThrows(() => db.exec("UPDATE consumed SET at = 0"));
+  LG.closeLedger(); LG.openLedger(p); assert(LG.isConsumed("auth", "auth:0xa:0x1")); assert(LG.isConsumed("tx", "0xt1"));
+  const old = await Deno.openKv(dir + "/kv.sqlite3");
+  await old.set(["nonce", "auth:0xb:0x2"], 1); await old.set(["txused", "0xt2"], 1); await old.set(["txused", "0xt1"], 1);
+  assertEquals(await LG.migrateFromKv(old), { auth: 1, tx: 1 }); assertEquals(await LG.migrateFromKv(old), { auth: 0, tx: 0 });
+  old.close(); assertEquals(LG.ledgerCount(), 4);
+  LG.closeLedger(); await Deno.remove(dir, { recursive: true });
+  assertEquals(LG.ledgerPath((k) => k === "KV_PATH" ? "/var/lib/x/kv.sqlite3" : undefined), "/var/lib/x/ledger.sqlite3");
+  assertEquals(LG.ledgerPath((k) => k === "LEDGER_PATH" ? "/data/l.db" : "/var/lib/x/kv.sqlite3"), "/data/l.db");
+});
+
+Deno.test("finality: settled only after MIN_CONFIRMATIONS", async () => {
+  const r = reqFor("/base/network", env); const pad = (a: string) => "0x" + "0".repeat(24) + a.slice(2).toLowerCase();
+  const rc = { status: "0x1", blockNumber: "0x64", logs: [{ address: r.asset, topics: [TRANSFER, pad(PAYER), pad(r.payTo)], data: "0x3e8" }] };
+  const f = (head: number, min: number) => verifyOnchain(async (m: string) => m === "eth_blockNumber" ? "0x" + head.toString(16) : rc,
+    "0x" + "ab".repeat(32), r.asset, r.payTo, r.amount, PAYER, "eip155:8453", 1, 0, async () => {}, null, min) as Promise<any>;
+  assertEquals(await f(101, 3).then((x) => [x.settled, x.reason, x.confirmations]), [null, "awaiting_confirmations", 2]);
+  assertEquals(await f(102, 3).then((x) => [x.settled, x.confirmations]), [true, 3]);
+  assertEquals((await f(0, 1)).settled, true); // default 1: receipt is enough (previous behaviour)
+});
+
+Deno.test("defense in depth: reuse rejected when the authorization / tx is only in the KV or only in the ledger", async () => {
+  await resetGuards(); const { kv } = await import("../lib/store.ts"); const k = await kv();
+  // authorization present only in the KV copy
+  const t = rig({ v: { settled: true } }); const n = rnd(); const key = "auth:" + PAYER.toLowerCase() + ":" + n.toLowerCase();
+  await k.set(["authused", key], 1); assert(!LG.isConsumed("auth", key));
+  const [c, b] = await t.call(pay("/base/network", {}, n));
+  assertEquals([c, b.error], [402, "payment authorization already used"]); assertEquals(t.calls.filter((x) => x === "/settle").length, 0);
+  // authorization present only in the ledger
+  const n2 = rnd(); const key2 = "auth:" + PAYER.toLowerCase() + ":" + n2.toLowerCase(); LG.consume("auth", key2);
+  assertEquals((await k.get(["authused", key2])).versionstamp, null);
+  assertEquals((await t.call(pay("/base/network", {}, n2)))[0], 402);
+  // tx: only in KV, only in ledger, in neither
+  const SGm = await import("../lib/settle_guard.ts");
+  const t1 = rnd(); await k.set(["txused", t1], 1); assertEquals(await SGm.claimTx(t1), false);
+  const t2 = rnd(); LG.consume("tx", t2); assertEquals(await SGm.claimTx(t2), false);
+  const t3 = rnd(); assertEquals(await SGm.claimTx(t3), true);
+  assert(LG.isConsumed("tx", t3)); assert((await k.get(["txused", t3])).versionstamp !== null); // written to both
+});
+
+Deno.test("startup refuses an in-memory ledger on mainnet; testnet needs explicit opt-in", async () => {
+  const e = (m: Record<string, string>) => (k: string) => m[k];
+  assert(LG.ledgerConfigError(e({}))?.includes("mainnet")); // NETWORK defaults to mainnet
+  assert(LG.ledgerConfigError(e({ NETWORK: "eip155:8453", LEDGER_MEMORY_OK: "1" }))?.includes("mainnet"));
+  assert(LG.ledgerConfigError(e({ NETWORK: "eip155:84532" })) !== null);
+  assertEquals(LG.ledgerConfigError(e({ NETWORK: "eip155:84532", LEDGER_MEMORY_OK: "1" })), null);
+  assertEquals(LG.ledgerConfigError(e({ KV_PATH: "/var/lib/x/kv.sqlite3" })), null);
+  assertEquals(LG.ledgerConfigError(e({ LEDGER_PATH: "/var/lib/x/l.sqlite3" })), null);
+  // real process: mainnet config without any path exits with the error before serving
+  const p = new Deno.Command(Deno.execPath(), { args: ["run", "-A", "--config", new URL("../deno.json", import.meta.url).pathname, new URL("../main.ts", import.meta.url).pathname],
+    clearEnv: true, env: { PATH: Deno.env.get("PATH") ?? "", HOME: Deno.env.get("HOME") ?? "", PORT: "0", SNAPSHOT_SCHEDULER: "0" }, stdout: "piped", stderr: "piped" });
+  const out = await p.output(); const err = new TextDecoder().decode(out.stderr);
+  assert(!out.success); assert(err.includes("payment ledger needs a file"), err.slice(0, 300));
+});

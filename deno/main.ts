@@ -7,10 +7,11 @@ import { PAY_TO_DEFAULT, ROUTES } from "./lib/routes.ts";
 import DISCOVERY from "./lib/discovery.json" with { type: "json" };
 import { CDP_HOST, enabled as cdpEnabled, headers as cdpHeaders } from "./lib/cdp_auth.ts";
 import * as SG from "./lib/settle_guard.ts";
+import * as LG from "./lib/ledger.ts";
 import { SCHEMA, snapshotDates, loadIndex } from "./lib/preflight.ts";
-import { isoOrNull, keyHistory, publicKeyInfo, sign, SigningUnavailable } from "./lib/sign.ts";
+import { isoOrNull, keyHistory, loadKey, publicKeyInfo, sign, SigningUnavailable } from "./lib/sign.ts";
 import { scheduledSnapshot, latestSnapStatus, loadFail, mapErrorCode } from "./lib/snapshot.ts";
-import { EXPORT_FILES, rows } from "./lib/store.ts";
+import { EXPORT_FILES, kv, rows } from "./lib/store.ts";
 import { recordObservation, recordSale, verifyOnchain } from "./lib/stream.ts";
 import { ADDR, b64json, iso, pyQuery, sha256hex, unquote } from "./lib/util.ts";
 
@@ -192,6 +193,16 @@ export async function handler(req: Request, d: Deps): Promise<Response> {
   }
   return await handleGet(req, d);
 }
+/** Liveness for deploys: signing key loads and a KV write/read/delete round-trip works. Outputs only booleans. */
+export async function health(env: Deps["env"]): Promise<[number, Record<string, boolean>]> {
+  let signing = false, store = false;
+  try { await loadKey(env); signing = true; } catch { /* reported as false */ }
+  try {
+    const k = await kv(); const key = ["health", crypto.randomUUID()]; const v = crypto.randomUUID();
+    await k.set(key, v, { expireIn: 60_000 }); store = (await k.get(key)).value === v; await k.delete(key);
+  } catch { store = false; }
+  const ok = signing && store; return [ok ? 200 : 503, { ok, signing, store }];
+}
 async function handleGet(req: Request, d: Deps): Promise<Response> {
   if (req.method !== "GET") return send(501, { error: "unsupported method" });
   const env = d.env; const c = cfg(env); const rpc = d.rpc ?? makeRpc(c.RPC); const fac = d.fac ?? facClient(c.FAC, env);
@@ -201,6 +212,10 @@ async function handleGet(req: Request, d: Deps): Promise<Response> {
   if (path === "/openapi.json") return send(200, openapi(env), { "Cache-Control": "public, max-age=3600" });
   if (path === "/favicon.ico") return new Response(Uint8Array.from(atob(FAVICON_B64), (ch) => ch.charCodeAt(0)), { status: 200, headers: { ...HDRS, "Content-Type": "image/x-icon", "Cache-Control": "public, max-age=86400" } });
   if (path === "/.well-known/402index-verify.txt") return new Response(verifyToken(env), { status: 200, headers: { ...HDRS, "Content-Type": "text/plain; charset=utf-8" } });
+  if (path === "/healthz") { // local deploy checks only: any non-loopback peer (incl. proxied clients) gets 404
+    if (!d.ip || !isLoopback(d.ip)) return send(404, { error: "not found" });
+    return send(...await health(env), { "Cache-Control": "no-store" });
+  }
   if (path === "/llms.txt") return new Response(llmsTxt(env), { status: 200, headers: { ...HDRS, "Content-Type": "text/plain; charset=utf-8", "Cache-Control": "public, max-age=3600" } });
   if (path === "/.well-known/x402-preflight") {
     try { return send(200, await wellKnown(env)); } catch (e) { if (e instanceof SigningUnavailable) return send(503, { error: "signing key unavailable" }); throw e; }
@@ -268,7 +283,8 @@ async function paid(path: string, q: Record<string, string>, qs: string, sig: st
   const bad = SG.precheck(payload, r); // before the claim: malformed/foreign payloads never consume a nonce slot
   if (bad) return [402, { error: bad }, noPay(bad, N)];
   const who = SG.payerOf(payload)!; const nonce = SG.nonceOf(payload)!; const ids = { ip: d.ip ?? null, payer: who };
-  const check = d.check ?? ((tx: string, rq: any, payer: string | undefined) => verifyOnchain(rpc, tx, rq.asset, rq.payTo, rq.amount, payer, N, 3, 1000, undefined, nonce));
+  const minConf = Math.max(1, Number(env("MIN_CONFIRMATIONS") ?? 1) || 1);
+  const check = d.check ?? ((tx: string, rq: any, payer: string | undefined) => verifyOnchain(rpc, tx, rq.asset, rq.payTo, rq.amount, payer, N, 3, 1000, undefined, nonce, minConf));
   const bg = d.background ?? (() => {});
   const sale = (tx: string) => ({ success: true, transaction: tx, payer: who, network: N });
   const log = (tx: string, oc: any, served: boolean, times: [string, string, string]) => {
@@ -308,6 +324,9 @@ async function paid(path: string, q: Record<string, string>, qs: string, sig: st
     if (pend) await SG.setPending(key, pend);
     return [409, { error: "payment authorization already used or in flight" }, noPay("replay", N)];
   }
+  // KV claim is only an in-flight lock; the append-only ledger is the source of truth for spent authorizations,
+  // so a rolled-back or restored KV can never let a spent authorization through again.
+  if (await SG.authUsed(key)) return [402, { error: "payment authorization already used" }, noPay("replay", N)];
   const body = { x402Version: 2, paymentPayload: payload, paymentRequirements: r };
   const v = await fac("/verify", body); const tVer = iso();
   if (!v.isValid) { const why = facErr(v.invalidReason); await FAILS.fail({ ip: ids.ip }, "verify"); return [402, { error: why }, noPay(why, N)]; }
@@ -320,6 +339,8 @@ async function paid(path: string, q: Record<string, string>, qs: string, sig: st
     return [502, { error: "upstream error, not charged" }, {}];
   }
   if (code !== 200) return [code, out, {}]; // bad input: not settled, not charged
+  // point of no return: record the authorization as consumed (fsync'ed) before asking for settlement
+  if (!await SG.consumeAuth(key, { path, payload_sha256: await SG.payloadHash(payload!) })) return [402, { error: "payment authorization already used" }, noPay("replay", N)];
   const st = await fac("/settle", body); const tSet = iso(); const times: [string, string, string] = [tReq, tVer, tSet];
   const tx: string | null = typeof st.transaction === "string" && SG.TX_RE.test(st.transaction) ? st.transaction.toLowerCase() : null;
   if (typeof st.payer === "string" && st.payer.toLowerCase() !== who) mismatch("facilitator_payer_differs_from_signed_from");
@@ -350,6 +371,23 @@ async function paid(path: string, q: Record<string, string>, qs: string, sig: st
 }
 }
 
+/** Behind a local reverse proxy (TRUST_PROXY=1) the peer is loopback; use the last X-Forwarded-For hop the proxy appended. */
+/** Loopback: 127.0.0.0/8, ::1, and IPv4-mapped ::ffff:127.x.x.x. */
+export function isLoopback(ip: string) {
+  const v = ip.toLowerCase().replace(/^\[|\]$/g, "");
+  if (v === "::1" || v === "0:0:0:0:0:0:0:1") return true;
+  const v4 = v.startsWith("::ffff:") ? v.slice(7) : v;
+  const m = /^127\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(v4);
+  return !!m && m.slice(1).every((x) => Number(x) <= 255);
+}
+/** Bind address: HOST if set, else loopback when behind a proxy, else all interfaces. */
+export const bindHost = (env: Deps["env"]) => env("HOST") ?? (env("TRUST_PROXY") === "1" ? "127.0.0.1" : "0.0.0.0");
+export function clientIp(req: Request, peer: string, env: Deps["env"]) {
+  if (env("TRUST_PROXY") !== "1" || !isLoopback(peer)) return peer;
+  const hop = (req.headers.get("x-forwarded-for") ?? "").split(",").pop()?.trim() ?? "";
+  return /^[0-9a-fA-F:.]{2,45}$/.test(hop) ? hop : peer;
+}
+
 if (import.meta.main) {
   const env = (k: string) => Deno.env.get(k);
   if ((env("SNAPSHOT_SCHEDULER") ?? "1") === "1") {
@@ -357,6 +395,11 @@ if (import.meta.main) {
     Deno.cron("fail-counter-purge", "7 0 * * *", async () => { await FAILS.purge(); });
   }
   for (const w of startupWarnings(env)) console.warn("WARNING:", w);
+  const lerr = LG.ledgerConfigError(env); if (lerr) throw new Error(lerr); // refuse to start without a durable ledger
+  LG.openLedger(LG.ledgerPath(env));
+  const mig = await LG.migrateFromKv(await kv()); // one-time import of replay keys kept in KV by older releases
+  if (mig.auth || mig.tx) console.log("ledger: imported", JSON.stringify(mig));
   assertOnchainMode(env); // refuse to start with ONCHAIN_CHECK=log on Base mainnet
-  Deno.serve({ port: Number(env("PORT") ?? 8000) }, (req, info) => handler(req, { env, ip: (info.remoteAddr as Deno.NetAddr).hostname }));
+  Deno.serve({ hostname: bindHost(env), port: Number(env("PORT") ?? 8000) },
+    (req, info) => handler(req, { env, ip: clientIp(req, (info.remoteAddr as Deno.NetAddr).hostname, env) }));
 }

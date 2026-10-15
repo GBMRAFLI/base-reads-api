@@ -1,4 +1,5 @@
 // Port of api/settle_guard.py (see SECURITY.md). Replay claims live in Deno KV with atomic checks, so they hold across isolates.
+import * as LG from "./ledger.ts";
 import { kv } from "./store.ts";
 import { sha256hex } from "./util.ts";
 export const MAX_HEADER = 16384, MIN_VALID_WINDOW = 6;
@@ -87,10 +88,25 @@ export async function takePending(key: string): Promise<any | null> {
   const r = await k.atomic().check(e).delete(["pending", key]).commit();
   return r.ok ? e.value : null;
 }
-/** Durable, atomic: a settlement tx hash is stored in KV (no expiry) the first time it backs a sale; false if already used. */
+/** Durable, atomic: a settlement tx hash is recorded in the append-only payment ledger (separate file, fsync'ed)
+ * the first time it backs a sale; false if already used. Never stored in the KV store, so KV restores cannot re-open it. */
 export async function claimTx(tx: string): Promise<boolean> {
   const k = await kv(); const kk = ["txused", tx.toLowerCase()];
-  return (await k.atomic().check({ key: kk, versionstamp: null }).set(kk, Date.now()).commit()).ok;
+  // defense in depth: written to both stores; a reuse is rejected if EITHER already has it
+  const kvNew = (await k.atomic().check({ key: kk, versionstamp: null }).set(kk, Date.now()).commit()).ok;
+  const ledgerNew = LG.consume("tx", tx);
+  return kvNew && ledgerNew;
+}
+/** True if the authorization was already submitted for settlement, per the ledger OR the KV copy. */
+export async function authUsed(key: string): Promise<boolean> {
+  return LG.isConsumed("auth", key) || (await (await kv()).get(["authused", key])).versionstamp !== null;
+}
+/** Record an authorization as consumed in both stores (no expiry); false if EITHER already had it. */
+export async function consumeAuth(key: string, meta: unknown): Promise<boolean> {
+  const k = await kv(); const kk = ["authused", key];
+  const kvNew = (await k.atomic().check({ key: kk, versionstamp: null }).set(kk, Date.now()).commit()).ok;
+  const ledgerNew = LG.consume("auth", key, meta);
+  return kvNew && ledgerNew;
 }
 /** Per-IP limit key: IPv4 as-is, IPv6 collapsed to its /64 (one subscriber/host usually owns a whole /64). */
 export function ipKey(ip: string | null | undefined): string | null {
