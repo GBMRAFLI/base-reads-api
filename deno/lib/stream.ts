@@ -2,6 +2,7 @@
 import { append } from "./store.ts";
 import { iso, rid } from "./util.ts";
 export const TRANSFER = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef";
+export const AUTH_USED = "0x98de503528ee59b575ef0c0a2576a82497bfc029a5685b209e9ec333479b10a5"; // EIP-3009 AuthorizationUsed(address,bytes32)
 export const category = (route: string) => route === "/x402/preflight" ? "endpoint_check" : "chain_reads";
 export type Rpc = (m: string, p: unknown[]) => Promise<any>;
 export function selfWallets(payTo: string, env = (k: string) => Deno.env.get(k)) {
@@ -11,7 +12,7 @@ export function selfWallets(payTo: string, env = (k: string) => Deno.env.get(k))
   return w;
 }
 export async function verifyOnchain(rpc: Rpc, tx: string | undefined, asset: string, payTo: string, amount: string, payer: string | undefined,
-  network = "eip155:8453", attempts = 4, wait = 2000, sleep = (ms: number) => new Promise((r) => setTimeout(r, ms))) {
+  network = "eip155:8453", attempts = 4, wait = 2000, sleep = (ms: number) => new Promise((r) => setTimeout(r, ms)), nonce?: string | null) {
   if (!tx) return { settled: false, reason: "no_tx_hash" };
   let rc: any = null;
   for (let i = 0; i < attempts; i++) {
@@ -26,10 +27,18 @@ export async function verifyOnchain(rpc: Rpc, tx: string | undefined, asset: str
     if ((lg.address ?? "").toLowerCase() === asset.toLowerCase() && t.length === 3 && t[0] === TRANSFER) {
       const frm = "0x" + t[1].slice(-40), to = "0x" + t[2].slice(-40), v = BigInt(lg.data ?? "0x0");
       if (to.toLowerCase() === payTo.toLowerCase() && (payer == null || frm.toLowerCase() === payer.toLowerCase()) && v >= BigInt(amount))
-        return { settled: true, network, block: parseInt(rc.blockNumber, 16), from: frm, to, value: Number(v) };
+      {
+        if (nonce != null && !authUsed(rc, asset, frm, nonce)) return { settled: false, reason: "nonce_not_in_settlement_tx" };
+        return { settled: true, network, block: parseInt(rc.blockNumber, 16), from: frm, to, value: Number(v), nonceBound: nonce != null };
+      }
     }
   }
   return { settled: false, reason: "no_matching_usdc_transfer" };
+}
+function authUsed(rc: any, asset: string, frm: string, nonce: string) {
+  let n = nonce.toLowerCase(); if (n.startsWith("0x")) n = "0x" + n.slice(2).padStart(64, "0");
+  return (rc.logs ?? []).some((lg: any) => { const t = (lg.topics ?? []).map((x: string) => x.toLowerCase());
+    return (lg.address ?? "").toLowerCase() === asset.toLowerCase() && t.length === 3 && t[0] === AUTH_USED && t[1].slice(-40) === frm.toLowerCase().slice(2) && t[2] === n; });
 }
 export async function recordSale(route: string, req: Record<string, any>, st: Record<string, any>, times: [string, string, string],
   onchain: Record<string, any>, servedOk = true, env = (k: string) => Deno.env.get(k)) {
@@ -52,7 +61,9 @@ export async function recordSale(route: string, req: Record<string, any>, st: Re
     allocationMethod: "direct; facilitator pays gas, seller cost 0", revenue: status === "verified_success" ? parseInt(req.amount) / 1e6 : 0.0 });
   return out;
 }
-export async function recordObservation(route: string, queryHash: string, code: number, latencyMs: number | null) {
-  return append("observations.jsonl", { id: rid("obs", route, queryHash, iso()), category: category(route), route,
-    inputHash: queryHash, httpStatus: code, latencyMs, observedAt: iso(), method: "deterministic_code" });
+export async function recordObservation(route: string, queryHash: string, code: number, latencyMs: number | null, note?: string) {
+  const rec: Record<string, unknown> & { id: string } = { id: rid("obs", route, queryHash, iso()), category: category(route), route,
+    inputHash: queryHash, httpStatus: code, latencyMs, observedAt: iso(), method: "deterministic_code" };
+  if (note) rec.note = note;
+  return append("observations.jsonl", rec);
 }

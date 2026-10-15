@@ -1,4 +1,4 @@
-import base64, json, os, sys, tempfile, threading, unittest, urllib.request, urllib.error
+import base64, json, os, sys, tempfile, threading, time, unittest, urllib.request, urllib.error
 T = tempfile.mkdtemp()
 os.environ.update(SNAPSHOT_DIR=os.path.join(T, "snap"), SIGNING_KEY_PATH=os.path.join(T, "k.pem"), DATA_STORE=os.path.join(T, "merc"), SELF_WALLETS="0x" + "77" * 20, EXPORT_TOKEN="t" * 40,
                   SIGNING_KEY_PASSPHRASE="test-passphrase-0123456789", PORT="18766")
@@ -210,4 +210,134 @@ class T6(unittest.TestCase):
         finally: IX.urllib.request.urlopen = old
         self.assertNotIn("Authorization", seen["h"]); self.assertEqual(seen["u"], "https://facilitator.payai.network/settle")
         self.assertTrue(st["success"]); self.assertEqual(st["transaction"], "0x" + "ab" * 32)  # CDP settle response uses the same fields
+MS = IX.MS
+class T7(unittest.TestCase):
+    """Seller verify/settle hardening (SECURITY.md)."""
+    PAYER = "0x" + "a1" * 20
+    def pay(self, path="/base/network", nonce=None, **over):
+        r = IX.req_for(path); now = int(time.time())
+        a = {"from": self.PAYER, "to": r["payTo"], "value": r["amount"], "validAfter": str(now - 5), "validBefore": str(now + 300), "nonce": nonce or "0x" + os.urandom(32).hex()}
+        a.update(over); return base64.b64encode(json.dumps({"x402Version": 2, "accepted": r, "payload": {"authorization": a, "signature": "0x" + "11" * 65}}).encode()).decode()
+    def setUp(self):
+        self.calls = []; self.tx = "0x" + os.urandom(32).hex(); self.settle = lambda: {"success": True, "transaction": self.tx, "payer": self.PAYER, "network": IX.NETWORK}
+        def fac(p, body): self.calls.append(p); return {"isValid": True, "payer": self.PAYER} if p == "/verify" else self.settle()
+        self.old = (IX.fac, IX.handle); IX.fac = fac; IX.handle = lambda path, q: (200, {"ok": True})
+        IX.REPLAY, IX.FAILS = IX.SG.Replay(), IX.SG.FailLimiter()
+        self.chain = {"settled": True, "block": 1}; self.check = lambda tx, r, payer: dict(self.chain)
+    def tearDown(self): IX.fac, IX.handle = self.old
+    def run_paid(self, sig, path="/base/network"): return IX.paid(path, {}, "", sig, "t", check=self.check)
+    def test_serves_only_after_settle_and_onchain_confirmation(self):
+        c, out, hd = self.run_paid(self.pay()); self.assertEqual((c, out), (200, {"ok": True})); self.assertEqual(self.calls, ["/verify", "/settle"])
+        self.assertTrue(json.loads(base64.b64decode(hd["PAYMENT-RESPONSE"]))["success"])
+    def test_onchain_mismatch_blocks_serving(self):
+        self.chain = {"settled": False, "reason": "no_matching_usdc_transfer"}
+        c, out, _ = self.run_paid(self.pay()); self.assertEqual(c, 402); self.assertIn("not confirmed on-chain", out["error"])
+        o = MS.rows("outcomes.jsonl")[-1]; self.assertEqual((o["outcome"], o["status"]), ("not_delivered", "verified_failure"))
+    def test_onchain_pending_parks_then_serves_once_on_retry(self):
+        self.chain = {"settled": None, "reason": "receipt_not_found_yet"}; sig = self.pay()
+        c, out, _ = self.run_paid(sig); self.assertEqual((c, out["status"]), (202, "settled_pending_onchain_confirmation"))
+        self.assertEqual(self.run_paid(sig)[0], 202)                               # still pending: still not served
+        self.chain = {"settled": True, "block": 2}
+        self.assertEqual(self.run_paid(sig)[:2], (200, {"ok": True}))             # confirmed: served exactly once
+        self.assertEqual(self.run_paid(sig)[0], 409); self.assertEqual(self.calls.count("/settle"), 1)
+    def test_facilitator_success_alone_never_serves(self):
+        for chain in ({"settled": None}, {"settled": False, "reason": "nonce_not_in_settlement_tx"}):
+            self.chain = chain; self.assertNotEqual(self.run_paid(self.pay())[0], 200)
+    def test_concurrent_duplicate_signature_only_one_wins(self):
+        import concurrent.futures as cf
+        gate = threading.Event(); orig = IX.fac
+        def slow(p, body): gate.wait(1); return orig(p, body)
+        IX.fac = slow; sig = self.pay()
+        with cf.ThreadPoolExecutor(8) as ex:
+            futs = [ex.submit(self.run_paid, sig) for _ in range(8)]; time.sleep(0.2); gate.set()
+            codes = sorted(f.result()[0] for f in futs)
+        self.assertEqual(codes, [200] + [409] * 7); self.assertEqual(self.calls.count("/settle"), 1)
+    def test_onchain_check_binds_nonce(self):
+        r = IX.req_for("/base/network"); P = self.PAYER; n = "0x" + "4e" * 32
+        def rc(nonce_topic):
+            logs = [{"address": r["asset"], "topics": [MS.TRANSFER, "0x" + "0" * 24 + P[2:], "0x" + "0" * 24 + r["payTo"][2:].lower()], "data": hex(1000)}]
+            if nonce_topic: logs.append({"address": r["asset"], "topics": [MS.AUTH_USED, "0x" + "0" * 24 + P[2:], nonce_topic], "data": "0x"})
+            return {"status": "0x1", "blockNumber": "0x5", "logs": logs}
+        f = lambda rec, nonce: MS.verify_onchain(lambda m, p: rec, "0x" + "ab" * 32, r["asset"], r["payTo"], r["amount"], P, nonce=nonce, sleep=lambda x: None)
+        self.assertTrue(f(rc(n), n)["settled"]); self.assertTrue(f(rc(n), n)["nonceBound"])
+        self.assertEqual(f(rc("0x" + "11" * 32), n)["reason"], "nonce_not_in_settlement_tx")
+        self.assertEqual(f(rc(None), n)["reason"], "nonce_not_in_settlement_tx")
+        self.assertTrue(f(rc(None), None)["settled"])  # non-EIP-3009 schemes: Transfer-only check
+    def test_nonce_kept_until_valid_before(self):
+        g = IX.SG.Replay(ttl=1); now = 1000
+        self.assertTrue(g.claim("k", expires_at=now + 500, now=now)); self.assertFalse(g.claim("k", now=now + 499)); self.assertTrue(g.claim("k", now=now + 501))
+    def test_replay_same_authorization_rejected(self):
+        sig = self.pay(nonce="0x" + "05" * 32); self.assertEqual(self.run_paid(sig)[0], 200)
+        self.tx = "0x" + os.urandom(32).hex(); c, _, _ = self.run_paid(sig); self.assertEqual(c, 409); self.assertEqual(self.calls.count("/settle"), 1)
+    def test_settle_tx_reuse_rejected(self):
+        self.assertEqual(self.run_paid(self.pay())[0], 200)
+        c, out, _ = self.run_paid(self.pay()); self.assertEqual((c, out["error"]), (409, "settlement transaction already used"))
+    def test_window_payee_amount_and_accepted_prechecks(self):
+        now = int(time.time())
+        for over, why in (({"validBefore": str(now + 2)}, "authorization_expired_or_expiring"), ({"validAfter": str(now + 60)}, "authorization_not_yet_valid"),
+                          ({"to": "0x" + "99" * 20}, "authorization_payee_mismatch"), ({"value": "1"}, "authorization_amount_mismatch")):
+            c, out, _ = self.run_paid(self.pay(**over)); self.assertEqual((c, out["error"]), (402, why))
+        self.assertEqual(self.calls, [])  # rejected before any facilitator call
+        p = json.loads(base64.b64decode(self.pay())); p["accepted"]["amount"] = "1"
+        self.assertEqual(self.run_paid(base64.b64encode(json.dumps(p).encode()).decode())[1]["error"], "accepted.amount_mismatch")
+    def test_bad_or_huge_header(self):
+        self.assertEqual(self.run_paid("x" * 20000)[0], 400); self.assertEqual(self.run_paid("%%%")[0], 400)
+    def test_failed_settle_burns_signature_then_cooldown(self):
+        self.settle = lambda: {"success": False, "errorReason": "insufficient_funds"}
+        sig = self.pay(); self.assertEqual(self.run_paid(sig)[0], 402); self.assertEqual(self.run_paid(sig)[0], 409)  # duplicates rejected consistently
+        for _ in range(2): self.assertEqual(self.run_paid(self.pay())[0], 402)
+        self.assertEqual(self.run_paid(self.pay())[0], 429)
+    def test_settle_reported_failure_but_confirmed_onchain_is_honored(self):
+        self.settle = lambda: {"success": False, "errorReason": "timeout", "transaction": self.tx}
+        c, out, hd = self.run_paid(self.pay()); self.assertEqual(c, 200)
+        self.assertEqual(MS.rows("executions.jsonl")[-1]["tx"], self.tx)
+    def test_settle_success_without_tx_not_served(self):
+        self.settle = lambda: {"success": True, "transaction": "nope"}
+        self.assertEqual(self.run_paid(self.pay())[0], 502)
+    def test_host_header_cannot_inject_resource_url(self):
+        old = IX.PUBLIC; IX.PUBLIC = ""
+        try:
+            self.assertEqual(IX.required("/base/network", "evil.example/x?y")["resource"]["url"], "https://invalid-host/base/network")
+            self.assertEqual(IX.required("/base/network", "h.example:8443")["resource"]["url"], "https://h.example:8443/base/network")
+        finally: IX.PUBLIC = old
+class T8(unittest.TestCase):
+    def test_well_known_and_root_facilitator(self):
+        w = IX.well_known(); self.assertEqual((w["alg"], w["key_id"]), ("Ed25519", PF.public_key_info()["key_id"]))
+        self.assertEqual(w["facilitator"], IX.facilitator_info()); self.assertEqual(IX.root()["facilitator"]["name"], "PayAI")
+        self.assertTrue(w["repo"].startswith("https://github.com/"))
+        old = IX.FAC; IX.FAC = "https://api.cdp.coinbase.com/platform/v2/x402"
+        try: self.assertEqual(IX.facilitator_info(), {"name": "CDP", "url": IX.FAC, "auth": "none"})
+        finally: IX.FAC = old
+        env = PF.sign({"z": 1, "a": "é"}); import hashlib
+        from Crypto.Signature import eddsa
+        pk = eddsa.import_public_key(base64.b64decode(w["public_key_b64"]))
+        eddsa.new(pk, "rfc8032").verify(json.dumps(env["facts"], sort_keys=True, separators=(",", ":")).encode(), base64.b64decode(env["signature"]["value_b64"]))
+        self.assertEqual(hashlib.sha256(base64.b64decode(w["public_key_b64"])).hexdigest()[:16], w["key_id"])
+    def test_snapshot_summary(self):
+        BS.write([{"resource": "https://a.example/x", "accepts": [{"payTo": "0x" + "ab" * 20}], "quality": {"l30DaysUniquePayers": 2, "l30DaysTotalCalls": 7}}], "2026-01-02")
+        s = IX.snapshot_summary(); self.assertIn("snapshots", s)
+        self.assertIn({"date": "2026-01-02", "resources": 1, "hosts": 1, "payout_wallets": 1, "calls30d_total": 7, "payers30d_total": 2}, s["snapshots"])
+        for x in s["snapshots"]: self.assertEqual(set(x), {"date", "resources", "hosts", "payout_wallets", "calls30d_total", "payers30d_total"})
+class T9(unittest.TestCase):
+    def test_pubkey_fingerprints_and_history(self):
+        import hashlib
+        k = PF.public_key_info(); raw = base64.b64decode(k["public_key_b64"]); d = hashlib.sha256(raw).digest()
+        self.assertEqual(k["fingerprint"], "SHA256:" + base64.b64encode(d).decode().rstrip("="))
+        self.assertEqual(k["fingerprint_short"].replace(" ", ""), k["key_id"]); self.assertRegex(k["fingerprint_short"], r"^([0-9a-f]{4} ){3}[0-9a-f]{4}$")
+        self.assertIn("created_at", k)
+        os.environ["SIGNING_KEY_CREATED_AT"] = "2026-10-14T11:00:00Z"
+        os.environ["SIGNING_KEY_HISTORY"] = json.dumps([{"public_key_b64": base64.b64encode(b"\x01" * 32).decode(), "created_at": "2026-10-01", "retired_at": "2026-10-14"}, {"public_key_b64": "bad"}])
+        try:
+            h = PF.key_history()
+            self.assertEqual((h["current"]["status"], h["current"]["created_at"], h["current"]["key_id"]), ("active", "2026-10-14T11:00:00Z", k["key_id"]))
+            self.assertEqual(len(h["retired"]), 1); self.assertEqual((h["retired"][0]["status"], h["retired"][0]["retired_at"]), ("retired", "2026-10-14"))
+            self.assertNotIn("private", json.dumps(h).lower())
+        finally: del os.environ["SIGNING_KEY_CREATED_AT"], os.environ["SIGNING_KEY_HISTORY"]
+    def test_snapshot_meta_signed_metadata_only(self):
+        BS.write([{"resource": "https://a.example/x", "accepts": [], "quality": {}}, {"resource": "https://b.example/y", "accepts": [], "quality": {}}], "2026-01-03")
+        m = IX.snapshot_meta(); md = m["metadata"]
+        self.assertEqual(set(md), {"version", "started_at", "last_updated", "total_snapshots", "covered_listings"})
+        self.assertEqual(m["pubkey_url"], "/x402/preflight/pubkey"); self.assertTrue(PF.verify({"facts": md, "signature": m["signature"]}))
+        self.assertGreaterEqual(md["total_snapshots"], 1); self.assertNotIn("resources", json.dumps(m))
+        md["covered_listings"] += 1; self.assertFalse(PF.verify({"facts": md, "signature": m["signature"]}))
 if __name__ == "__main__": unittest.main(verbosity=2)

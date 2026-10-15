@@ -31,10 +31,29 @@ def load_or_create_key():
         fd = os.open(KEY_PATH, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         with os.fdopen(fd, "w") as f: f.write(_key.export_key(format="PEM", passphrase=pw, protection="scryptAndAES256-CBC"))
     return _key
+def key_meta(raw, created_at=None):
+    """Identity of a raw 32-byte Ed25519 public key: key_id, SSH-style fingerprint and a grouped short form."""
+    d = hashlib.sha256(raw).digest(); kid = d.hex()[:16]
+    return {"alg": "Ed25519", "public_key_b64": base64.b64encode(raw).decode(), "key_id": kid,
+            "fingerprint": "SHA256:" + base64.b64encode(d).decode().rstrip("="), "fingerprint_short": " ".join(kid[i:i + 4] for i in range(0, 16, 4)),
+            "created_at": created_at}
+def _created_at():
+    if os.environ.get("SIGNING_KEY_CREATED_AT"): return os.environ["SIGNING_KEY_CREATED_AT"]
+    if not os.environ.get("SIGNING_KEY_ENC_B64") and os.path.exists(KEY_PATH):
+        return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(os.path.getmtime(KEY_PATH)))
+    return None
 def public_key_info():
-    k = load_or_create_key().public_key()
-    raw = k.export_key(format="raw")
-    return {"alg": "Ed25519", "public_key_b64": base64.b64encode(raw).decode(), "key_id": hashlib.sha256(raw).hexdigest()[:16]}
+    return key_meta(load_or_create_key().public_key().export_key(format="raw"), _created_at())
+def key_history():
+    """Current key plus retired keys from SIGNING_KEY_HISTORY (JSON list of {public_key_b64, created_at, retired_at}). Public data only."""
+    try: retired = json.loads(os.environ.get("SIGNING_KEY_HISTORY") or "[]")
+    except ValueError: retired = []
+    out = []
+    for k in retired if isinstance(retired, list) else []:
+        try: raw = base64.b64decode(k["public_key_b64"])
+        except Exception: continue
+        if len(raw) == 32: out.append(dict(key_meta(raw, k.get("created_at")), retired_at=k.get("retired_at"), status="retired"))
+    return {"current": dict(public_key_info(), status="active"), "retired": out}
 def canonical(o): return json.dumps(o, sort_keys=True, separators=(",", ":")).encode()
 def sign(facts):
     k = load_or_create_key(); pub = public_key_info()

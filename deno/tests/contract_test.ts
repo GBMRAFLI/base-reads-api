@@ -6,7 +6,9 @@ import { ROUTES } from "../lib/routes.ts";
 import { rid } from "../lib/util.ts";
 import { useKv, rows } from "../lib/store.ts";
 import { recordSale, verifyOnchain, TRANSFER } from "../lib/stream.ts";
-import { bazaar, facClient, handler, reqFor } from "../main.ts";
+import { bazaar, facClient, handler, reqFor, required, resetGuards, root, snapshotMeta, wellKnown } from "../main.ts";
+import { keyHistory } from "../lib/sign.ts";
+import { AUTH_USED } from "../lib/stream.ts";
 import { headers as cdpHeaders, jwt as cdpJwt } from "../lib/cdp_auth.ts";
 
 const C = JSON.parse(Deno.readTextFileSync(new URL("./fixtures/contract.json", import.meta.url)));
@@ -104,7 +106,7 @@ Deno.test("paid flow: verify -> serve -> settle -> on-chain check -> same record
   const rpc = async (m: string) => m === "eth_getTransactionReceipt" ? rc(W2, r.payTo, 1000, r.asset)
     : m === "eth_getBlockByNumber" ? { number: "0x10", timestamp: "0x" + Math.floor(Date.now() / 1000).toString(16), baseFeePerGas: "0x3b9aca00" } : "0x3b9aca00";
   let bg: Promise<unknown> | null = null;
-  const res = await handler(new Request("http://h/base/network", { headers: { "PAYMENT-SIGNATURE": btoa("{}") } }), { env, fac, rpc, background: (p) => { bg = p; } });
+  const res = await handler(new Request("http://h/base/network", { headers: { "PAYMENT-SIGNATURE": btoa(JSON.stringify({ t: 1 })) } }), { env, fac, rpc, background: (p) => { bg = p; } });
   assertEquals(res.status, 200); assertEquals(calls, ["/verify", "/settle"]);
   const body = await res.json(); assertEquals(body.chain_id, 8453); assertEquals(body.base_fee_gwei, 1);
   assert(res.headers.get("PAYMENT-RESPONSE")); await bg;
@@ -125,11 +127,11 @@ Deno.test("paid flow: verify -> serve -> settle -> on-chain check -> same record
 });
 Deno.test("not charged on bad input or upstream error; invalid payment -> 402", async () => {
   const calls: string[] = []; const fac = async (p: string) => { calls.push(p); return { isValid: true }; };
-  let r = await handler(new Request("http://h/base/usdc-balance?address=0xbad", { headers: { "X-PAYMENT": btoa("{}") } }), { env, fac });
+  let r = await handler(new Request("http://h/base/usdc-balance?address=0xbad", { headers: { "X-PAYMENT": btoa(JSON.stringify({ t: 2 })) } }), { env, fac });
   assertEquals(r.status, 400); await r.body?.cancel(); assertEquals(calls, ["/verify"]);
-  r = await handler(new Request("http://h/base/network", { headers: { "X-PAYMENT": btoa("{}") } }), { env, fac, rpc: () => Promise.reject(new Error("down")) });
+  r = await handler(new Request("http://h/base/network", { headers: { "X-PAYMENT": btoa(JSON.stringify({ t: 3 })) } }), { env, fac, rpc: () => Promise.reject(new Error("down")) });
   assertEquals(r.status, 502); await r.body?.cancel(); assert(!calls.includes("/settle"));
-  r = await handler(new Request("http://h/base/network", { headers: { "X-PAYMENT": btoa("{}") } }), { env, fac: async () => ({ isValid: false, invalidReason: "insufficient_funds" }) });
+  r = await handler(new Request("http://h/base/network", { headers: { "X-PAYMENT": btoa(JSON.stringify({ t: 4 })) } }), { env, fac: async () => ({ isValid: false, invalidReason: "insufficient_funds" }) });
   assertEquals(r.status, 402); assertEquals(await r.json(), { error: "insufficient_funds" });
   r = await handler(new Request("http://h/base/network", { headers: { "X-PAYMENT": "%%%" } }), { env }); assertEquals(r.status, 400); await r.body?.cancel();
   r = await handler(new Request("http://h/nope"), { env }); assertEquals(r.status, 404); await r.body?.cancel();
@@ -182,4 +184,88 @@ Deno.test("CDP auth only when FACILITATOR is CDP AND keys are set; PayAI request
   assertEquals(st.transaction, "0x" + "ab".repeat(32)); // CDP settle response uses the same fields (success, transaction, payer, network)
   await facClient(CDP, ke, f)("/settle", { x: 1 });
   assertEquals(seen[1].url, CDP + "/settle"); assert(seen[1].h.get("Authorization")!.startsWith("Bearer ey"));
+});
+
+// ---- settle hardening (SECURITY.md) ----
+const PAYER = "0x" + "a1".repeat(20);
+const rnd = () => "0x" + Array.from(crypto.getRandomValues(new Uint8Array(32)), (b) => b.toString(16).padStart(2, "0")).join("");
+function pay(path = "/base/network", over: Record<string, string> = {}, nonce = rnd()) {
+  const r = reqFor(path, env); const now = Math.floor(Date.now() / 1000);
+  const a = { from: PAYER, to: r.payTo, value: r.amount, validAfter: String(now - 5), validBefore: String(now + 300), nonce, ...over };
+  return btoa(JSON.stringify({ x402Version: 2, accepted: r, payload: { authorization: a, signature: "0x" + "11".repeat(65) } }));
+}
+function rig(chain: { v: any }, settle?: () => any, delay = 0) {
+  const calls: string[] = []; let tx = rnd();
+  const fac = async (p: string) => { calls.push(p); if (delay) await new Promise((r) => setTimeout(r, delay));
+    return p === "/verify" ? { isValid: true } : (settle ? settle() : { success: true, transaction: tx, payer: PAYER, network: "eip155:8453" }); };
+  const rpc = async (m: string) => m === "eth_getBlockByNumber" ? { number: "0x10", timestamp: "0x" + Math.floor(Date.now() / 1000).toString(16), baseFeePerGas: "0x1" } : "0x1";
+  const call = async (sig: string, path = "/base/network") => {
+    const res = await handler(new Request("http://h" + path, { headers: { "PAYMENT-SIGNATURE": sig } }), { env, fac, rpc, check: async () => chain.v, background: () => {} });
+    return [res.status, await res.json()] as [number, any];
+  };
+  return { calls, call, newTx: () => { tx = rnd(); } };
+}
+Deno.test("serve only after on-chain confirmation; facilitator success alone never serves", async () => {
+  resetGuards();
+  for (const v of [{ settled: false, reason: "nonce_not_in_settlement_tx" }, { settled: null }]) {
+    const t = rig({ v }); const [code] = await t.call(pay()); assert(code !== 200, JSON.stringify(v));
+  }
+  const ok = rig({ v: { settled: true } }); const [c, b] = await ok.call(pay()); assertEquals([c, b.chain_id], [200, 8453]);
+});
+Deno.test("pending confirmation parks the payment and the same request is served exactly once later", async () => {
+  resetGuards(); const chain = { v: { settled: null } as any }; const t = rig(chain); const sig = pay();
+  assertEquals((await t.call(sig))[0], 202); assertEquals((await t.call(sig))[0], 202);
+  chain.v = { settled: true }; assertEquals((await t.call(sig))[0], 200); assertEquals((await t.call(sig))[0], 409);
+  assertEquals(t.calls.filter((x) => x === "/settle").length, 1);
+});
+Deno.test("duplicate signature: concurrent requests race on KV atomic check-and-set, exactly one wins", async () => {
+  resetGuards(); const t = rig({ v: { settled: true } }, undefined, 20); const sig = pay();
+  const codes = (await Promise.all(Array.from({ length: 8 }, () => t.call(sig)))).map((x) => x[0]).sort();
+  assertEquals(codes, [200, 409, 409, 409, 409, 409, 409, 409]); assertEquals(t.calls.filter((x) => x === "/settle").length, 1);
+  assertEquals((await t.call(sig))[0], 409); // and later, consistently
+});
+Deno.test("prechecks before any facilitator call; settlement tx reuse; failed settle cooldown", async () => {
+  resetGuards(); const now = Math.floor(Date.now() / 1000); const t = rig({ v: { settled: true } });
+  for (const [over, why] of [[{ validBefore: String(now + 2) }, "authorization_expired_or_expiring"], [{ validAfter: String(now + 60) }, "authorization_not_yet_valid"],
+    [{ to: "0x" + "99".repeat(20) }, "authorization_payee_mismatch"], [{ value: "1" }, "authorization_amount_mismatch"]] as [Record<string, string>, string][]) {
+    const [c, b] = await t.call(pay("/base/network", over)); assertEquals([c, b.error], [402, why]);
+  }
+  assertEquals(t.calls, []);
+  assertEquals((await t.call("x".repeat(20000)))[0], 400);
+  const fixed = rnd(); const u = rig({ v: { settled: true } }, () => ({ success: true, transaction: fixed, payer: PAYER }));
+  assertEquals((await u.call(pay()))[0], 200); assertEquals(await u.call(pay()), [409, { error: "settlement transaction already used" }]);
+  const f = rig({ v: { settled: false } }, () => ({ success: false, errorReason: "insufficient_funds" }));
+  for (let i = 0; i < 3; i++) assertEquals((await f.call(pay()))[0], 402);
+  assertEquals((await f.call(pay()))[0], 429);
+});
+Deno.test("on-chain check binds the EIP-3009 nonce (AuthorizationUsed in the same receipt)", async () => {
+  const r = reqFor("/base/network", env); const n = "0x" + "4e".repeat(32); const pad = (a: string) => "0x" + "0".repeat(24) + a.slice(2).toLowerCase();
+  const rcpt = (nt: string | null) => ({ status: "0x1", blockNumber: "0x5", logs: [{ address: r.asset, topics: [TRANSFER, pad(PAYER), pad(r.payTo)], data: "0x3e8" },
+    ...(nt ? [{ address: r.asset, topics: [AUTH_USED, pad(PAYER), nt], data: "0x" }] : [])] });
+  const f = (x: unknown, nonce: string | null) => verifyOnchain(async () => x, "0x" + "ab".repeat(32), r.asset, r.payTo, r.amount, PAYER, "eip155:8453", 1, 0, async () => {}, nonce) as Promise<any>;
+  assertEquals((await f(rcpt(n), n)).nonceBound, true);
+  assertEquals((await f(rcpt("0x" + "11".repeat(32)), n)).reason, "nonce_not_in_settlement_tx");
+  assertEquals((await f(rcpt(null), n)).reason, "nonce_not_in_settlement_tx");
+  assertEquals((await f(rcpt(null), null)).settled, true);
+});
+Deno.test("Host header cannot inject the challenge resource URL", () => {
+  const e = (k: string) => k === "PUBLIC_URL" ? undefined : env(k);
+  assertEquals(required("/base/network", "evil.example/x?y", e).resource.url, "https://invalid-host/base/network");
+  assertEquals(required("/base/network", "h.example:8443", e).resource.url, "https://h.example:8443/base/network");
+});
+Deno.test("well-known, key history, fingerprints, signed snapshot metadata, facilitator in root", async () => {
+  resetKey();
+  const w: any = await wellKnown(env); assertEquals([w.alg, w.fingerprint_short.replaceAll(" ", "")], ["Ed25519", w.key_id]);
+  assert(w.fingerprint.startsWith("SHA256:")); assertEquals(w.facilitator, root(env).facilitator); assertEquals(root(env).facilitator.name, "PayAI");
+  const cdp = (k: string) => k === "FACILITATOR" ? "https://api.cdp.coinbase.com/platform/v2/x402" : env(k);
+  assertEquals(root(cdp).facilitator, { name: "CDP", url: "https://api.cdp.coinbase.com/platform/v2/x402", auth: "none" });
+  const hist = (k: string) => k === "SIGNING_KEY_HISTORY" ? JSON.stringify([{ public_key_b64: btoa("\x01".repeat(32)), created_at: "2026-10-01", retired_at: "2026-10-14" }, { public_key_b64: "bad" }])
+    : k === "SIGNING_KEY_CREATED_AT" ? "2026-10-14T11:00:00Z" : env(k);
+  const h: any = await keyHistory(hist);
+  assertEquals([h.current.status, h.current.created_at, h.retired.length, h.retired[0].status], ["active", "2026-10-14T11:00:00Z", 1, "retired"]);
+  const m: any = await snapshotMeta(); assertEquals(Object.keys(m.metadata).sort(), ["covered_listings", "last_updated", "started_at", "total_snapshots", "version"]);
+  assertEquals(m.pubkey_url, "/x402/preflight/pubkey"); assert(await verify({ facts: m.metadata, signature: m.signature }));
+  for (const p of ["/.well-known/x402-preflight", "/.well-known/bazaar-snapshot.json", "/.well-known/x402-preflight-key-history.json", "/bazaar/snapshots"]) {
+    const res = await handler(new Request("http://h" + p), { env }); assertEquals(res.status, 200, p); await res.body?.cancel();
+  }
 });
