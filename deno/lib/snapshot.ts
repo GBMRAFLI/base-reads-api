@@ -3,15 +3,16 @@
 // (success or failure) per UTC calendar day. Status is complete | partial | failed; failed stores an error record
 // (never an empty snapshot). Tiered retention demotes old indexes (never the newest; no day deletion).
 import {
-  IndexAssembler, saveIndex, loadIndex, listSnapMetas, readSnapMeta, UA, type Index, type SnapTier, clearIndexCache,
+  IndexAssembler, saveIndex, loadIndex, listSnapMetas, readSnapMeta, dayAge, UA, type Index, type SnapTier, clearIndexCache,
 } from "./preflight.ts";
+export { dayAge } from "./preflight.ts";
 import { kv } from "./store.ts";
 
 const BAZAAR = Deno.env.get("BAZAAR_URL") ?? "https://api.cdp.coinbase.com/platform/v2/x402/discovery/resources";
 export const PAGE = 1000, PAGE_TIMEOUT_MS = 15000, RETRIES = 1;
 export const SNAPATTEMPT_TTL_MS = 3 * 24 * 3600_000;
-/** 0–30 full; 31–90 reduced (counts only); 90+ aggregate. Newest day is never demoted. */
-export const TIER_FULL_DAYS = 30, TIER_AGGREGATE_FROM = 90;
+/** 0–30 full; 31–364 reduced (counts only); 365+ aggregate. Newest day is never demoted. */
+export const TIER_FULL_DAYS = 30, TIER_AGGREGATE_FROM = 365;
 
 export type SnapStatus = "complete" | "partial" | "failed";
 export type SnapFail = { status: "failed"; date: string; error: string; error_code: string; at: string; failed_pages: number[] };
@@ -94,9 +95,6 @@ export async function latestSnapStatus(date?: string | null): Promise<{ status: 
   return { status: (meta.status as SnapStatus | null) ?? null, failed_pages: null, error: null, error_code: null };
 }
 
-export function dayAge(date: string, today: string) {
-  return Math.floor((Date.parse(today + "T00:00:00Z") - Date.parse(date + "T00:00:00Z")) / 86400000);
-}
 
 function targetTier(age: number): SnapTier {
   if (age >= TIER_AGGREGATE_FROM) return "aggregate";
@@ -130,7 +128,7 @@ function toAggregate(idx: Index): Index {
 /**
  * Demote old snapshots using snapdate.tier only (no gunzip unless a boundary is crossed).
  * Never demotes the newest successful snapshot (H1).
- * 0–30 full; 31–90 reduced counts; 90+ aggregate.
+ * 0–30 full; 31–364 reduced counts; 365+ aggregate.
  */
 export async function applyTierRetention(today = utcDay()) {
   const metas = await listSnapMetas();

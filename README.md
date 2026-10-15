@@ -96,20 +96,22 @@ facts (same encrypted key and pubkey, byte-identical signatures), `/internal/exp
 record format. Storage: Deno KV.
 
 ### Daily Bazaar snapshot
-`Deno.cron` at 00:15 UTC only (never at startup). At most one attempt per UTC calendar day: skip if today's `snapdate` or `snapfail` already exists (cold-start safe), else KV `["snapattempt", YYYY-MM-DD]` with `check(versionstamp: null)` and `expireIn` 3 days. Capped at `SNAPSHOT_MAX_PAGES` pages of 1000 listings (default 3, range 1–50 with clamp + warning; 15 s per page, 1 retry). Statuses: **complete** / **partial** (`partial: true` + `failed_pages`) / **failed** (error record only — never an empty snapshot). Status is included in signed `/.well-known/bazaar-snapshot.json` as `last_status`, `last_failed_pages`, `last_error`.
+`Deno.cron` at 00:15 UTC only (never at startup). At most one attempt per UTC calendar day: skip if today's `snapdate` or `snapfail` already exists (cold-start safe), else KV `["snapattempt", YYYY-MM-DD]` with `check(versionstamp: null)` and `expireIn` 3 days. Capped at `SNAPSHOT_MAX_PAGES` pages of 1000 listings (default 3, range 1–50 with clamp + warning; 15 s per page, 1 retry). Freshness: full snap must be ≤ 7 days old for preflight. Statuses: **complete** / **partial** (`partial: true` + `failed_pages`) / **failed** (error record only — never an empty snapshot). Status is included in signed `/.well-known/bazaar-snapshot.json` as `last_status`, `last_failed_pages`, `last_error`.
 
 ### Optional `prepay-check/v1` bazaar fields (Deno production)
 Schema stays `prepay-check/v1` (additive optional fields; no version bump). `bazaar.coverage` carries `pages_fetched`, `max_pages`, `items_indexed`, `bazaar_total`, `complete`, `status`, `partial`, `failed_pages`. **`listed: false` only when `coverage.complete === true`**. Otherwise if the resource is missing: `listed: null` + `listed_reason: "not_in_indexed_part"`, and `host_listing_count_is_min` / `payout_wallet_reuse_is_min` mark lower bounds.
 
 ### Tiered retention (no day deletion; newest day never demoted)
 - 0–30 days: **full** index (gzip JSON generationed chunks)
-- 31–90 days: **reduced** counts only (`hosts: {host:n}`, `wallet_hosts: {wallet: hostCount}`; no per-URL resources)
-- 90+ days: **aggregate** (`listings` + host/wallet counts + status)
-- Preflight `bazaarFacts` uses **full tier only**; if none remain → `{available:false, reason:"snapshot_too_old"}` (never `listed:false` / zero counts from a demoted day). Reduced/aggregate days in `payer_trend` are marked with `tier`.
+- 31–364 days: **reduced** counts only (`hosts: {host:n}`, `wallet_hosts: {wallet: hostCount}`; no per-URL resources)
+- 365+ days: **aggregate** (`listings` + host/wallet counts + status)
+- Preflight `bazaarFacts` uses a **full** snapshot at most **7 days** old; otherwise `{available:false, reason:"snapshot_too_old", snapshot_date}` (never `listed:false` / zero counts from a demoted or stale day). Reduced/aggregate days in `payer_trend` are marked with `tier`.
 
-### KV storage (measured, Deno Free 1 GiB)
-Measured 3-page capped snap (3000 listings): **gzip 18 870 bytes, 1 chunk** (~19 write units/day for a new full snap).
-Steady-state year ≈ 30×full + 60×reduced(~15%) + 275×aggregate(~200 B) ≈ **0.75 MiB (~0.07% of 1 GiB)**.
+### KV storage (measured from live Bazaar, Deno Free 1 GiB)
+Fetched 3 free public Bazaar pages (3000 listings, `bazaar_total≈38204`) and built the real index:
+- **full gzip = 156 059 bytes, 3 chunks** (~156 write units/day for a new full snap)
+- **reduced gzip ≈ 25 882 bytes** (~16.6% of full)
+- Steady-state year ≈ 30×full + 334×reduced ≈ **12.7 MiB (~1.24% of 1 GiB)**.
 
 The Python reference (`api/`) does **not** yet apply the page cap, status model, or tiering — Deno Deploy is production.
 

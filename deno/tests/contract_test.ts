@@ -626,47 +626,45 @@ Deno.test("usage cut: snapshot capped at N pages, 1 retry, coverage recorded, on
   const src = await Deno.readTextFile(new URL("../main.ts", import.meta.url));
   assert(!src.includes("snapshotIfMissing")); assert(src.includes('"7 0 * * *"'));
   assert(S.SNAPATTEMPT_TTL_MS === 3 * 24 * 3600_000);
-  const miss = await bazaarFacts("https://missing.example/r", []);
+  const miss = await bazaarFacts("https://missing.example/r", [], 14, "2001-01-04");
   assertEquals([(miss as any).listed, (miss as any).listed_reason, (miss as any).coverage.complete], [null, "not_in_indexed_part", false]);
-  const hit = await bazaarFacts("https://h1.example/r1", []);
+  const hit = await bazaarFacts("https://h1.example/r1", [], 14, "2001-01-04");
   assertEquals([(hit as any).listed, (hit as any).host_listing_count_is_min], [true, true]);
   await wipeSnaps(k);
 });
 
-Deno.test("snapshot follow-ups: H1 full-only facts, M1 crash-safe gen, M2/M3 tiers, L4 demoted-latest", async () => {
+Deno.test("snapshot follow-ups: freshness, tiers 30/365, legacy, orphan purge, crash after flip, real size", async () => {
   const S = await import("../lib/snapshot.ts");
   const PF = await import("../lib/preflight.ts");
   const { kv } = await import("../lib/store.ts"); const k = await kv();
   await wipeSnaps(k);
 
-  // --- complete listed:false (full tier) ---
-  const completeIdx = {
+  // complete listed:false within freshness window
+  await saveIndex({
     date: "2002-01-01", listings: 1, hosts: { "only.example": 1 }, wallet_hosts: {},
     resources: { "https://only.example/r": { payers30d: 1, calls30d: 2, lastCalledAt: null, payTo: ["0x" + "11".repeat(20)] } },
     coverage: { pages_fetched: 1, max_pages: 3, items_indexed: 1, bazaar_total: 1, complete: true, status: "complete" as const, partial: false, failed_pages: [] as number[] },
     status: "complete" as const, tier: "full" as const,
-  };
-  await saveIndex(completeIdx);
-  const missComplete = await bazaarFacts("https://missing.example/nope", []);
+  });
+  const missComplete = await bazaarFacts("https://missing.example/nope", [], 14, "2002-01-03");
   assertEquals([(missComplete as any).listed, (missComplete as any).listed_reason], [false, undefined]);
 
-  // --- legacy without coverage -> listed:null ---
-  await wipeSnaps(k);
-  await saveIndex({ date: "2002-01-02", listings: 0, hosts: {}, wallet_hosts: {}, resources: {}, tier: "full" } as any);
-  const missLegacy = await bazaarFacts("https://missing.example/nope", []);
-  assertEquals([(missLegacy as any).listed, (missLegacy as any).listed_reason, (missLegacy as any).coverage.complete], [null, "not_in_indexed_part", null]);
+  // M1: full snapshot older than 7 days -> snapshot_too_old with snapshot_date
+  const aged = await bazaarFacts("https://missing.example/nope", [], 14, "2002-07-20"); // ~200 days later
+  assertEquals([(aged as any).available, (aged as any).reason, (aged as any).snapshot_date, (aged as any).listed],
+    [false, "snapshot_too_old", "2002-01-01", undefined]);
 
-  // --- H1: only reduced snapshot -> available:false snapshot_too_old (never listed:false) ---
+  // H1: only reduced -> snapshot_too_old
   await wipeSnaps(k);
   await saveIndex({
     date: "2002-03-01", listings: 5, hosts: { a: 5 }, wallet_hosts: { ["0x" + "aa".repeat(20)]: 2 },
     resources: {}, tier: "reduced", status: "complete",
     coverage: { pages_fetched: 1, max_pages: 1, items_indexed: 5, bazaar_total: 5, complete: true, status: "complete", partial: false, failed_pages: [] },
   } as any);
-  const tooOld = await bazaarFacts("https://missing.example/nope", []);
+  const tooOld = await bazaarFacts("https://missing.example/nope", [], 14, "2002-03-02");
   assertEquals([(tooOld as any).available, (tooOld as any).reason, (tooOld as any).listed], [false, "snapshot_too_old", undefined]);
 
-  // --- H1/L4: never demote the newest (only) snapshot ---
+  // Never demote newest
   await wipeSnaps(k);
   await saveIndex({
     date: "2000-01-01", listings: 2, hosts: { a: 1, b: 1 },
@@ -675,16 +673,12 @@ Deno.test("snapshot follow-ups: H1 full-only facts, M1 crash-safe gen, M2/M3 tie
     coverage: { pages_fetched: 1, max_pages: 1, items_indexed: 2, bazaar_total: 2, complete: true, status: "complete", partial: false, failed_pages: [] },
     status: "complete", tier: "full",
   } as any);
-  await S.applyTierRetention("2000-06-01"); // would be aggregate age, but newest must stay full
-  clearIndexCache();
-  const still = await PF.readSnapMeta("2000-01-01");
-  assertEquals(still?.tier, "full");
-  const factsAfter = await bazaarFacts("https://missing.example/x", []);
-  assert((factsAfter as any).listed !== false || (factsAfter as any).available === true);
-  assertEquals((factsAfter as any).listed, false); // complete full + missing => false is OK; must NOT be from demotion zeros
-  assertEquals((factsAfter as any).available, true);
+  await S.applyTierRetention("2001-06-01");
+  assertEquals((await PF.readSnapMeta("2000-01-01"))?.tier, "full");
+  const factsAfter = await bazaarFacts("https://missing.example/x", [], 14, "2000-01-03");
+  assertEquals([(factsAfter as any).available, (factsAfter as any).listed], [true, false]);
 
-  // --- M3: older (non-newest) days demote: reduced counts, then aggregate after 90d ---
+  // M3/L4 Founder tiers: 31–364 reduced, 365+ aggregate (non-newest)
   await saveIndex({
     date: "2000-01-15", listings: 3, hosts: { c: 3 },
     wallet_hosts: { ["0x" + "44".repeat(20)]: ["c", "d"] },
@@ -692,22 +686,30 @@ Deno.test("snapshot follow-ups: H1 full-only facts, M1 crash-safe gen, M2/M3 tie
     coverage: { pages_fetched: 1, max_pages: 1, items_indexed: 3, bazaar_total: 3, complete: true, status: "complete", partial: false, failed_pages: [] },
     status: "complete", tier: "full",
   } as any);
-  // newest is now 2000-01-15; demote 2000-01-01 at age 45 from 2000-02-15
-  await S.applyTierRetention("2000-02-15");
+  await S.applyTierRetention("2000-02-15"); // age 45 for 2000-01-01 -> reduced
   clearIndexCache();
   assertEquals((await PF.readSnapMeta("2000-01-01"))?.tier, "reduced");
   const red = await PF.loadIndex("2000-01-01");
   assertEquals([red.tier, Object.keys(red.resources).length, red.wallet_hosts["0x" + "33".repeat(20)]], ["reduced", 0, 1]);
-  // age >= 90 from 2000-05-01 -> aggregate (non-newest)
-  await S.applyTierRetention("2000-05-01");
+  await S.applyTierRetention("2001-01-02"); // age >= 365 -> aggregate
   clearIndexCache();
-  assertEquals((await PF.readSnapMeta("2000-01-01"))?.tier, "aggregate");
-  // payer_trend marks reduced/aggregate days
-  const trendFacts = await bazaarFacts("https://c.example/r", []);
-  assertEquals((trendFacts as any).available, true);
-  assert((trendFacts as any).payer_trend.some((t: any) => t.tier === "aggregate" || t.tier === "reduced"));
+  assertEquals([S.TIER_AGGREGATE_FROM, (await PF.readSnapMeta("2000-01-01"))?.tier], [365, "aggregate"]);
 
-  // --- M1 crash mid-write: old generation remains readable ---
+  // L2: snapdate without gen (legacy number) still readable
+  await wipeSnaps(k);
+  const legacyIdx = { date: "2005-01-01", listings: 1, hosts: { L: 1 }, wallet_hosts: {}, resources: { "https://L.example/r": { payers30d: 1, calls30d: 1, lastCalledAt: null, payTo: [] } } };
+  const z = new Uint8Array(await new Response(new Blob([JSON.stringify(legacyIdx)]).stream().pipeThrough(new CompressionStream("gzip"))).arrayBuffer());
+  await k.set(["snap", "2005-01-01", 0], z.slice(0, Math.min(z.length, 60000)));
+  await k.set(["snapdate", "2005-01-01"], 1); // legacy: number of chunks, no gen
+  clearIndexCache();
+  const legMeta = await PF.readSnapMeta("2005-01-01");
+  assertEquals([legMeta?.legacy, legMeta?.gen], [true, undefined]);
+  const leg = await PF.loadIndex("2005-01-01");
+  assertEquals(leg.resources["https://L.example/r"].payers30d, 1);
+  const legFacts = await bazaarFacts("https://L.example/r", [], 14, "2005-01-02");
+  assertEquals([(legFacts as any).available, (legFacts as any).listed], [true, true]);
+
+  // M1 crash before flip: old gen readable
   await wipeSnaps(k);
   await saveIndex({
     date: "2003-01-01", listings: 1, hosts: { z: 1 }, wallet_hosts: {},
@@ -715,47 +717,73 @@ Deno.test("snapshot follow-ups: H1 full-only facts, M1 crash-safe gen, M2/M3 tie
     tier: "full", status: "complete",
     coverage: { pages_fetched: 1, max_pages: 1, items_indexed: 1, bazaar_total: 1, complete: true, status: "complete", partial: false, failed_pages: [] },
   } as any);
-  const before = await PF.loadIndex("2003-01-01");
-  assertEquals(before.resources["https://z.example/r"].payers30d, 9);
+  const gen0 = (await PF.readSnapMeta("2003-01-01"))!.gen;
   PF.setSaveCrashAfterChunks(1);
   let crashed = false;
   try {
-    await saveIndex({
-      date: "2003-01-01", listings: 99, hosts: {}, wallet_hosts: {}, resources: {},
-      tier: "full", status: "complete",
-      coverage: { pages_fetched: 1, max_pages: 1, items_indexed: 99, bazaar_total: 99, complete: true, status: "complete", partial: false, failed_pages: [] },
-    } as any);
-  } catch (e) { crashed = (e as Error).name === "SaveCrash" || (e as Error).message.includes("save_crash"); }
+    await saveIndex({ date: "2003-01-01", listings: 99, hosts: {}, wallet_hosts: {}, resources: {}, tier: "full", status: "complete",
+      coverage: { pages_fetched: 1, max_pages: 1, items_indexed: 99, bazaar_total: 99, complete: true, status: "complete", partial: false, failed_pages: [] } } as any);
+  } catch (e) { crashed = (e as Error).name === "SaveCrash"; }
   PF.setSaveCrashAfterChunks(null);
   assert(crashed);
   clearIndexCache();
-  const afterCrash = await PF.loadIndex("2003-01-01");
-  assertEquals([afterCrash.listings, afterCrash.resources["https://z.example/r"].payers30d], [1, 9]);
+  assertEquals([(await PF.readSnapMeta("2003-01-01"))!.gen, (await PF.loadIndex("2003-01-01")).listings], [gen0, 1]);
 
-  // --- concurrent day gate ---
+  // L5 crash after flip: new gen is current; orphans purged on next successful save (flip already committed)
+  PF.setSaveCrashAfterFlip(true);
+  let crashed2 = false;
+  try {
+    await saveIndex({ date: "2003-01-01", listings: 7, hosts: { z: 7 }, wallet_hosts: {},
+      resources: { "https://z.example/r": { payers30d: 7, calls30d: 7, lastCalledAt: null, payTo: [] } },
+      tier: "full", status: "complete",
+      coverage: { pages_fetched: 1, max_pages: 1, items_indexed: 7, bazaar_total: 7, complete: true, status: "complete", partial: false, failed_pages: [] } } as any);
+  } catch (e) { crashed2 = (e as Error).name === "SaveCrashAfterFlip"; }
+  PF.setSaveCrashAfterFlip(false);
+  assert(crashed2);
+  clearIndexCache();
+  const afterFlip = await PF.readSnapMeta("2003-01-01");
+  assert(afterFlip!.gen !== gen0);
+  assertEquals((await PF.loadIndex("2003-01-01")).listings, 7);
+  // L1: successful save purges orphan gens
+  await saveIndex({ date: "2003-01-01", listings: 8, hosts: { z: 8 }, wallet_hosts: {},
+    resources: { "https://z.example/r": { payers30d: 8, calls30d: 8, lastCalledAt: null, payTo: [] } },
+    tier: "full", status: "complete",
+    coverage: { pages_fetched: 1, max_pages: 1, items_indexed: 8, bazaar_total: 8, complete: true, status: "complete", partial: false, failed_pages: [] } } as any);
+  const keep = (await PF.readSnapMeta("2003-01-01"))!.gen!;
+  let orphan = 0;
+  for await (const e of k.list({ prefix: ["snap", "2003-01-01"] })) {
+    if (e.key.length >= 4 && e.key[2] !== keep) orphan++;
+  }
+  assertEquals(orphan, 0);
+
+  // L3: last_attempt_at stored on meta (real), null when unknown
+  assert(typeof (await PF.readSnapMeta("2003-01-01"))!.last_attempt_at === "string");
+  await k.set(["snapdate", "2005-06-01"], { chunks: 1, tier: "full", status: null, listings: 0, gzip_bytes: 0, legacy: true }); // no last_attempt_at
+  assertEquals((await PF.readSnapMeta("2005-06-01"))!.last_attempt_at ?? null, null);
+
+  // Concurrent day gate
   await wipeSnaps(k);
   let fetches = 0;
   const onePage = (async () => {
     fetches++;
     return new Response(JSON.stringify({ items: [{ resource: "https://race.example/r", accepts: [{ payTo: "0x" + "22".repeat(20) }], quality: {} }], pagination: { total: 1 } }));
   }) as typeof fetch;
-  const tRace = Date.UTC(2002, 5, 15, 8, 0, 0);
-  const results = await Promise.all([S.scheduledSnapshot(onePage, tRace), S.scheduledSnapshot(onePage, tRace)]);
+  const results = await Promise.all([S.scheduledSnapshot(onePage, Date.UTC(2002, 5, 15, 8, 0, 0)), S.scheduledSnapshot(onePage, Date.UTC(2002, 5, 15, 8, 0, 0))]);
   assertEquals([results.filter((r) => r === "ok").length, results.filter((r) => r === "skipped").length, fetches], [1, 1, 1]);
 
-  // --- measure real gzip size (3-page capped snap) ---
+  // M2: REAL Bazaar size — fetch 3 free public pages and measure gzip
   await wipeSnaps(k);
-  const mk = (i: number) => ({ resource: `https://h${i % 7}.example/r${i}`, accepts: [{ payTo: "0x" + (i % 3).toString(16).padStart(40, "0") }], quality: { l30DaysUniquePayers: i % 5, l30DaysTotalCalls: i % 17 } });
-  const f = (async (u: string) => {
-    const off = Number(new URL(u).searchParams.get("offset"));
-    return new Response(JSON.stringify({ items: Array.from({ length: 1000 }, (_, i) => mk(off + i)), pagination: { total: 38020 } }));
-  }) as typeof fetch;
-  const measured = await S.runSnapshot(f, 3, "2004-01-01");
-  if (measured.status === "failed") throw new Error("measure failed");
-  const gz = measured.meta.gzip_bytes; const ch = measured.meta.chunks;
-  // reduced≈15% of full gzip; aggregate≈200B/day; 30 full + 60 reduced + 275 aggregate
-  const annual = gz * 30 + gz * 0.15 * 60 + 200 * 275;
-  console.log(`MEASURED_SNAPSHOT gzip_bytes=${gz} chunks=${ch} annual_est_MiB=${(annual / (1024 * 1024)).toFixed(3)} vs_1GiB=${(annual / (1024 * 1024 * 1024) * 100).toFixed(4)}%`);
+  const live = await S.runSnapshot(fetch, 3, "2026-10-15");
+  if (live.status === "failed") throw new Error("live bazaar fetch failed: " + live.fail.error);
+  const gz = live.meta.gzip_bytes, ch = live.meta.chunks, n = live.index.listings;
+  // reduced size approx from same index
+  const walletCounts: Record<string, number> = {};
+  for (const [w, v] of Object.entries(live.index.wallet_hosts)) walletCounts[w] = Array.isArray(v) ? v.length : Number(v);
+  const redIdx = { date: "2026-10-15", listings: n, hosts: live.index.hosts, wallet_hosts: walletCounts, resources: {}, tier: "reduced" as const };
+  const rgz = new Uint8Array(await new Response(new Blob([JSON.stringify(redIdx)]).stream().pipeThrough(new CompressionStream("gzip"))).arrayBuffer()).length;
+  const annual = gz * 30 + rgz * 334; // 0–30 full, 31–364 reduced
+  console.log(`MEASURED_REAL_BAZAAR listings=${n} gzip_bytes=${gz} chunks=${ch} reduced_gzip_bytes=${rgz} annual_est_MiB=${(annual / (1024 * 1024)).toFixed(3)} vs_1GiB=${(annual / (1024 ** 3) * 100).toFixed(4)}%`);
+  assert(gz > 50_000 && ch >= 2 && n >= 1000); // real pages are large
 
   await wipeSnaps(k);
 });

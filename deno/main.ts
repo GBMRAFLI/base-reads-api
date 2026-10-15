@@ -124,19 +124,14 @@ export async function snapshotMeta(env: Deps["env"] = (k) => Deno.env.get(k)) {
   const last_error = todayFail && status === "failed"
     ? (todayFail.error_code || mapErrorCode(todayFail.error))
     : (st.error_code ?? null);
-  // L2: covered_listings always == listings from snapdate meta (unified)
+  // L2/L3: covered_listings == listings; last_attempt_at from stored meta or fail record only (null if unknown)
   let covered = 0;
+  let last_attempt_at: string | null = todayFail?.at ?? null;
   if (last) {
     const { readSnapMeta } = await import("./lib/preflight.ts");
     const m = await readSnapMeta(last);
     covered = m?.listings ?? 0;
-  }
-  // L3: last_updated = last successful snapshot date; last_attempt_at = most recent attempt (fail or success)
-  let last_attempt_at: string | null = todayFail?.at ?? null;
-  if (!last_attempt_at && last) {
-    const k = await (await import("./lib/store.ts")).kv();
-    const attempt = await k.get<number>(["snapattempt", last]);
-    last_attempt_at = typeof attempt.value === "number" ? new Date(attempt.value).toISOString() : `${last}T00:15:00Z`;
+    if (!last_attempt_at) last_attempt_at = m?.last_attempt_at ?? null;
   }
   const meta = { version: 1, started_at: dates[0] ?? null, last_updated: last,
     last_attempt_at, total_snapshots: dates.length, covered_listings: covered,
