@@ -166,7 +166,8 @@ export function validateChallenge(ch: any): [boolean, string[], Record<string, u
 
 // ---------- Bazaar snapshot index (same shape as Python build_index) ----------
 export type Index = { date: string; listings: number; hosts: Record<string, number>; wallet_hosts: Record<string, string[]>;
-  resources: Record<string, { payers30d: unknown; calls30d: unknown; lastCalledAt: unknown; payTo: string[] }> };
+  resources: Record<string, { payers30d: unknown; calls30d: unknown; lastCalledAt: unknown; payTo: string[] }>;
+  coverage?: { pages_fetched: number; max_pages: number; items_indexed: number; bazaar_total: number | null; complete: boolean } };
 export function hostOf(url: string) { try { return new URL(url).hostname.toLowerCase(); } catch { return ""; } }
 export class IndexAssembler {
   hosts: Record<string, number> = {}; wallets = new Map<string, Set<string>>(); res: Index["resources"] = {}; n = 0;
@@ -222,14 +223,25 @@ export async function bazaarFacts(url: string, paytoList: string[], maxTrend = 1
   const dates = await snapshotDates();
   if (!dates.length) return { available: false, reason: "no_snapshot" };
   const last = dates[dates.length - 1]; const idx = await loadIndex(last); const h = hostOf(url); const key = url.split("?")[0];
-  const cur = idx.resources[key] ?? null; const listed = cur?.payTo ?? [];
+  const cur = idx.resources[key] ?? null; const listedPayTo = cur?.payTo ?? [];
   const wl: Record<string, unknown> = {};
-  const ws = new Set([...paytoList.filter(Boolean).map((x) => x.toLowerCase()), ...listed]);
+  const ws = new Set([...paytoList.filter(Boolean).map((x) => x.toLowerCase()), ...listedPayTo]);
   for (const w of ws) { const hs = idx.wallet_hosts[w] ?? []; wl[w] = { hosts_using_wallet: hs.length, other_hosts_sample: hs.filter((x) => x !== h).slice(0, 10) }; }
   const trend = [];
   for (const d of dates.slice(-maxTrend)) { const r = (d === last ? idx : await loadIndex(d)).resources[key]; trend.push({ snapshot: d, payers30d: r ? r.payers30d : null, calls30d: r ? r.calls30d : null }); }
-  return { available: true, snapshot_date: last, listed: cur !== null, listed_payTo: listed, host_listing_count: idx.hosts[h] ?? 0,
-    payout_wallet_reuse: wl, last_called_at: cur ? cur.lastCalledAt : null, payer_trend: trend };
+  // Optional prepay-check/v1 fields when the Deno snapshot is capped (coverage.complete !== true):
+  // listed:null + listed_reason:"not_in_indexed_part" if the resource was not found in the indexed pages;
+  // host_listing_count_is_min / payout_wallet_reuse_is_min mark those counts as lower bounds (same field names kept for compatibility).
+  const coverage = idx.coverage ?? { complete: null as boolean | null };
+  const incomplete = coverage.complete !== true;
+  const found = cur !== null;
+  const out: Record<string, unknown> = { available: true, snapshot_date: last,
+    listed: found ? true : (incomplete ? null : false), listed_payTo: listedPayTo,
+    host_listing_count: idx.hosts[h] ?? 0, payout_wallet_reuse: wl,
+    last_called_at: cur ? cur.lastCalledAt : null, payer_trend: trend, coverage };
+  if (!found && incomplete) out.listed_reason = "not_in_indexed_part";
+  if (incomplete) { out.host_listing_count_is_min = true; out.payout_wallet_reuse_is_min = true; }
+  return out;
 }
 
 export async function preflight(url: string, opts: { resolver?: Resolver; fetcher?: Fetcher; connect?: Connector; now?: number; env?: (k: string) => string | undefined } = {}): Promise<[number, unknown]> {

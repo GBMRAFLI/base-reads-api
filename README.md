@@ -93,9 +93,15 @@ Transfer logs into the payee on Base, matched to the settlement tx hashes from P
 ## Deno Deploy port (`deno/`)
 TypeScript port with the same routes, 402 challenges (byte-identical body and `PAYMENT-REQUIRED` header), Ed25519 signed
 facts (same encrypted key and pubkey, byte-identical signatures), `/internal/export` with the same bearer auth, and the same
-record format. Storage: Deno KV. Daily Bazaar snapshot: `Deno.cron` at 00:15 UTC.
+record format. Storage: Deno KV. Daily Bazaar snapshot: `Deno.cron` at 00:15 UTC only (never at startup), at most one attempt per UTC calendar day (KV key `["snapattempt", YYYY-MM-DD]` with `versionstamp: null`, so a failed attempt also consumes the day and there is no every-other-day skip), capped at `SNAPSHOT_MAX_PAGES` pages of 1000 listings (default 3, range 1–50 with clamp + warning on invalid values; 15 s per page, 1 retry), snapshots retained 60 days. On Deno the snapshot is therefore often partial.
+
+### Optional `prepay-check/v1` bazaar fields (Deno production)
+Schema stays `prepay-check/v1` (safer than a version bump: existing clients keep working; new fields are additive and optional). When the index is capped, `bazaar.coverage` is present with `pages_fetched`, `max_pages`, `items_indexed`, `bazaar_total`, `complete`. If `coverage.complete !== true` and the resource was not found in the indexed pages: `listed` is `null` and `listed_reason` is `"not_in_indexed_part"` (do not treat as "definitely unlisted"). `host_listing_count` and `payout_wallet_reuse` keep their existing shapes; when the snapshot is incomplete they are lower bounds and Deno also sets `host_listing_count_is_min: true` and `payout_wallet_reuse_is_min: true` (backward-compatible: unknown clients ignore the flags). When `complete` is true, `listed` is a boolean as before.
+
+The Python reference (`api/`) does **not** yet apply the page cap or emit `coverage` / `listed: null` / `*_is_min` — Deno Deploy is production. Python still builds a full local snapshot for tests and the HF Docker path.
+
 Entry point `deno/main.ts`; env: `SIGNING_KEY_PASSPHRASE`, `SIGNING_KEY_ENC_B64`, `EXPORT_TOKEN` (+ optional `PAY_TO_ADDRESS`,
-`SELF_WALLETS`, `PUBLIC_URL`, `RPC`, `FACILITATOR`, `NETWORK`). Contract fixtures come from the Python reference
+`SELF_WALLETS`, `PUBLIC_URL`, `RPC`, `FACILITATOR`, `NETWORK`, `SNAPSHOT_MAX_PAGES`). Contract fixtures come from the Python reference
 (`python scripts/gen_contract_fixture.py`); `tests/fixtures/py_signed.json` holds a public THROWAWAY test key only.
 
 ## Bazaar discovery and the CDP facilitator (optional)

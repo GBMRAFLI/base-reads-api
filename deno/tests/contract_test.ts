@@ -582,3 +582,44 @@ Deno.test("HEAD gate uses the raw request path like GET routing", async () => {
   }
   const h = await handler(new Request("http://h.example/llms.txt?x=1", { method: "HEAD" }), { env }); assertEquals([h.status, h.body], [200, null]);
 });
+Deno.test("usage cut: snapshot capped at N pages, 1 retry, coverage recorded, one attempt per UTC day, listed:null when incomplete", async () => {
+  const S = await import("../lib/snapshot.ts"); const { kv } = await import("../lib/store.ts"); const k = await kv();
+  const mk = (i: number) => ({ resource: `https://h${i % 7}.example/r${i}`, accepts: [{ payTo: "0x" + (i % 3).toString(16).padStart(40, "0") }], quality: {} });
+  let calls = 0;
+  const f = (async (u: string) => { calls++; const off = Number(new URL(u).searchParams.get("offset"));
+    return new Response(JSON.stringify({ items: Array.from({ length: 1000 }, (_, i) => mk(off + i)), pagination: { total: 38020 } })); }) as typeof fetch;
+  const idx = await S.runSnapshot(f, 3, "2001-01-01");
+  assertEquals([calls, idx.listings, idx.coverage], [3, 3000, { pages_fetched: 3, max_pages: 3, items_indexed: 3000, bazaar_total: 38020, complete: false }]);
+  // L4: clamp out-of-range / invalid SNAPSHOT_MAX_PAGES with a warning
+  const warns: string[] = []; const w = (m: string) => warns.push(m);
+  assertEquals([S.maxPages(() => undefined), S.maxPages(() => "5"), S.maxPages(() => "0", w), S.maxPages(() => "99", w), S.maxPages(() => "x", w), S.PAGE_TIMEOUT_MS, S.RETRIES], [3, 5, 1, 50, 3, 15000, 1]);
+  assert(warns.length >= 3 && warns.some((m) => m.includes("clamped to 1")) && warns.some((m) => m.includes("clamped to 50")));
+  let n = 0; const bad = (async () => { n++; throw new Error("down"); }) as typeof fetch;
+  let threw = false; try { await S.runSnapshot(bad, 3, "2001-01-02"); } catch { threw = true; } assert(threw); assertEquals(n, 2); // 1 try + 1 retry, then stop
+  // M1: UTC-day gate — one attempt per calendar day (fail or ok); same day skipped; next UTC day allowed (no 24h every-other-day gap)
+  for await (const e of k.list({ prefix: ["snapattempt"] })) await k.delete(e.key);
+  const t0 = Date.UTC(2001, 0, 3, 12, 0, 0); // 2001-01-03 UTC
+  n = 0;
+  assertEquals(S.utcDay(t0), "2001-01-03");
+  assertEquals(await S.scheduledSnapshot(bad, t0), "failed");
+  assertEquals(await S.scheduledSnapshot(f, t0 + 3600_000), "skipped"); // same UTC day, even hours later
+  assertEquals(await S.scheduledSnapshot(f, Date.UTC(2001, 0, 4, 0, 0, 1)), "ok"); // next UTC day
+  // same-day race: second check(versionstamp:null) loses
+  assertEquals(await S.scheduledSnapshot(f, Date.UTC(2001, 0, 4, 23, 0, 0)), "skipped");
+  for await (const e of k.list({ prefix: ["snapattempt"] })) await k.delete(e.key);
+  const src = await Deno.readTextFile(new URL("../main.ts", import.meta.url));
+  assert(!src.includes("snapshotIfMissing")); assert(src.includes('"7 0 * * *"'));
+  // M2: incomplete + not found → listed:null; incomplete + found → listed:true with *_is_min
+  const miss = await bazaarFacts("https://missing.example/r", []);
+  assertEquals([(miss as any).listed, (miss as any).listed_reason, (miss as any).host_listing_count_is_min, (miss as any).payout_wallet_reuse_is_min, (miss as any).coverage.complete],
+    [null, "not_in_indexed_part", true, true, false]);
+  const hit = await bazaarFacts("https://h1.example/r1", []);
+  assertEquals([(hit as any).listed, (hit as any).listed_reason, (hit as any).host_listing_count_is_min, (hit as any).coverage.complete], [true, undefined, true, false]);
+  // retention stays 60 (L1): runSnapshot must not pass a shorter keep
+  const snapSrc = await Deno.readTextFile(new URL("../lib/snapshot.ts", import.meta.url));
+  assert(snapSrc.includes("saveIndex(idx, 60)")); assert(!snapSrc.includes("saveIndex(idx, 14)"));
+  for (const d of ["2001-01-01", "2001-01-02", "2001-01-03", "2001-01-04", new Date().toISOString().slice(0, 10)]) {
+    for await (const e of k.list({ prefix: ["snap", d] })) await k.delete(e.key); await k.delete(["snapdate", d]);
+  }
+  clearIndexCache();
+});
