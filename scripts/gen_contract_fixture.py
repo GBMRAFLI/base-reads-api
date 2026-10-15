@@ -23,6 +23,7 @@ def build():
         "routes": [[k, v[0], v[1], v[2]] for k, v in IX.ROUTES.items()],
         "root_body": json.dumps(root),
         "llms_txt": IX.llms_txt(),
+        "favicon_b64": IX.FAVICON_B64,
         "openapi_body": json.dumps(IX.openapi()),
         "ref": [[q, IX.clean_ref(q)] for q in ["", "ref=agent.x_1-2", "a=1&ref=ok", "ref=" + "a" * 64, "ref=" + "a" * 65, "ref=bad%20x", "ref=%3Cscript%3E", "ref=", "ref=caf%C3%A9", "ref=a%2Eb", "ref=abc%0A", "ref=abc%0D%0A", "ref=first&ref=second", "ref=bad%20x&ref=good"]],
         "strip_ref": [[q, IX.strip_ref(q)] for q in ["", "ref=a", "address=0x1&ref=a", "ref=a&address=0x1", "a=1&ref=x&b=2&ref=y", "a=1&ref", "a=1&referrer=z"]],

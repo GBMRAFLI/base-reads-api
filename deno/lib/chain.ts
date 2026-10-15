@@ -5,7 +5,7 @@ export const REG = "0xb94704422c2a1e396835a571837aa5ae53285a95";
 export type Rpc = (m: string, p: unknown[]) => Promise<any>;
 export function makeRpc(url: string, f: typeof fetch = fetch): Rpc {
   return async (m, p) => {
-    const r = await f(url, { method: "POST", headers: { "Content-Type": "application/json", "User-Agent": "gbmrafli-base-reads/1.0" },
+    const r = await f(url, { method: "POST", headers: { "Content-Type": "application/json", "User-Agent": "base-reads/1.0" },
       body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: m, params: p }), signal: AbortSignal.timeout(15000) });
     const d = await r.json();
     if (d.error) throw new Error(d.error.message);

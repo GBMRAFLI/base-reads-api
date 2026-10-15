@@ -35,6 +35,7 @@ export function bazaar(path: string) {
   const inp: Record<string, unknown> = { type: "http", method: "GET" };
   const inpS: Record<string, unknown> = { type: { type: "string", const: "http" }, method: { type: "string", enum: ["GET", "HEAD", "DELETE"] } };
   if (Object.keys(d.params).length) { inp.queryParams = ex; inpS.queryParams = { type: "object", properties: d.params, required: d.required }; }
+  else inpS.queryParams = { type: "object", properties: {}, additionalProperties: false }; // no inputs: declare an empty input schema (see api/index.py)
   return { info: { input: inp, output: { type: "json", example: d.output } },
     schema: { $schema: "https://json-schema.org/draft/2020-12/schema", type: "object",
       properties: { input: { type: "object", properties: inpS, required: ["type", "method"], additionalProperties: false },
@@ -58,7 +59,11 @@ export function cleanRef(qs: string): string | null {
 }
 /** Query string without ref params, so the logged input hash does not depend on attribution. */
 export const stripRef = (qs: string) => qs.split("&").filter((x) => x && !x.startsWith("ref=") && x !== "ref").join("&");
-export const VERIFY_402INDEX = "be918d4df21371f971ccaa589e4ed1adbe9a077a824950b1db21cebfbbf5ae3c"; // served with no trailing newline: exact token, byte-for-byte
+export const VERIFY_402INDEX_DEFAULT = "be918d4df21371f971ccaa589e4ed1adbe9a077a824950b1db21cebfbbf5ae3c";
+/** 402index ownership token: INDEX_VERIFY_TOKEN if set, else the built-in constant. Served with no trailing newline. */
+export const verifyToken = (env: Deps["env"]) => env("INDEX_VERIFY_TOKEN") || VERIFY_402INDEX_DEFAULT;
+export const FAVICON_B64 = "AAABAAEAEBAAAAEAIABoBAAAFgAAACgAAAAQAAAAIAAAAAEAIAAAAAAAQAQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA0lIA/9JSAP8AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAANJSAP/SUgD/0lIA/9JSAP/SUgD/0lIA/9JSAP/SUgD/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAANJSAP/SUgD/0lIA/9JSAP/SUgD/0lIA/9JSAP/SUgD/0lIA/9JSAP8AAAAAAAAAAAAAAAAAAAAAAAAAANJSAP/SUgD/0lIA/9JSAP/SUgD/0lIA/9JSAP/SUgD/0lIA/9JSAP/SUgD/0lIA/wAAAAAAAAAAAAAAANJSAP/SUgD/0lIA/9JSAP/SUgD/0lIA/9JSAP/SUgD/0lIA/9JSAP/SUgD/0lIA/9JSAP/SUgD/AAAAAAAAAADSUgD/0lIA/9JSAP/SUgD/0lIA///////////////////////SUgD/0lIA/9JSAP/SUgD/0lIA/wAAAAAAAAAA0lIA/9JSAP/SUgD/0lIA/9JSAP//////0lIA/9JSAP/SUgD//////9JSAP/SUgD/0lIA/9JSAP8AAAAA0lIA/9JSAP/SUgD/0lIA/9JSAP/SUgD//////9JSAP/SUgD/0lIA///////SUgD/0lIA/9JSAP/SUgD/0lIA/9JSAP/SUgD/0lIA/9JSAP/SUgD/0lIA///////////////////////SUgD/0lIA/9JSAP/SUgD/0lIA/9JSAP8AAAAA0lIA/9JSAP/SUgD/0lIA/9JSAP//////0lIA/9JSAP/SUgD//////9JSAP/SUgD/0lIA/9JSAP8AAAAAAAAAANJSAP/SUgD/0lIA/9JSAP/SUgD//////9JSAP/SUgD/0lIA///////SUgD/0lIA/9JSAP/SUgD/AAAAAAAAAADSUgD/0lIA/9JSAP/SUgD/0lIA///////////////////////SUgD/0lIA/9JSAP/SUgD/0lIA/wAAAAAAAAAAAAAAANJSAP/SUgD/0lIA/9JSAP/SUgD/0lIA/9JSAP/SUgD/0lIA/9JSAP/SUgD/0lIA/wAAAAAAAAAAAAAAAAAAAAAAAAAA0lIA/9JSAP/SUgD/0lIA/9JSAP/SUgD/0lIA/9JSAP/SUgD/0lIA/wAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAADSUgD/0lIA/9JSAP/SUgD/0lIA/9JSAP/SUgD/0lIA/wAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA0lIA/9JSAP8AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=="; // 16x16 ICO from scripts/gen_favicon.py
+export const FREE_PATHS = new Set(["/", "/index.json", "/favicon.ico", "/llms.txt", "/openapi.json", "/.well-known/402index-verify.txt", "/.well-known/x402-preflight", "/.well-known/x402-preflight-key-history.json", "/.well-known/bazaar-snapshot.json", "/x402/preflight/pubkey", "/bazaar/snapshots"]);
 /** OpenAPI 3.1 for the paid routes, generated from ROUTES + discovery.json so prices cannot drift from the 402 challenge. */
 export function openapi(env: Deps["env"]) {
   const c = cfg(env); const D = DISCOVERY as Record<string, any>; const paths: Record<string, unknown> = {};
@@ -69,9 +74,9 @@ export function openapi(env: Deps["env"]) {
     paths[k] = { get: { operationId: k.replace(/^\/+|\/+$/g, "").replaceAll("/", "_").replaceAll("-", "_"), summary: desc.split(". ")[0].slice(0, 120), description: desc, parameters: params,
       responses: { "200": { description: "Result (served after the payment is confirmed on-chain)", content: { "application/json": { example: d.output } } },
         "402": { description: "Payment required: x402 v2 challenge in the PAYMENT-REQUIRED header and body" } },
-      "x-payment-info": { protocols: ["x402"], pricingMode: "fixed", price: (price / 1e6).toFixed(3), amount: String(price), currency: "USDC", asset: c.USDC, network: c.NETWORK } } };
+      "x-payment-info": { protocols: ["x402"], pricingMode: "fixed", price: (price / 1e6).toFixed(3), amount: String(price), currency: "USDC", asset: c.USDC, network: c.NETWORK, payTo: c.PAY_TO } } };
   }
-  return { openapi: "3.1.0", info: { title: "Base Reads", version: "1.0.0",
+  return { openapi: "3.1.0", info: { title: "Base Reads", version: "1.0.0", contact: { email: "gbmrafli@agentmail.to" },
     description: "Pay-per-call read API for Base over x402 v2. Deterministic data, no advice.",
     "x-guidance": "Call any path with GET. Without payment you get HTTP 402 and a PAYMENT-REQUIRED challenge (x402 v2, exact scheme, USDC on Base). Sign an EIP-3009 transferWithAuthorization for the stated amount and retry with the PAYMENT-SIGNATURE header; the JSON is returned once the transfer is confirmed on-chain." },
     paths };
@@ -136,7 +141,7 @@ export function required(path: string, host: string, env: Deps["env"]) {
 }
 export function facClient(base: string, env: Deps["env"], f: typeof fetch = fetch) {
   return async (p: string, body: unknown) => {
-    const r = await f(base + p, { method: "POST", headers: { "Content-Type": "application/json", "User-Agent": "gbmrafli-base-reads/1.0", ...(await cdpHeaders(base, p, env)) }, body: pyDumps(body), signal: AbortSignal.timeout(40000) });
+    const r = await f(base + p, { method: "POST", headers: { "Content-Type": "application/json", "User-Agent": "base-reads/1.0", ...(await cdpHeaders(base, p, env)) }, body: pyDumps(body), signal: AbortSignal.timeout(40000) });
     try { return await r.json(); } catch { return {}; }
   };
 }
@@ -152,18 +157,29 @@ export async function exportRecords(auth: string, q: Record<string, string>, env
   for (const n of EXPORT_FILES) out[n.split(".")[0]] = (await rows(n)).filter((r: any) => !since || ((r.startedAt || r.verifiedAt || r.observedAt || r.incurredAt || "") >= since));
   return [200, { payTo: c.PAY_TO, network: c.NETWORK, asset: c.USDC, exportedAt: iso(), records: out }];
 }
-const HDRS = { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*", "Access-Control-Expose-Headers": "PAYMENT-REQUIRED, PAYMENT-RESPONSE" };
+const HDRS = { "Content-Type": "application/json", "X-Content-Type-Options": "nosniff", "Access-Control-Allow-Origin": "*", "Access-Control-Expose-Headers": "PAYMENT-REQUIRED, PAYMENT-RESPONSE" };
 const send = (code: number, obj: unknown, hd: Record<string, string> = {}) => new Response(pyDumps(obj), { status: code, headers: { ...HDRS, ...hd } });
 const b64 = (o: unknown) => b64json(o, pyDumps);
 
+/** HEAD on free routes: same status and headers as GET, no body. Paid routes keep their previous behaviour (501). */
 export async function handler(req: Request, d: Deps): Promise<Response> {
+  if (req.method === "HEAD") {
+    const raw = req.url.slice(req.url.indexOf("/", 8)); const qi = raw.indexOf("?"); // same raw path as GET routing
+    if (!FREE_PATHS.has(qi < 0 ? raw : raw.slice(0, qi))) return send(501, { error: "unsupported method" });
+    const r = await handleGet(new Request(req.url, { method: "GET", headers: req.headers }), d); await r.body?.cancel();
+    return new Response(null, { status: r.status, headers: r.headers });
+  }
+  return await handleGet(req, d);
+}
+async function handleGet(req: Request, d: Deps): Promise<Response> {
   if (req.method !== "GET") return send(501, { error: "unsupported method" });
   const env = d.env; const c = cfg(env); const rpc = d.rpc ?? makeRpc(c.RPC); const fac = d.fac ?? facClient(c.FAC, env);
   const raw = req.url.slice(req.url.indexOf("/", 8)); const qi = raw.indexOf("?");
   const path = qi < 0 ? raw : raw.slice(0, qi), qs = qi < 0 ? "" : raw.slice(qi + 1); const q = pyQuery(qs);
   if (path === "/" || path === "/index.json") return send(200, root(env));
-  if (path === "/openapi.json") return send(200, openapi(env));
-  if (path === "/.well-known/402index-verify.txt") return new Response(VERIFY_402INDEX, { status: 200, headers: { ...HDRS, "Content-Type": "text/plain; charset=utf-8" } });
+  if (path === "/openapi.json") return send(200, openapi(env), { "Cache-Control": "public, max-age=3600" });
+  if (path === "/favicon.ico") return new Response(Uint8Array.from(atob(FAVICON_B64), (ch) => ch.charCodeAt(0)), { status: 200, headers: { ...HDRS, "Content-Type": "image/x-icon", "Cache-Control": "public, max-age=86400" } });
+  if (path === "/.well-known/402index-verify.txt") return new Response(verifyToken(env), { status: 200, headers: { ...HDRS, "Content-Type": "text/plain; charset=utf-8" } });
   if (path === "/llms.txt") return new Response(llmsTxt(env), { status: 200, headers: { ...HDRS, "Content-Type": "text/plain; charset=utf-8", "Cache-Control": "public, max-age=3600" } });
   if (path === "/.well-known/x402-preflight") {
     try { return send(200, await wellKnown(env)); } catch (e) { if (e instanceof SigningUnavailable) return send(503, { error: "signing key unavailable" }); throw e; }
