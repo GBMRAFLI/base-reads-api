@@ -165,11 +165,18 @@ export function validateChallenge(ch: any): [boolean, string[], Record<string, u
 }
 
 // ---------- Bazaar snapshot index (same shape as Python build_index) ----------
-export type Index = { date: string; listings: number; hosts: Record<string, number>; wallet_hosts: Record<string, string[]>;
+export type SnapTier = "full" | "reduced" | "aggregate";
+export type SnapDateMeta = {
+  gen: number; chunks: number; tier: SnapTier;
+  status: "complete" | "partial" | null; listings: number; gzip_bytes: number;
+};
+export type Index = { date: string; listings: number; hosts: Record<string, number>;
+  /** Full tier: wallet -> host list. Reduced tier: wallet -> host count (number). */
+  wallet_hosts: Record<string, string[] | number>;
   resources: Record<string, { payers30d: unknown; calls30d: unknown; lastCalledAt: unknown; payTo: string[] }>;
   coverage?: { pages_fetched: number; max_pages: number; items_indexed: number; bazaar_total: number | null; complete: boolean;
     status?: "complete" | "partial"; partial?: boolean; failed_pages?: number[] };
-  status?: "complete" | "partial"; tier?: "full" | "reduced" | "aggregate";
+  status?: "complete" | "partial"; tier?: SnapTier;
   aggregate?: { hosts: number; payout_wallets: number } };
 export function hostOf(url: string) { try { return new URL(url).hostname.toLowerCase(); } catch { return ""; } }
 export class IndexAssembler {
@@ -190,54 +197,123 @@ export class IndexAssembler {
     return { date, listings: this.n, hosts: this.hosts, wallet_hosts: wh, resources: this.res };
   }
 }
-// KV values are capped at 64 KiB: store gzip(JSON) in 60 KB chunks
-const CHUNK = 60000;
+// KV values are capped at 64 KiB: store gzip(JSON) in 60 KB chunks under ["snap", date, gen, i]
+export const CHUNK = 60000;
+/** Test hook: if set to N, saveIndex throws after writing N new-gen chunks (before flipping snapdate). */
+let _saveCrashAfterChunks: number | null = null;
+export function setSaveCrashAfterChunks(n: number | null) { _saveCrashAfterChunks = n; }
 async function gz(s: string, mode: "c" | "d", data?: Uint8Array): Promise<Uint8Array> {
   const stream = mode === "c" ? new Blob([s]).stream().pipeThrough(new CompressionStream("gzip")) : new Blob([data! as Uint8Array<ArrayBuffer>]).stream().pipeThrough(new DecompressionStream("gzip"));
   return new Uint8Array(await new Response(stream).arrayBuffer());
 }
-/** Persist a snapshot index. Tiered retention (see applyTierRetention) demotes old days; this never deletes day history.
- *  `keep` is ignored (retained for call-site compatibility). Pass skipRetention when demoting to avoid recursion. */
-export async function saveIndex(idx: Index, _keep?: number, skipRetention = false) {
+export async function readSnapMeta(date: string): Promise<SnapDateMeta | null> {
+  const k = await kv(); const e = await k.get<SnapDateMeta | number>(["snapdate", date]);
+  if (e.value == null) return null;
+  if (typeof e.value === "number") return { gen: 0, chunks: e.value, tier: "full", status: null, listings: 0, gzip_bytes: 0 };
+  return e.value;
+}
+export async function listSnapMetas(): Promise<{ date: string; meta: SnapDateMeta }[]> {
+  const k = await kv(); const out: { date: string; meta: SnapDateMeta }[] = [];
+  for await (const e of k.list<SnapDateMeta | number>({ prefix: ["snapdate"] })) {
+    const date = e.key[1] as string;
+    const meta = typeof e.value === "number"
+      ? { gen: 0, chunks: e.value, tier: "full" as const, status: null, listings: 0, gzip_bytes: 0 }
+      : e.value;
+    if (meta) out.push({ date, meta });
+  }
+  return out.sort((a, b) => a.date.localeCompare(b.date));
+}
+/** Persist index via generationed chunks: write new gen, atomic flip snapdate, then delete old gen. Crash before flip leaves the previous day readable. */
+export async function saveIndex(idx: Index, _keep?: number, _skipRetention = false): Promise<SnapDateMeta> {
   if (!idx.tier) idx.tier = "full";
   const k = await kv();
-  // Replace any previous chunks for this date (demotion / rewrite).
-  for await (const e of k.list({ prefix: ["snap", idx.date] })) await k.delete(e.key);
-  const z = await gz(JSON.stringify(idx), "c"); const n = Math.ceil(z.length / CHUNK);
-  for (let i = 0; i < n; i++) await k.set(["snap", idx.date, i], z.slice(i * CHUNK, (i + 1) * CHUNK));
-  await k.set(["snapdate", idx.date], { chunks: n, tier: idx.tier, status: idx.status ?? idx.coverage?.status ?? null });
-  void skipRetention; // demotion is driven explicitly by applyTierRetention in snapshot.ts
+  const prev = await k.get<SnapDateMeta | number>(["snapdate", idx.date]);
+  let oldGen: number | null = null;
+  let legacyFlat = false;
+  if (typeof prev.value === "number") { oldGen = 0; legacyFlat = true; }
+  else if (prev.value && typeof prev.value === "object") oldGen = prev.value.gen;
+  const newGen = (oldGen ?? -1) + 1;
+  const z = await gz(JSON.stringify(idx), "c"); const n = Math.ceil(z.length / CHUNK) || 1;
+  for (let i = 0; i < n; i++) {
+    await k.set(["snap", idx.date, newGen, i], z.slice(i * CHUNK, (i + 1) * CHUNK));
+    if (_saveCrashAfterChunks != null && i + 1 >= _saveCrashAfterChunks) {
+      const err = new Error("save_crash_injected"); (err as any).name = "SaveCrash"; throw err;
+    }
+  }
+  const meta: SnapDateMeta = {
+    gen: newGen, chunks: n, tier: idx.tier, status: idx.status ?? idx.coverage?.status ?? null,
+    listings: idx.listings, gzip_bytes: z.length,
+  };
+  const flipped = await k.atomic().check(prev).set(["snapdate", idx.date], meta).commit();
+  if (!flipped.ok) {
+    for (let i = 0; i < n; i++) await k.delete(["snap", idx.date, newGen, i]);
+    throw new Error("snapdate_cas_failed");
+  }
+  // Delete previous generation (and legacy flat keys) after the flip.
+  if (oldGen != null) {
+    if (legacyFlat) {
+      for await (const e of k.list({ prefix: ["snap", idx.date] })) {
+        if (e.key.length === 3) await k.delete(e.key); // ["snap", date, i]
+      }
+    }
+    for await (const e of k.list({ prefix: ["snap", idx.date, oldGen] })) await k.delete(e.key);
+  }
+  idxCache.delete(idx.date);
+  return meta;
 }
 export async function snapshotDates(): Promise<string[]> {
-  const k = await kv(); const out: string[] = [];
-  for await (const e of k.list({ prefix: ["snapdate"] })) out.push(e.key[1] as string);
-  return out.sort();
+  return (await listSnapMetas()).map((x) => x.date);
 }
 const idxCache = new Map<string, Index>();
 export async function loadIndex(date: string): Promise<Index> {
   if (idxCache.has(date)) return idxCache.get(date)!;
-  const k = await kv(); const parts: Uint8Array[] = [];
-  for await (const e of k.list<Uint8Array>({ prefix: ["snap", date] })) parts.push(e.value);
+  const k = await kv();
+  const meta = await readSnapMeta(date);
+  if (!meta) throw new Error("no_snapshot");
+  const parts: Uint8Array[] = [];
+  if (meta.gzip_bytes === 0 && meta.gen === 0) {
+    // legacy flat chunks ["snap", date, i]
+    for await (const e of k.list<Uint8Array>({ prefix: ["snap", date] })) {
+      if (e.key.length === 3 && typeof e.key[2] === "number") parts.push(e.value);
+    }
+  } else {
+    for (let i = 0; i < meta.chunks; i++) {
+      const e = await k.get<Uint8Array>(["snap", date, meta.gen, i]);
+      if (!e.value) throw new Error("missing_chunk");
+      parts.push(e.value);
+    }
+  }
   const all = new Uint8Array(parts.reduce((a, p) => a + p.length, 0)); let o = 0; for (const p of parts) { all.set(p, o); o += p.length; }
   const idx = JSON.parse(new TextDecoder().decode(await gz("", "d", all))) as Index;
   if (idxCache.size > 16) idxCache.clear();
   idxCache.set(date, idx); return idx;
 }
 export function clearIndexCache() { idxCache.clear(); }
+
+/** Preflight bazaar facts: only a full-tier snapshot is usable. Reduced/aggregate never yield listed:false or zero counts. */
 export async function bazaarFacts(url: string, paytoList: string[], maxTrend = 14) {
-  const dates = await snapshotDates();
-  if (!dates.length) return { available: false, reason: "no_snapshot" };
-  const last = dates[dates.length - 1]; const idx = await loadIndex(last); const h = hostOf(url); const key = url.split("?")[0];
+  const metas = await listSnapMetas();
+  if (!metas.length) return { available: false, reason: "no_snapshot" };
+  const full = [...metas].reverse().find((m) => m.meta.tier === "full");
+  if (!full) return { available: false, reason: "snapshot_too_old" };
+  const last = full.date; const idx = await loadIndex(last); const h = hostOf(url); const key = url.split("?")[0];
   const cur = idx.resources[key] ?? null; const listedPayTo = cur?.payTo ?? [];
   const wl: Record<string, unknown> = {};
   const ws = new Set([...paytoList.filter(Boolean).map((x) => x.toLowerCase()), ...listedPayTo]);
-  for (const w of ws) { const hs = idx.wallet_hosts[w] ?? []; wl[w] = { hosts_using_wallet: hs.length, other_hosts_sample: hs.filter((x) => x !== h).slice(0, 10) }; }
-  const trend = [];
-  for (const d of dates.slice(-maxTrend)) { const r = (d === last ? idx : await loadIndex(d)).resources[key]; trend.push({ snapshot: d, payers30d: r ? r.payers30d : null, calls30d: r ? r.calls30d : null }); }
-  // Optional prepay-check/v1 fields when the Deno snapshot is capped (coverage.complete !== true):
-  // listed:null + listed_reason:"not_in_indexed_part" if the resource was not found in the indexed pages;
-  // host_listing_count_is_min / payout_wallet_reuse_is_min mark those counts as lower bounds (same field names kept for compatibility).
-  // listed:false only when coverage.complete === true (M2). Otherwise null + reason when not found.
+  for (const w of ws) {
+    const raw = idx.wallet_hosts[w];
+    const hs = Array.isArray(raw) ? raw : [];
+    wl[w] = { hosts_using_wallet: hs.length, other_hosts_sample: hs.filter((x) => x !== h).slice(0, 10) };
+  }
+  const trend: Record<string, unknown>[] = [];
+  for (const { date: d, meta } of metas.slice(-maxTrend)) {
+    if (meta.tier !== "full") {
+      trend.push({ snapshot: d, tier: meta.tier, payers30d: null, calls30d: null });
+      continue;
+    }
+    const r = (d === last ? idx : await loadIndex(d)).resources[key];
+    trend.push({ snapshot: d, tier: "full", payers30d: r ? r.payers30d : null, calls30d: r ? r.calls30d : null });
+  }
   const coverage = idx.coverage
     ? { ...idx.coverage, status: idx.coverage.status ?? idx.status, complete: idx.coverage.complete }
     : { complete: null as boolean | null, status: idx.status ?? null };

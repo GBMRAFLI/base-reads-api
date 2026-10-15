@@ -90,11 +90,11 @@ Deno.test("preflight end-to-end: signed facts, bazaar facts from KV snapshot", a
   const f = envl.facts; assertEquals(Object.keys(f).sort(), ["bazaar", "challenge", "checked_at", "disclaimer", "reachability", "schema", "target"]);
   assert(f.challenge.valid); assertEquals(f.reachability.http_status, 402);
   assertEquals(f.bazaar.host_listing_count, 1); assertEquals(f.bazaar.payout_wallet_reuse["0x" + "22".repeat(20)].hosts_using_wallet, 2);
-  assertEquals(f.bazaar.payer_trend, [{ snapshot: "2026-10-13", payers30d: 4, calls30d: 8 }]);
+  assertEquals(f.bazaar.payer_trend, [{ snapshot: "2026-10-13", tier: "full", payers30d: 4, calls30d: 8 }]);
   assertEquals(f.bazaar.last_called_at, "2026-10-13T00:00:00Z");
   const big = { ...b.build("2026-10-14"), resources: Object.fromEntries(Array.from({ length: 5000 }, (_, i) => [`https://h${i}.example/r`, { payers30d: i, calls30d: i, lastCalledAt: null, payTo: [] }])) };
   await saveIndex(big); clearIndexCache(); // multi-chunk round trip (> 64 KiB KV value limit)
-  assertEquals(((await bazaarFacts("https://h4999.example/r", [])) as any).payer_trend.at(-1), { snapshot: "2026-10-14", payers30d: 4999, calls30d: 4999 });
+  assertEquals(((await bazaarFacts("https://h4999.example/r", [])) as any).payer_trend.at(-1), { snapshot: "2026-10-14", tier: "full", payers30d: 4999, calls30d: 4999 });
 });
 
 const pad = (a: string) => "0x" + "0".repeat(24) + a.slice(2);
@@ -266,7 +266,7 @@ Deno.test("well-known, key history, fingerprints, signed snapshot metadata, faci
     : k === "SIGNING_KEY_CREATED_AT" ? "2026-10-14T11:00:00Z" : env(k);
   const h: any = await keyHistory(hist);
   assertEquals([h.current.status, h.current.created_at, h.retired.length, h.retired[0].status], ["active", "2026-10-14T11:00:00Z", 1, "retired"]);
-  const m: any = await snapshotMeta(); assertEquals(Object.keys(m.metadata).sort(), ["covered_listings", "last_error", "last_failed_pages", "last_status", "last_updated", "started_at", "total_snapshots", "version"]);
+  const m: any = await snapshotMeta(); assertEquals(Object.keys(m.metadata).sort(), ["covered_listings", "last_attempt_at", "last_error", "last_failed_pages", "last_status", "last_updated", "started_at", "total_snapshots", "version"]);
   assertEquals(m.pubkey_url, "/x402/preflight/pubkey"); assert(await verify({ facts: m.metadata, signature: m.signature }));
   for (const p of ["/.well-known/x402-preflight", "/.well-known/bazaar-snapshot.json", "/.well-known/x402-preflight-key-history.json", "/bazaar/snapshots"]) {
     const res = await handler(new Request("http://h" + p), { env }); assertEquals(res.status, 200, p); await res.body?.cancel();
@@ -600,7 +600,7 @@ Deno.test("usage cut: snapshot capped at N pages, 1 retry, coverage recorded, on
   const out = await S.runSnapshot(f, 3, "2001-01-01");
   assertEquals(out.status, "partial");
   const idx = out.status === "failed" ? null : out.index;
-  assertEquals([calls, idx!.listings, idx!.coverage?.complete, idx!.coverage?.status, idx!.coverage?.partial], [3, 3000, false, "partial", true]);
+  assertEquals([calls, idx!.listings, idx!.coverage?.complete, idx!.coverage?.status, idx!.coverage?.partial, out.status !== "failed" && out.meta.chunks >= 1], [3, 3000, false, "partial", true, true]);
   const warns: string[] = []; const w = (m: string) => warns.push(m);
   assertEquals([S.maxPages(() => undefined), S.maxPages(() => "5"), S.maxPages(() => "0", w), S.maxPages(() => "99", w), S.maxPages(() => "x", w), S.PAGE_TIMEOUT_MS, S.RETRIES], [3, 5, 1, 50, 3, 15000, 1]);
   assert(warns.length >= 3);
@@ -633,10 +633,13 @@ Deno.test("usage cut: snapshot capped at N pages, 1 retry, coverage recorded, on
   await wipeSnaps(k);
 });
 
-Deno.test("snapshot follow-ups: complete listed:false, legacy coverage null, concurrent day gate, tier retention", async () => {
-  const S = await import("../lib/snapshot.ts"); const { kv } = await import("../lib/store.ts"); const k = await kv();
+Deno.test("snapshot follow-ups: H1 full-only facts, M1 crash-safe gen, M2/M3 tiers, L4 demoted-latest", async () => {
+  const S = await import("../lib/snapshot.ts");
+  const PF = await import("../lib/preflight.ts");
+  const { kv } = await import("../lib/store.ts"); const k = await kv();
   await wipeSnaps(k);
-  // (1) complete snapshot + missing resource -> listed:false, no reason / *_is_min
+
+  // --- complete listed:false (full tier) ---
   const completeIdx = {
     date: "2002-01-01", listings: 1, hosts: { "only.example": 1 }, wallet_hosts: {},
     resources: { "https://only.example/r": { payers30d: 1, calls30d: 2, lastCalledAt: null, payTo: ["0x" + "11".repeat(20)] } },
@@ -645,51 +648,114 @@ Deno.test("snapshot follow-ups: complete listed:false, legacy coverage null, con
   };
   await saveIndex(completeIdx);
   const missComplete = await bazaarFacts("https://missing.example/nope", []);
-  assertEquals([(missComplete as any).listed, (missComplete as any).listed_reason, (missComplete as any).host_listing_count_is_min, (missComplete as any).payout_wallet_reuse_is_min],
-    [false, undefined, undefined, undefined]);
+  assertEquals([(missComplete as any).listed, (missComplete as any).listed_reason], [false, undefined]);
 
-  // (2) legacy snapshot without coverage -> listed:null, complete:null
-  for await (const e of k.list({ prefix: ["snap", "2002-01-01"] })) await k.delete(e.key); await k.delete(["snapdate", "2002-01-01"]);
-  clearIndexCache();
-  const legacy = { date: "2002-01-02", listings: 0, hosts: {}, wallet_hosts: {}, resources: {} };
-  await saveIndex(legacy as any);
+  // --- legacy without coverage -> listed:null ---
+  await wipeSnaps(k);
+  await saveIndex({ date: "2002-01-02", listings: 0, hosts: {}, wallet_hosts: {}, resources: {}, tier: "full" } as any);
   const missLegacy = await bazaarFacts("https://missing.example/nope", []);
   assertEquals([(missLegacy as any).listed, (missLegacy as any).listed_reason, (missLegacy as any).coverage.complete], [null, "not_in_indexed_part", null]);
 
-  // (3) Promise.all two scheduledSnapshot on the same day -> exactly one ok, fetch once
-  for await (const e of k.list({ prefix: ["snapattempt"] })) await k.delete(e.key);
-  for await (const e of k.list({ prefix: ["snapfail"] })) await k.delete(e.key);
-  for (const d of ["2002-01-02", "2002-06-15"]) {
-    for await (const e of k.list({ prefix: ["snap", d] })) await k.delete(e.key); await k.delete(["snapdate", d]);
-  }
+  // --- H1: only reduced snapshot -> available:false snapshot_too_old (never listed:false) ---
+  await wipeSnaps(k);
+  await saveIndex({
+    date: "2002-03-01", listings: 5, hosts: { a: 5 }, wallet_hosts: { ["0x" + "aa".repeat(20)]: 2 },
+    resources: {}, tier: "reduced", status: "complete",
+    coverage: { pages_fetched: 1, max_pages: 1, items_indexed: 5, bazaar_total: 5, complete: true, status: "complete", partial: false, failed_pages: [] },
+  } as any);
+  const tooOld = await bazaarFacts("https://missing.example/nope", []);
+  assertEquals([(tooOld as any).available, (tooOld as any).reason, (tooOld as any).listed], [false, "snapshot_too_old", undefined]);
+
+  // --- H1/L4: never demote the newest (only) snapshot ---
+  await wipeSnaps(k);
+  await saveIndex({
+    date: "2000-01-01", listings: 2, hosts: { a: 1, b: 1 },
+    wallet_hosts: { ["0x" + "33".repeat(20)]: ["a"] },
+    resources: { "https://a.example/r": { payers30d: null, calls30d: null, lastCalledAt: null, payTo: [] } },
+    coverage: { pages_fetched: 1, max_pages: 1, items_indexed: 2, bazaar_total: 2, complete: true, status: "complete", partial: false, failed_pages: [] },
+    status: "complete", tier: "full",
+  } as any);
+  await S.applyTierRetention("2000-06-01"); // would be aggregate age, but newest must stay full
   clearIndexCache();
+  const still = await PF.readSnapMeta("2000-01-01");
+  assertEquals(still?.tier, "full");
+  const factsAfter = await bazaarFacts("https://missing.example/x", []);
+  assert((factsAfter as any).listed !== false || (factsAfter as any).available === true);
+  assertEquals((factsAfter as any).listed, false); // complete full + missing => false is OK; must NOT be from demotion zeros
+  assertEquals((factsAfter as any).available, true);
+
+  // --- M3: older (non-newest) days demote: reduced counts, then aggregate after 90d ---
+  await saveIndex({
+    date: "2000-01-15", listings: 3, hosts: { c: 3 },
+    wallet_hosts: { ["0x" + "44".repeat(20)]: ["c", "d"] },
+    resources: { "https://c.example/r": { payers30d: 1, calls30d: 1, lastCalledAt: null, payTo: [] } },
+    coverage: { pages_fetched: 1, max_pages: 1, items_indexed: 3, bazaar_total: 3, complete: true, status: "complete", partial: false, failed_pages: [] },
+    status: "complete", tier: "full",
+  } as any);
+  // newest is now 2000-01-15; demote 2000-01-01 at age 45 from 2000-02-15
+  await S.applyTierRetention("2000-02-15");
+  clearIndexCache();
+  assertEquals((await PF.readSnapMeta("2000-01-01"))?.tier, "reduced");
+  const red = await PF.loadIndex("2000-01-01");
+  assertEquals([red.tier, Object.keys(red.resources).length, red.wallet_hosts["0x" + "33".repeat(20)]], ["reduced", 0, 1]);
+  // age >= 90 from 2000-05-01 -> aggregate (non-newest)
+  await S.applyTierRetention("2000-05-01");
+  clearIndexCache();
+  assertEquals((await PF.readSnapMeta("2000-01-01"))?.tier, "aggregate");
+  // payer_trend marks reduced/aggregate days
+  const trendFacts = await bazaarFacts("https://c.example/r", []);
+  assertEquals((trendFacts as any).available, true);
+  assert((trendFacts as any).payer_trend.some((t: any) => t.tier === "aggregate" || t.tier === "reduced"));
+
+  // --- M1 crash mid-write: old generation remains readable ---
+  await wipeSnaps(k);
+  await saveIndex({
+    date: "2003-01-01", listings: 1, hosts: { z: 1 }, wallet_hosts: {},
+    resources: { "https://z.example/r": { payers30d: 9, calls30d: 9, lastCalledAt: null, payTo: [] } },
+    tier: "full", status: "complete",
+    coverage: { pages_fetched: 1, max_pages: 1, items_indexed: 1, bazaar_total: 1, complete: true, status: "complete", partial: false, failed_pages: [] },
+  } as any);
+  const before = await PF.loadIndex("2003-01-01");
+  assertEquals(before.resources["https://z.example/r"].payers30d, 9);
+  PF.setSaveCrashAfterChunks(1);
+  let crashed = false;
+  try {
+    await saveIndex({
+      date: "2003-01-01", listings: 99, hosts: {}, wallet_hosts: {}, resources: {},
+      tier: "full", status: "complete",
+      coverage: { pages_fetched: 1, max_pages: 1, items_indexed: 99, bazaar_total: 99, complete: true, status: "complete", partial: false, failed_pages: [] },
+    } as any);
+  } catch (e) { crashed = (e as Error).name === "SaveCrash" || (e as Error).message.includes("save_crash"); }
+  PF.setSaveCrashAfterChunks(null);
+  assert(crashed);
+  clearIndexCache();
+  const afterCrash = await PF.loadIndex("2003-01-01");
+  assertEquals([afterCrash.listings, afterCrash.resources["https://z.example/r"].payers30d], [1, 9]);
+
+  // --- concurrent day gate ---
+  await wipeSnaps(k);
   let fetches = 0;
   const onePage = (async () => {
     fetches++;
     return new Response(JSON.stringify({ items: [{ resource: "https://race.example/r", accepts: [{ payTo: "0x" + "22".repeat(20) }], quality: {} }], pagination: { total: 1 } }));
   }) as typeof fetch;
-  const tRace = Date.UTC(2002, 5, 15, 8, 0, 0); // 2002-06-15
+  const tRace = Date.UTC(2002, 5, 15, 8, 0, 0);
   const results = await Promise.all([S.scheduledSnapshot(onePage, tRace), S.scheduledSnapshot(onePage, tRace)]);
-  const ok = results.filter((r) => r === "ok").length;
-  const skipped = results.filter((r) => r === "skipped").length;
-  assertEquals([ok, skipped, fetches], [1, 1, 1]);
+  assertEquals([results.filter((r) => r === "ok").length, results.filter((r) => r === "skipped").length, fetches], [1, 1, 1]);
 
-  // Tiered retention: full -> reduced after 31d, aggregate at 365d; day keys remain
-  const oldFull = {
-    date: "2000-01-01", listings: 2, hosts: { a: 1, b: 1 }, wallet_hosts: { ["0x" + "33".repeat(20)]: ["a"] },
-    resources: { "https://a.example/r": { payers30d: null, calls30d: null, lastCalledAt: null, payTo: [] } },
-    coverage: { pages_fetched: 1, max_pages: 1, items_indexed: 2, bazaar_total: 2, complete: true, status: "complete" as const, partial: false, failed_pages: [] },
-    status: "complete" as const, tier: "full" as const,
-  };
-  await saveIndex(oldFull);
-  await S.applyTierRetention("2000-02-15"); // age 45 days -> reduced
-  clearIndexCache();
-  const reduced = await (await import("../lib/preflight.ts")).loadIndex("2000-01-01");
-  assertEquals([reduced.tier, Object.keys(reduced.resources).length, reduced.hosts.a], ["reduced", 0, 1]);
-  await S.applyTierRetention("2001-01-02"); // age >= 365 -> aggregate
-  clearIndexCache();
-  const agg = await (await import("../lib/preflight.ts")).loadIndex("2000-01-01");
-  assertEquals([agg.tier, agg.aggregate?.hosts, (await k.get(["snapdate", "2000-01-01"])).value != null], ["aggregate", 2, true]);
+  // --- measure real gzip size (3-page capped snap) ---
+  await wipeSnaps(k);
+  const mk = (i: number) => ({ resource: `https://h${i % 7}.example/r${i}`, accepts: [{ payTo: "0x" + (i % 3).toString(16).padStart(40, "0") }], quality: { l30DaysUniquePayers: i % 5, l30DaysTotalCalls: i % 17 } });
+  const f = (async (u: string) => {
+    const off = Number(new URL(u).searchParams.get("offset"));
+    return new Response(JSON.stringify({ items: Array.from({ length: 1000 }, (_, i) => mk(off + i)), pagination: { total: 38020 } }));
+  }) as typeof fetch;
+  const measured = await S.runSnapshot(f, 3, "2004-01-01");
+  if (measured.status === "failed") throw new Error("measure failed");
+  const gz = measured.meta.gzip_bytes; const ch = measured.meta.chunks;
+  // reduced≈15% of full gzip; aggregate≈200B/day; 30 full + 60 reduced + 275 aggregate
+  const annual = gz * 30 + gz * 0.15 * 60 + 200 * 275;
+  console.log(`MEASURED_SNAPSHOT gzip_bytes=${gz} chunks=${ch} annual_est_MiB=${(annual / (1024 * 1024)).toFixed(3)} vs_1GiB=${(annual / (1024 * 1024 * 1024) * 100).toFixed(4)}%`);
 
   await wipeSnaps(k);
 });

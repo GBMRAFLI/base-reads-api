@@ -9,7 +9,7 @@ import { CDP_HOST, enabled as cdpEnabled, headers as cdpHeaders } from "./lib/cd
 import * as SG from "./lib/settle_guard.ts";
 import { SCHEMA, snapshotDates, loadIndex } from "./lib/preflight.ts";
 import { isoOrNull, keyHistory, publicKeyInfo, sign, SigningUnavailable } from "./lib/sign.ts";
-import { scheduledSnapshot, latestSnapStatus, loadFail } from "./lib/snapshot.ts";
+import { scheduledSnapshot, latestSnapStatus, loadFail, mapErrorCode } from "./lib/snapshot.ts";
 import { EXPORT_FILES, rows } from "./lib/store.ts";
 import { recordObservation, recordSale, verifyOnchain } from "./lib/stream.ts";
 import { ADDR, b64json, iso, pyQuery, sha256hex, unquote } from "./lib/util.ts";
@@ -114,24 +114,32 @@ export async function wellKnown(env: Deps["env"]) {
 }
 /** Free, signed metadata about the daily Bazaar snapshot series (no snapshot contents). */
 export async function snapshotMeta(env: Deps["env"] = (k) => Deno.env.get(k)) {
-  const dates = await snapshotDates(); const last = dates.at(-1) ?? null;
-  const st = await latestSnapStatus(last);
-  // Prefer a same-day failure over a stale success when the latest calendar attempt failed with no index.
+  const dates = await snapshotDates(); const last = dates.at(-1) ?? null; // last successful snapdate
   const today = new Date().toISOString().slice(0, 10);
   const todayFail = await loadFail(today);
-  const status = todayFail && (!last || today >= last) ? "failed" : st.status;
+  const st = await latestSnapStatus(last);
+  const status = todayFail && (!last || today >= last) ? "failed" as const : st.status;
   const failed_pages = todayFail && status === "failed" ? todayFail.failed_pages : st.failed_pages;
-  const last_error = todayFail && status === "failed" ? todayFail.error : st.error;
+  // L1: fixed error codes only (never free-form exception text in the signed payload)
+  const last_error = todayFail && status === "failed"
+    ? (todayFail.error_code || mapErrorCode(todayFail.error))
+    : (st.error_code ?? null);
+  // L2: covered_listings always == listings from snapdate meta (unified)
   let covered = 0;
   if (last) {
-    try {
-      const idx: any = await loadIndex(last);
-      covered = idx.tier === "aggregate" ? (idx.listings ?? 0) : Object.keys(idx.resources ?? {}).length;
-      if (idx.tier === "reduced" || idx.tier === "aggregate") covered = idx.listings ?? covered;
-    } catch { /* ignore */ }
+    const { readSnapMeta } = await import("./lib/preflight.ts");
+    const m = await readSnapMeta(last);
+    covered = m?.listings ?? 0;
   }
-  const meta = { version: 1, started_at: dates[0] ?? null, last_updated: todayFail && status === "failed" ? today : last,
-    total_snapshots: dates.length, covered_listings: covered,
+  // L3: last_updated = last successful snapshot date; last_attempt_at = most recent attempt (fail or success)
+  let last_attempt_at: string | null = todayFail?.at ?? null;
+  if (!last_attempt_at && last) {
+    const k = await (await import("./lib/store.ts")).kv();
+    const attempt = await k.get<number>(["snapattempt", last]);
+    last_attempt_at = typeof attempt.value === "number" ? new Date(attempt.value).toISOString() : `${last}T00:15:00Z`;
+  }
+  const meta = { version: 1, started_at: dates[0] ?? null, last_updated: last,
+    last_attempt_at, total_snapshots: dates.length, covered_listings: covered,
     last_status: status, last_failed_pages: failed_pages, last_error };
   const e = await sign(meta, env);
   return { metadata: e.facts, signature: e.signature, pubkey_url: "/x402/preflight/pubkey" };
@@ -143,8 +151,10 @@ export async function snapshotSummary(limit = 30) {
     if (!SNAP_SUM.has(d)) {
       const idx: any = await loadIndex(d); const res: Record<string, any> = idx.resources ?? {};
       const vals = Object.values(res);
-      SNAP_SUM.set(d, { date: d, resources: vals.length, hosts: Object.keys(idx.hosts ?? {}).length, payout_wallets: Object.keys(idx.wallet_hosts ?? {}).length,
-        calls30d_total: vals.reduce((a, r) => a + (r.calls30d || 0), 0), payers30d_total: vals.reduce((a, r) => a + (r.payers30d || 0), 0) });
+      const hosts = idx.tier === "aggregate" ? (idx.aggregate?.hosts ?? 0) : Object.keys(idx.hosts ?? {}).length;
+      const wallets = idx.tier === "aggregate" ? (idx.aggregate?.payout_wallets ?? 0) : Object.keys(idx.wallet_hosts ?? {}).length;
+      SNAP_SUM.set(d, { date: d, resources: idx.tier === "full" ? vals.length : (idx.listings ?? 0), hosts, payout_wallets: wallets,
+        calls30d_total: vals.reduce((a: number, r: any) => a + (r.calls30d || 0), 0), payers30d_total: vals.reduce((a: number, r: any) => a + (r.payers30d || 0), 0) });
     }
     out.push(SNAP_SUM.get(d)!);
   }
