@@ -40,3 +40,18 @@ jobs:
         with: {deno-version: v2.x}
       - run: deno check main.ts
       - run: deno test -A tests/
+  cdp-validate:
+    # Advisory: CDP's free, no-key validator checks the DEPLOYED endpoints (it cannot reach a CI container).
+    # Set the repository variable PUBLIC_URL to enable it. Never fails the build.
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    if: ${{ vars.PUBLIC_URL != '' }}
+    steps:
+      - name: validate each route with CDP (no API key, no payment)
+        env: {PUBLIC_URL: "${{ vars.PUBLIC_URL }}"}
+        run: |
+          for r in /base/usdc-balance /base/tx-status /base/basename /base/address-intel /x402/preflight /base/network; do
+            curl -s -m 60 -X POST https://api.cdp.coinbase.com/platform/v2/x402/validate -H 'Content-Type: application/json' \
+              -d "{\"resource\":\"$PUBLIC_URL$r\",\"method\":\"GET\"}" > out.json || true
+            python3 -c "import json,sys;d=json.load(open('out.json'));bad=[c['check'] for c in d.get('preflight',[]) if not c['passed'] and c['severity']=='required'];print(sys.argv[1],'valid=',d.get('valid'),'outcome=',(d.get('simulation') or {}).get('outcome'),'failed_required=',bad)" "$r" || cat out.json
+          done

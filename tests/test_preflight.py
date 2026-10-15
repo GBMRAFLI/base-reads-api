@@ -156,4 +156,58 @@ class T5(unittest.TestCase):
         sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "scripts")); import gen_contract_fixture as G
         f = json.load(open(os.path.join(os.path.dirname(__file__), "..", "deno", "tests", "fixtures", "contract.json")))
         self.assertEqual(json.loads(json.dumps(G.build(), sort_keys=True)), f, "run scripts/gen_contract_fixture.py")
+class T6(unittest.TestCase):
+    R = os.path.join(os.path.dirname(__file__), "..")
+    def test_bazaar_block_every_route(self):
+        self.assertEqual(open(os.path.join(self.R, "api", "discovery.json")).read(), open(os.path.join(self.R, "deno", "lib", "discovery.json")).read())
+        for path in IX.ROUTES:
+            b = IX.required(path, "h.example")["extensions"]["bazaar"]
+            self.assertEqual(set(b), {"info", "schema"}); inp = b["info"]["input"]
+            self.assertEqual((inp["type"], inp["method"]), ("http", "GET"))
+            self.assertEqual(b["info"]["output"]["type"], "json"); self.assertIsInstance(b["info"]["output"]["example"], dict); self.assertTrue(b["info"]["output"]["example"])
+            si = b["schema"]["properties"]["input"]; self.assertEqual(si["required"], ["type", "method"]); self.assertFalse(si["additionalProperties"])
+            params = IX.DISCOVERY[path]["params"]
+            ex = inp.get("queryParams", {}); self.assertEqual(bool(ex), bool(params))
+            self.assertLessEqual(set(ex), set(params)); self.assertLessEqual(set(IX.DISCOVERY[path]["required"]), set(ex))
+            for name, sch in params.items():
+                self.assertGreater(len(sch.get("description", "")), 15, (path, name)); self.assertEqual(sch["type"], "string")
+                if "pattern" in sch and name in ex: self.assertRegex(ex[name], sch["pattern"])
+            self.assertNotIn("example.com", json.dumps(b))
+            try: import jsonschema
+            except ImportError: continue
+            jsonschema.validate(b["info"], b["schema"])
+    def test_cdp_jwt_claims_and_signature(self):
+        import cdp_auth; from Crypto.PublicKey import ECC; from Crypto.Signature import eddsa
+        seed = bytes(range(32)); pub = ECC.construct(curve="ed25519", seed=seed).public_key()
+        sec = base64.b64encode(seed + pub.export_key(format="raw")).decode()
+        tok = cdp_auth.jwt("kid-1", sec, "POST", "api.cdp.coinbase.com", "/platform/v2/x402/settle", now=1000)
+        h, c, sg = tok.split("."); dec = lambda x: json.loads(base64.urlsafe_b64decode(x + "=" * (-len(x) % 4)))
+        hd, cl = dec(h), dec(c)
+        self.assertEqual((hd["alg"], hd["kid"], hd["typ"]), ("EdDSA", "kid-1", "JWT")); self.assertRegex(hd["nonce"], r"^[0-9]{16}$")
+        self.assertEqual(cl, {"sub": "kid-1", "iss": "cdp", "nbf": 1000, "exp": 1120, "uris": ["POST api.cdp.coinbase.com/platform/v2/x402/settle"]})
+        eddsa.new(pub, "rfc8032").verify((h + "." + c).encode(), base64.urlsafe_b64decode(sg + "=" * (-len(sg) % 4)))
+        self.assertNotEqual(cdp_auth.jwt("kid-1", sec, "POST", "a", "/b"), cdp_auth.jwt("kid-1", sec, "POST", "a", "/b"))  # fresh nonce per request
+        with self.assertRaises(ValueError): cdp_auth.jwt("k", base64.b64encode(b"x" * 32).decode(), "POST", "a", "/b")
+    def test_cdp_only_when_cdp_url_and_keys(self):
+        import cdp_auth
+        sec = base64.b64encode(bytes(range(32)) + bytes(32)).decode()
+        keys = {"CDP_API_KEY_ID": "k", "CDP_API_KEY_SECRET": sec}; cdp = "https://api.cdp.coinbase.com/platform/v2/x402"
+        self.assertEqual(cdp_auth.headers("https://facilitator.payai.network", "/settle", keys), {})
+        self.assertEqual(cdp_auth.headers(cdp, "/settle", {}), {})
+        self.assertEqual(cdp_auth.headers(cdp, "/settle", {"CDP_API_KEY_ID": "k"}), {})
+        self.assertEqual(cdp_auth.headers("https://api.cdp.coinbase.com.evil.example/x", "/settle", keys), {})
+        a = cdp_auth.headers(cdp, "/settle", keys)["Authorization"]; self.assertTrue(a.startswith("Bearer "))
+        cl = json.loads(base64.urlsafe_b64decode(a.split(".")[1] + "=="))
+        self.assertEqual(cl["uris"], ["POST api.cdp.coinbase.com/platform/v2/x402/settle"])
+    def test_fac_payai_default_unchanged(self):
+        self.assertEqual(IX.FAC, os.environ.get("FACILITATOR", "https://facilitator.payai.network"))
+        seen = {}
+        class R:
+            def read(self): return b'{"success": true, "transaction": "0x' + b"ab" * 32 + b'", "payer": "0x1", "network": "eip155:8453"}'
+        old = IX.urllib.request.urlopen
+        IX.urllib.request.urlopen = lambda req, timeout: (seen.update(h=dict(req.header_items()), u=req.full_url), R())[1]
+        try: st = IX.fac("/settle", {"x": 1})
+        finally: IX.urllib.request.urlopen = old
+        self.assertNotIn("Authorization", seen["h"]); self.assertEqual(seen["u"], "https://facilitator.payai.network/settle")
+        self.assertTrue(st["success"]); self.assertEqual(st["transaction"], "0x" + "ab" * 32)  # CDP settle response uses the same fields
 if __name__ == "__main__": unittest.main(verbosity=2)

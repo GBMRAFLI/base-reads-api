@@ -4,6 +4,8 @@ import { pyDumps } from "./lib/canonical.ts";
 import { Chain, makeRpc, type Rpc } from "./lib/chain.ts";
 import { preflight, type Fetcher, type Resolver } from "./lib/preflight.ts";
 import { PAY_TO_DEFAULT, ROUTES } from "./lib/routes.ts";
+import DISCOVERY from "./lib/discovery.json" with { type: "json" };
+import { headers as cdpHeaders } from "./lib/cdp_auth.ts";
 import { publicKeyInfo, SigningUnavailable } from "./lib/sign.ts";
 import { snapshotIfMissing, runSnapshot } from "./lib/snapshot.ts";
 import { EXPORT_FILES, rows } from "./lib/store.ts";
@@ -23,14 +25,27 @@ export function reqFor(path: string, env: Deps["env"]) {
   return { scheme: "exact", network: c.NETWORK, amount: String(ROUTES[path][0]), asset: c.USDC, payTo: c.PAY_TO, maxTimeoutSeconds: 120,
     extra: { name: c.NETWORK === "eip155:8453" ? "USD Coin" : "USDC", version: "2" } };
 }
-export function required(path: string, host: string, env: Deps["env"]) {
-  const [, desc, ex] = ROUTES[path]; const c = cfg(env);
-  return { x402Version: 2, error: "PAYMENT-SIGNATURE header is required", resource: { url: (c.PUBLIC || ("https://" + host)) + path, description: desc, mimeType: "application/json" },
-    accepts: [reqFor(path, env)], extensions: { bazaar: { info: { input: { type: "http", method: "GET", queryParams: ex }, output: { type: "json" } }, discoverable: true } } };
+type Disc = { params: Record<string, unknown>; required: string[]; output: unknown };
+/** extensions.bazaar in the declareDiscoveryExtension format (info + JSON schema); same bytes as api/index.py bazaar(). */
+export function bazaar(path: string) {
+  const ex = ROUTES[path][2], d = (DISCOVERY as Record<string, Disc>)[path];
+  const inp: Record<string, unknown> = { type: "http", method: "GET" };
+  const inpS: Record<string, unknown> = { type: { type: "string", const: "http" }, method: { type: "string", enum: ["GET", "HEAD", "DELETE"] } };
+  if (Object.keys(d.params).length) { inp.queryParams = ex; inpS.queryParams = { type: "object", properties: d.params, required: d.required }; }
+  return { info: { input: inp, output: { type: "json", example: d.output } },
+    schema: { $schema: "https://json-schema.org/draft/2020-12/schema", type: "object",
+      properties: { input: { type: "object", properties: inpS, required: ["type", "method"], additionalProperties: false },
+        output: { type: "object", properties: { type: { type: "string" }, example: { type: "object" } }, required: ["type"] } },
+      required: ["input"] } };
 }
-function facClient(base: string) {
+export function required(path: string, host: string, env: Deps["env"]) {
+  const [, desc] = ROUTES[path]; const c = cfg(env);
+  return { x402Version: 2, error: "PAYMENT-SIGNATURE header is required", resource: { url: (c.PUBLIC || ("https://" + host)) + path, description: desc, mimeType: "application/json" },
+    accepts: [reqFor(path, env)], extensions: { bazaar: bazaar(path) } };
+}
+export function facClient(base: string, env: Deps["env"], f: typeof fetch = fetch) {
   return async (p: string, body: unknown) => {
-    const r = await fetch(base + p, { method: "POST", headers: { "Content-Type": "application/json", "User-Agent": "gbmrafli-base-reads/1.0" }, body: pyDumps(body), signal: AbortSignal.timeout(40000) });
+    const r = await f(base + p, { method: "POST", headers: { "Content-Type": "application/json", "User-Agent": "gbmrafli-base-reads/1.0", ...(await cdpHeaders(base, p, env)) }, body: pyDumps(body), signal: AbortSignal.timeout(40000) });
     try { return await r.json(); } catch { return {}; }
   };
 }
@@ -52,7 +67,7 @@ const b64 = (o: unknown) => b64json(o, pyDumps);
 
 export async function handler(req: Request, d: Deps): Promise<Response> {
   if (req.method !== "GET") return send(501, { error: "unsupported method" });
-  const env = d.env; const c = cfg(env); const rpc = d.rpc ?? makeRpc(c.RPC); const fac = d.fac ?? facClient(c.FAC);
+  const env = d.env; const c = cfg(env); const rpc = d.rpc ?? makeRpc(c.RPC); const fac = d.fac ?? facClient(c.FAC, env);
   const raw = req.url.slice(req.url.indexOf("/", 8)); const qi = raw.indexOf("?");
   const path = qi < 0 ? raw : raw.slice(0, qi), qs = qi < 0 ? "" : raw.slice(qi + 1); const q = pyQuery(qs);
   if (path === "/" || path === "/index.json")

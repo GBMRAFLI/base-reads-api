@@ -6,7 +6,8 @@ import { ROUTES } from "../lib/routes.ts";
 import { rid } from "../lib/util.ts";
 import { useKv, rows } from "../lib/store.ts";
 import { recordSale, verifyOnchain, TRANSFER } from "../lib/stream.ts";
-import { handler, reqFor } from "../main.ts";
+import { bazaar, facClient, handler, reqFor } from "../main.ts";
+import { headers as cdpHeaders, jwt as cdpJwt } from "../lib/cdp_auth.ts";
 
 const C = JSON.parse(Deno.readTextFileSync(new URL("./fixtures/contract.json", import.meta.url)));
 const P = JSON.parse(Deno.readTextFileSync(new URL("./fixtures/py_signed.json", import.meta.url)));
@@ -147,3 +148,38 @@ Deno.test("on-chain check and outcome statuses match Python rules", async () => 
   assertEquals(inc.status, "inconclusive");
 });
 Deno.test("pyDumps matches Python spacing", () => { assertEquals(pyDumps({ a: [1, "x"], b: { c: null } }), '{"a": [1, "x"], "b": {"c": null}}'); });
+
+Deno.test("bazaar block: info + schema for every route, real descriptions and output examples", () => {
+  for (const k of Object.keys(ROUTES)) {
+    const b = bazaar(k) as any;
+    assertEquals(Object.keys(b).sort(), ["info", "schema"]);
+    assertEquals([b.info.input.type, b.info.input.method, b.info.output.type], ["http", "GET", "json"], k);
+    assert(Object.keys(b.info.output.example).length > 0, k);
+    assertEquals(b.schema.properties.input.required, ["type", "method"]);
+    for (const [, s] of Object.entries(b.schema.properties.input.properties.queryParams?.properties ?? {})) assert(((s as any).description ?? "").length > 15, k);
+    assert(!JSON.stringify(b).includes("example.com"), k);
+  }
+});
+Deno.test("CDP JWT byte-identical to Python for the same throwaway key, time and nonce", async () => {
+  const v = C.cdp_jwt;
+  assertEquals(await cdpJwt(v.key_id, v.secret, "POST", "api.cdp.coinbase.com", "/platform/v2/x402/settle", v.now, v.nonce), v.jwt);
+  const [h, c] = v.jwt.split(".").slice(0, 2).map((x: string) => JSON.parse(atob(x.replace(/-/g, "+").replace(/_/g, "/"))));
+  assertEquals(h, { alg: "EdDSA", kid: v.key_id, typ: "JWT", nonce: v.nonce });
+  assertEquals(c, { sub: v.key_id, iss: "cdp", nbf: v.now, exp: v.now + 120, uris: ["POST api.cdp.coinbase.com/platform/v2/x402/settle"] });
+});
+Deno.test("CDP auth only when FACILITATOR is CDP AND keys are set; PayAI request unchanged", async () => {
+  const keys: Record<string, string> = { CDP_API_KEY_ID: C.cdp_jwt.key_id, CDP_API_KEY_SECRET: C.cdp_jwt.secret };
+  const ke = (k: string) => keys[k]; const none = (_: string) => undefined;
+  const CDP = "https://api.cdp.coinbase.com/platform/v2/x402";
+  assertEquals(await cdpHeaders("https://facilitator.payai.network", "/settle", ke), {});
+  assertEquals(await cdpHeaders(CDP, "/settle", none), {});
+  assertEquals(await cdpHeaders("https://api.cdp.coinbase.com.evil.example/x", "/settle", ke), {});
+  const seen: { url: string; h: Headers }[] = [];
+  const f = ((u: string, init: RequestInit) => { seen.push({ url: u, h: new Headers(init.headers) });
+    return Promise.resolve(new Response(JSON.stringify({ success: true, transaction: "0x" + "ab".repeat(32), payer: "0x1", network: "eip155:8453" }))); }) as unknown as typeof fetch;
+  const st = await facClient("https://facilitator.payai.network", ke, f)("/settle", { x: 1 });
+  assertEquals([seen[0].url, seen[0].h.get("Authorization")], ["https://facilitator.payai.network/settle", null]);
+  assertEquals(st.transaction, "0x" + "ab".repeat(32)); // CDP settle response uses the same fields (success, transaction, payer, network)
+  await facClient(CDP, ke, f)("/settle", { x: 1 });
+  assertEquals(seen[1].url, CDP + "/settle"); assert(seen[1].h.get("Authorization")!.startsWith("Bearer ey"));
+});
