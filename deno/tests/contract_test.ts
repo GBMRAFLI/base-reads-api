@@ -536,3 +536,17 @@ Deno.test("observation inputHash is the same with and without ref", async () => 
   const h = async (qs: string) => (await sha256hex(stripRef(qs))).slice(0, 16);
   assertEquals(await h("address=0x1&ref=agent-7"), await h("address=0x1")); assertEquals(await h("ref=x&address=0x1"), await h("address=0x1"));
 });
+Deno.test("openapi.json identical to Python; prices equal the 402 challenge; verify file exact", async () => {
+  const r = await handler(new Request("http://h.example/openapi.json"), { env }); const t = await r.text();
+  assertEquals(r.status, 200); assertEquals(t, C.openapi_body);
+  const o = JSON.parse(t); assertEquals(o.openapi, "3.1.0"); assertEquals(o.info.title, "Base Reads"); assert(!("contact" in o.info));
+  assertEquals(Object.keys(o.paths), Object.keys(ROUTES));
+  for (const k of Object.keys(ROUTES)) {
+    const res = await handler(new Request("http://h.example" + k), { env }); assertEquals(res.status, 402);
+    const amt = (await res.json()).accepts[0].amount; const pi = o.paths[k].get["x-payment-info"];
+    assertEquals(pi.amount, amt, k); assertEquals(Math.round(Number(pi.price) * 1e6), Number(amt), k);
+    assertEquals([pi.protocols, pi.currency], [["x402"], "USDC"]); assert(o.paths[k].get.responses["200"] && o.paths[k].get.responses["402"]);
+  }
+  const v = await handler(new Request("http://h.example/.well-known/402index-verify.txt"), { env });
+  assert(v.headers.get("Content-Type")!.startsWith("text/plain")); assertEquals(await v.text(), "be918d4df21371f971ccaa589e4ed1adbe9a077a824950b1db21cebfbbf5ae3c");
+});

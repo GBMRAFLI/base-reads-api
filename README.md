@@ -36,6 +36,8 @@ Optional `?ref=<tag>` (`A-Z a-z 0-9 . _ -`, max 64; first occurrence wins) is st
 | Route | Returns |
 |---|---|
 | `/` | service info, prices, facilitator in use |
+| `/openapi.json` | OpenAPI 3.1 for the paid routes; prices generated from the same table as the 402 challenge |
+| `/.well-known/402index-verify.txt` | 402index ownership token, exact bytes, no trailing newline |
 | `/llms.txt` | plain-text summary for agents: routes, prices, payment info, discovery links (cached 1 h) |
 | `/.well-known/x402-preflight` | public key, key_id, fingerprint, how to verify, facilitator, repo |
 | `/.well-known/x402-preflight-key-history.json` | current and retired signing keys with dates |

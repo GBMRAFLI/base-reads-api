@@ -1,4 +1,4 @@
-// GBMRAFLI Base Reads on Deno Deploy: receive-only x402 v2 seller on Base mainnet. Never signs or sends funds.
+// Base Reads on Deno Deploy: receive-only x402 v2 seller on Base mainnet. Never signs or sends funds.
 // Same routes, 402 challenges, signed facts, export endpoint and record format as api/index.py. Zero LLM.
 import { pyDumps } from "./lib/canonical.ts";
 import { Chain, makeRpc, type Rpc } from "./lib/chain.ts";
@@ -58,15 +58,33 @@ export function cleanRef(qs: string): string | null {
 }
 /** Query string without ref params, so the logged input hash does not depend on attribution. */
 export const stripRef = (qs: string) => qs.split("&").filter((x) => x && !x.startsWith("ref=") && x !== "ref").join("&");
+export const VERIFY_402INDEX = "be918d4df21371f971ccaa589e4ed1adbe9a077a824950b1db21cebfbbf5ae3c"; // served with no trailing newline: exact token, byte-for-byte
+/** OpenAPI 3.1 for the paid routes, generated from ROUTES + discovery.json so prices cannot drift from the 402 challenge. */
+export function openapi(env: Deps["env"]) {
+  const c = cfg(env); const D = DISCOVERY as Record<string, any>; const paths: Record<string, unknown> = {};
+  for (const [k, [price, desc]] of Object.entries(ROUTES)) {
+    const d = D[k];
+    const params = Object.entries(d.params as Record<string, any>).map(([n, sch]) => ({ name: n, in: "query", required: d.required.includes(n), description: sch.description ?? "",
+      schema: Object.fromEntries(Object.entries(sch).filter(([kk]) => kk !== "description")) }));
+    paths[k] = { get: { operationId: k.replace(/^\/+|\/+$/g, "").replaceAll("/", "_").replaceAll("-", "_"), summary: desc.split(". ")[0].slice(0, 120), description: desc, parameters: params,
+      responses: { "200": { description: "Result (served after the payment is confirmed on-chain)", content: { "application/json": { example: d.output } } },
+        "402": { description: "Payment required: x402 v2 challenge in the PAYMENT-REQUIRED header and body" } },
+      "x-payment-info": { protocols: ["x402"], pricingMode: "fixed", price: (price / 1e6).toFixed(3), amount: String(price), currency: "USDC", asset: c.USDC, network: c.NETWORK } } };
+  }
+  return { openapi: "3.1.0", info: { title: "Base Reads", version: "1.0.0",
+    description: "Pay-per-call read API for Base over x402 v2. Deterministic data, no advice.",
+    "x-guidance": "Call any path with GET. Without payment you get HTTP 402 and a PAYMENT-REQUIRED challenge (x402 v2, exact scheme, USDC on Base). Sign an EIP-3009 transferWithAuthorization for the stated amount and retry with the PAYMENT-SIGNATURE header; the JSON is returned once the transfer is confirmed on-chain." },
+    paths };
+}
 export function llmsTxt(env: Deps["env"]) {
   const c = cfg(env); const N = c.NETWORK;
   const net = N === "eip155:8453" ? "Base mainnet" : N === "eip155:84532" ? "Base Sepolia" : N;
-  const L = ["# GBMRAFLI Base Reads", "", `> Pay-per-call read API for ${net} over x402 v2. Each paid route answers GET without payment with HTTP 402 and a PAYMENT-REQUIRED challenge; retry with a PAYMENT-SIGNATURE header to get JSON.`, "",
+  const L = ["# Base Reads", "", `> Pay-per-call read API for ${net} over x402 v2. Each paid route answers GET without payment with HTTP 402 and a PAYMENT-REQUIRED challenge; retry with a PAYMENT-SIGNATURE header to get JSON.`, "",
     "## Payment", "", "- Protocol: x402 v2, scheme exact", `- Network: ${N} (${net})`, `- Asset: USDC ${c.USDC}`, "- Authorization: EIP-3009 transferWithAuthorization only (Permit2 is rejected)",
     "- Responses are served only after the transfer is confirmed on-chain", "- Optional ?ref=<tag> (A-Z a-z 0-9 . _ -, max 64) is recorded for attribution and never changes price or challenge", "",
     "## Paid routes (GET, JSON)", "",
     ...Object.entries(ROUTES).map(([k, v]) => `- ${k} (${(v[0] / 1e6).toFixed(3)} USDC): ${v[1]}`),
-    "", "## Discovery (free)", "", "- / : service index with routes and prices", "- /bazaar/snapshots : daily Bazaar snapshot summary",
+    "", "## Discovery (free)", "", "- / : service index with routes and prices", "- /openapi.json : OpenAPI 3.1 description of the paid routes with prices", "- /bazaar/snapshots : daily Bazaar snapshot summary",
     "- /.well-known/bazaar-snapshot.json : signed snapshot series metadata", "- /.well-known/x402-preflight : Pre-pay Check schema and signing key",
     "- /.well-known/x402-preflight-key-history.json : signing key history", "- /x402/preflight/pubkey : Ed25519 public key for verifying signed facts",
     "- Each 402 challenge carries extensions.bazaar (input schema and output example) for x402 Bazaar listing", "", "Facts only, no investment advice.", ""];
@@ -74,13 +92,13 @@ export function llmsTxt(env: Deps["env"]) {
 }
 export function root(env: Deps["env"]) {
   const c = cfg(env);
-  return { service: "GBMRAFLI Base Reads", network: c.NETWORK, protocol: "x402 v2", facilitator: facilitatorInfo(env),
-    free: ["/llms.txt", "/.well-known/x402-preflight", "/.well-known/x402-preflight-key-history.json", "/.well-known/bazaar-snapshot.json", "/x402/preflight/pubkey", "/bazaar/snapshots"],
+  return { service: "Base Reads", network: c.NETWORK, protocol: "x402 v2", facilitator: facilitatorInfo(env),
+    free: ["/llms.txt", "/openapi.json", "/.well-known/402index-verify.txt", "/.well-known/x402-preflight", "/.well-known/x402-preflight-key-history.json", "/.well-known/bazaar-snapshot.json", "/x402/preflight/pubkey", "/bazaar/snapshots"],
     routes: Object.fromEntries(Object.entries(ROUTES).map(([k, v]) => [k, { price_usdc: v[0] / 1e6, description: v[1] }])) };
 }
 export async function wellKnown(env: Deps["env"]) {
   const pub = await publicKeyInfo(env);
-  return { service: "GBMRAFLI Base Reads", schema: SCHEMA, alg: "Ed25519", key_id: pub.key_id, public_key_b64: pub.public_key_b64,
+  return { service: "Base Reads", schema: SCHEMA, alg: "Ed25519", key_id: pub.key_id, public_key_b64: pub.public_key_b64,
     fingerprint: pub.fingerprint, fingerprint_short: pub.fingerprint_short, created_at: pub.created_at,
     verify: ["Take the paid /x402/preflight response body: {facts, signature}.",
       "Serialize facts as canonical JSON: keys sorted, separators (',', ':'), ASCII-only escapes (Python json.dumps(facts, sort_keys=True, separators=(',', ':'))).",
@@ -144,6 +162,8 @@ export async function handler(req: Request, d: Deps): Promise<Response> {
   const raw = req.url.slice(req.url.indexOf("/", 8)); const qi = raw.indexOf("?");
   const path = qi < 0 ? raw : raw.slice(0, qi), qs = qi < 0 ? "" : raw.slice(qi + 1); const q = pyQuery(qs);
   if (path === "/" || path === "/index.json") return send(200, root(env));
+  if (path === "/openapi.json") return send(200, openapi(env));
+  if (path === "/.well-known/402index-verify.txt") return new Response(VERIFY_402INDEX, { status: 200, headers: { ...HDRS, "Content-Type": "text/plain; charset=utf-8" } });
   if (path === "/llms.txt") return new Response(llmsTxt(env), { status: 200, headers: { ...HDRS, "Content-Type": "text/plain; charset=utf-8", "Cache-Control": "public, max-age=3600" } });
   if (path === "/.well-known/x402-preflight") {
     try { return send(200, await wellKnown(env)); } catch (e) { if (e instanceof SigningUnavailable) return send(503, { error: "signing key unavailable" }); throw e; }
