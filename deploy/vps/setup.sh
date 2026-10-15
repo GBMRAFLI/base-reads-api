@@ -1,7 +1,10 @@
 #!/usr/bin/env bash
 # One-time server setup for Ubuntu 24.04 (incl. Minimal image). Run as root on the server. Idempotent.
 set -euo pipefail
-DENO_VERSION="${DENO_VERSION:-v2.9.7}"
+API_DOMAIN="${API_DOMAIN:?set API_DOMAIN (hostname only, e.g. api.example.com)}"
+DENO_VERSION="v2.9.7"
+# sha256 of deno-x86_64-unknown-linux-gnu.zip for DENO_VERSION (matches the release's .sha256sum file)
+DENO_SHA256="c6527f24f4b16031d3ae4fa9f658d5f11534c8d84ce7dc8502420280919c3490"
 SWAP_GB="${SWAP_GB:-2}"
 
 apt-get update -y
@@ -34,6 +37,7 @@ ufw --force enable
 if ! /usr/local/bin/deno --version 2>/dev/null | grep -q "${DENO_VERSION#v}"; then
   tmp=$(mktemp -d)
   curl -fsSL -o "$tmp/deno.zip" "https://github.com/denoland/deno/releases/download/${DENO_VERSION}/deno-x86_64-unknown-linux-gnu.zip"
+  echo "$DENO_SHA256  $tmp/deno.zip" | sha256sum -c - || { echo "deno download checksum mismatch" >&2; exit 1; }
   unzip -o "$tmp/deno.zip" -d "$tmp" && install -m 755 "$tmp/deno" /usr/local/bin/deno.new && mv /usr/local/bin/deno.new /usr/local/bin/deno && rm -rf "$tmp"
 fi
 
@@ -50,5 +54,14 @@ id basereads >/dev/null 2>&1 || useradd --system --home /opt/base-reads --shell 
 install -d -o basereads -g basereads -m 750 /opt/base-reads /opt/base-reads/deno-cache /var/lib/base-reads
 install -d -o root -g root -m 700 /etc/base-reads /var/backups/base-reads
 [ -f /etc/base-reads/env ] || install -o root -g root -m 600 /dev/null /etc/base-reads/env
-install -m 644 "$(dirname "$0")/Caddyfile" /etc/caddy/Caddyfile.new && mv /etc/caddy/Caddyfile.new /etc/caddy/Caddyfile && systemctl reload caddy || true
+sed "s/API_DOMAIN_PLACEHOLDER/$API_DOMAIN/" "$(dirname "$0")/Caddyfile" > /etc/caddy/Caddyfile.new
+caddy validate --config /etc/caddy/Caddyfile.new --adapter caddyfile >/dev/null && mv /etc/caddy/Caddyfile.new /etc/caddy/Caddyfile && systemctl restart caddy
+
+# sshd: keys only. Only applied when root already has an authorized key, and validated before reload.
+if [ -s /root/.ssh/authorized_keys ]; then
+  printf 'PasswordAuthentication no\nKbdInteractiveAuthentication no\nPermitRootLogin prohibit-password\nPubkeyAuthentication yes\n' > /etc/ssh/sshd_config.d/10-key-only.conf
+  if sshd -t; then systemctl reload ssh; else rm -f /etc/ssh/sshd_config.d/10-key-only.conf; echo "sshd config invalid; left unchanged" >&2; fi
+else
+  echo "no /root/.ssh/authorized_keys: password login left enabled" >&2
+fi
 echo "setup done; fill /etc/base-reads/env (root:600), then run deploy.sh"

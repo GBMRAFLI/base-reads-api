@@ -9,5 +9,8 @@ sqlite3 "$SRC" ".timeout 10000" ".backup '$tmp'"
 sqlite3 "$tmp" "PRAGMA integrity_check;" | grep -qx ok
 gzip -f "$tmp" && chmod 600 "$tmp.gz" && mv "$tmp.gz" "$DST/kv-$d.sqlite3.gz"   # rename = atomic publish
 if [ "$(date -u +%u)" = 7 ]; then cp "$DST/kv-$d.sqlite3.gz" "$DST/.weekly.tmp" && mv "$DST/.weekly.tmp" "$DST/weekly-kv-$d.sqlite3.gz"; fi
+# optional offsite copy: an executable hook receives the backup path; it must encrypt before upload
+HOOK=/etc/base-reads/backup-offsite.sh
+if [ -x "$HOOK" ]; then "$HOOK" "$DST/kv-$d.sqlite3.gz" || echo "offsite hook failed" >&2; fi
 ls -1t "$DST"/kv-*.sqlite3.gz | tail -n +15 | xargs -r rm -f
 ls -1t "$DST"/weekly-kv-*.sqlite3.gz 2>/dev/null | tail -n +9 | xargs -r rm -f

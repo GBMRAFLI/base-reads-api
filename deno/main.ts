@@ -8,9 +8,9 @@ import DISCOVERY from "./lib/discovery.json" with { type: "json" };
 import { CDP_HOST, enabled as cdpEnabled, headers as cdpHeaders } from "./lib/cdp_auth.ts";
 import * as SG from "./lib/settle_guard.ts";
 import { SCHEMA, snapshotDates, loadIndex } from "./lib/preflight.ts";
-import { isoOrNull, keyHistory, publicKeyInfo, sign, SigningUnavailable } from "./lib/sign.ts";
+import { isoOrNull, keyHistory, loadKey, publicKeyInfo, sign, SigningUnavailable } from "./lib/sign.ts";
 import { scheduledSnapshot, latestSnapStatus, loadFail, mapErrorCode } from "./lib/snapshot.ts";
-import { EXPORT_FILES, rows } from "./lib/store.ts";
+import { EXPORT_FILES, kv, rows } from "./lib/store.ts";
 import { recordObservation, recordSale, verifyOnchain } from "./lib/stream.ts";
 import { ADDR, b64json, iso, pyQuery, sha256hex, unquote } from "./lib/util.ts";
 
@@ -63,7 +63,7 @@ export const VERIFY_402INDEX_DEFAULT = "be918d4df21371f971ccaa589e4ed1adbe9a077a
 /** 402index ownership token: INDEX_VERIFY_TOKEN if set, else the built-in constant. Served with no trailing newline. */
 export const verifyToken = (env: Deps["env"]) => env("INDEX_VERIFY_TOKEN") || VERIFY_402INDEX_DEFAULT;
 export const FAVICON_B64 = "AAABAAEAEBAAAAEAIABoBAAAFgAAACgAAAAQAAAAIAAAAAEAIAAAAAAAQAQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA0lIA/9JSAP8AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAANJSAP/SUgD/0lIA/9JSAP/SUgD/0lIA/9JSAP/SUgD/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAANJSAP/SUgD/0lIA/9JSAP/SUgD/0lIA/9JSAP/SUgD/0lIA/9JSAP8AAAAAAAAAAAAAAAAAAAAAAAAAANJSAP/SUgD/0lIA/9JSAP/SUgD/0lIA/9JSAP/SUgD/0lIA/9JSAP/SUgD/0lIA/wAAAAAAAAAAAAAAANJSAP/SUgD/0lIA/9JSAP/SUgD/0lIA/9JSAP/SUgD/0lIA/9JSAP/SUgD/0lIA/9JSAP/SUgD/AAAAAAAAAADSUgD/0lIA/9JSAP/SUgD/0lIA///////////////////////SUgD/0lIA/9JSAP/SUgD/0lIA/wAAAAAAAAAA0lIA/9JSAP/SUgD/0lIA/9JSAP//////0lIA/9JSAP/SUgD//////9JSAP/SUgD/0lIA/9JSAP8AAAAA0lIA/9JSAP/SUgD/0lIA/9JSAP/SUgD//////9JSAP/SUgD/0lIA///////SUgD/0lIA/9JSAP/SUgD/0lIA/9JSAP/SUgD/0lIA/9JSAP/SUgD/0lIA///////////////////////SUgD/0lIA/9JSAP/SUgD/0lIA/9JSAP8AAAAA0lIA/9JSAP/SUgD/0lIA/9JSAP//////0lIA/9JSAP/SUgD//////9JSAP/SUgD/0lIA/9JSAP8AAAAAAAAAANJSAP/SUgD/0lIA/9JSAP/SUgD//////9JSAP/SUgD/0lIA///////SUgD/0lIA/9JSAP/SUgD/AAAAAAAAAADSUgD/0lIA/9JSAP/SUgD/0lIA///////////////////////SUgD/0lIA/9JSAP/SUgD/0lIA/wAAAAAAAAAAAAAAANJSAP/SUgD/0lIA/9JSAP/SUgD/0lIA/9JSAP/SUgD/0lIA/9JSAP/SUgD/0lIA/wAAAAAAAAAAAAAAAAAAAAAAAAAA0lIA/9JSAP/SUgD/0lIA/9JSAP/SUgD/0lIA/9JSAP/SUgD/0lIA/wAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAADSUgD/0lIA/9JSAP/SUgD/0lIA/9JSAP/SUgD/0lIA/wAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA0lIA/9JSAP8AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=="; // 16x16 ICO from scripts/gen_favicon.py
-export const FREE_PATHS = new Set(["/", "/index.json", "/favicon.ico", "/llms.txt", "/openapi.json", "/.well-known/402index-verify.txt", "/.well-known/x402-preflight", "/.well-known/x402-preflight-key-history.json", "/.well-known/bazaar-snapshot.json", "/x402/preflight/pubkey", "/bazaar/snapshots"]);
+export const FREE_PATHS = new Set(["/", "/index.json", "/favicon.ico", "/llms.txt", "/openapi.json", "/.well-known/402index-verify.txt", "/.well-known/x402-preflight", "/.well-known/x402-preflight-key-history.json", "/.well-known/bazaar-snapshot.json", "/x402/preflight/pubkey", "/bazaar/snapshots", "/healthz"]);
 /** OpenAPI 3.1 for the paid routes, generated from ROUTES + discovery.json so prices cannot drift from the 402 challenge. */
 export function openapi(env: Deps["env"]) {
   const c = cfg(env); const D = DISCOVERY as Record<string, any>; const paths: Record<string, unknown> = {};
@@ -192,6 +192,16 @@ export async function handler(req: Request, d: Deps): Promise<Response> {
   }
   return await handleGet(req, d);
 }
+/** Liveness for deploys: signing key loads and a KV write/read/delete round-trip works. Outputs only booleans. */
+export async function health(env: Deps["env"]): Promise<[number, Record<string, boolean>]> {
+  let signing = false, store = false;
+  try { await loadKey(env); signing = true; } catch { /* reported as false */ }
+  try {
+    const k = await kv(); const key = ["health", crypto.randomUUID()]; const v = crypto.randomUUID();
+    await k.set(key, v, { expireIn: 60_000 }); store = (await k.get(key)).value === v; await k.delete(key);
+  } catch { store = false; }
+  const ok = signing && store; return [ok ? 200 : 503, { ok, signing, store }];
+}
 async function handleGet(req: Request, d: Deps): Promise<Response> {
   if (req.method !== "GET") return send(501, { error: "unsupported method" });
   const env = d.env; const c = cfg(env); const rpc = d.rpc ?? makeRpc(c.RPC); const fac = d.fac ?? facClient(c.FAC, env);
@@ -201,6 +211,7 @@ async function handleGet(req: Request, d: Deps): Promise<Response> {
   if (path === "/openapi.json") return send(200, openapi(env), { "Cache-Control": "public, max-age=3600" });
   if (path === "/favicon.ico") return new Response(Uint8Array.from(atob(FAVICON_B64), (ch) => ch.charCodeAt(0)), { status: 200, headers: { ...HDRS, "Content-Type": "image/x-icon", "Cache-Control": "public, max-age=86400" } });
   if (path === "/.well-known/402index-verify.txt") return new Response(verifyToken(env), { status: 200, headers: { ...HDRS, "Content-Type": "text/plain; charset=utf-8" } });
+  if (path === "/healthz") return send(...await health(env), { "Cache-Control": "no-store" });
   if (path === "/llms.txt") return new Response(llmsTxt(env), { status: 200, headers: { ...HDRS, "Content-Type": "text/plain; charset=utf-8", "Cache-Control": "public, max-age=3600" } });
   if (path === "/.well-known/x402-preflight") {
     try { return send(200, await wellKnown(env)); } catch (e) { if (e instanceof SigningUnavailable) return send(503, { error: "signing key unavailable" }); throw e; }
@@ -351,8 +362,18 @@ async function paid(path: string, q: Record<string, string>, qs: string, sig: st
 }
 
 /** Behind a local reverse proxy (TRUST_PROXY=1) the peer is loopback; use the last X-Forwarded-For hop the proxy appended. */
+/** Loopback: 127.0.0.0/8, ::1, and IPv4-mapped ::ffff:127.x.x.x. */
+export function isLoopback(ip: string) {
+  const v = ip.toLowerCase().replace(/^\[|\]$/g, "");
+  if (v === "::1" || v === "0:0:0:0:0:0:0:1") return true;
+  const v4 = v.startsWith("::ffff:") ? v.slice(7) : v;
+  const m = /^127\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(v4);
+  return !!m && m.slice(1).every((x) => Number(x) <= 255);
+}
+/** Bind address: HOST if set, else loopback when behind a proxy, else all interfaces. */
+export const bindHost = (env: Deps["env"]) => env("HOST") ?? (env("TRUST_PROXY") === "1" ? "127.0.0.1" : "0.0.0.0");
 export function clientIp(req: Request, peer: string, env: Deps["env"]) {
-  if (env("TRUST_PROXY") !== "1" || !(peer === "127.0.0.1" || peer === "::1")) return peer;
+  if (env("TRUST_PROXY") !== "1" || !isLoopback(peer)) return peer;
   const hop = (req.headers.get("x-forwarded-for") ?? "").split(",").pop()?.trim() ?? "";
   return /^[0-9a-fA-F:.]{2,45}$/.test(hop) ? hop : peer;
 }
@@ -365,6 +386,6 @@ if (import.meta.main) {
   }
   for (const w of startupWarnings(env)) console.warn("WARNING:", w);
   assertOnchainMode(env); // refuse to start with ONCHAIN_CHECK=log on Base mainnet
-  Deno.serve({ hostname: env("HOST") ?? "0.0.0.0", port: Number(env("PORT") ?? 8000) },
+  Deno.serve({ hostname: bindHost(env), port: Number(env("PORT") ?? 8000) },
     (req, info) => handler(req, { env, ip: clientIp(req, (info.remoteAddr as Deno.NetAddr).hostname, env) }));
 }

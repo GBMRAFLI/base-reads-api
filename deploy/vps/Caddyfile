@@ -1,6 +1,10 @@
-# Temporary hostname via sslip.io (resolves to 89.116.220.218). To change: edit this line and PUBLIC_URL
-# in /etc/base-reads/env, then `systemctl reload caddy && systemctl restart base-reads`.
-89-116-220-218.sslip.io {
+# setup.sh replaces API_DOMAIN_PLACEHOLDER with $API_DOMAIN. After editing by hand: systemctl restart caddy
+# (the admin API is off, so `caddy reload` / `systemctl reload caddy` are not used).
+{
+	admin off
+}
+
+API_DOMAIN_PLACEHOLDER {
 	encode gzip
 	reverse_proxy 127.0.0.1:8000 {
 		header_up X-Forwarded-For {remote_host}

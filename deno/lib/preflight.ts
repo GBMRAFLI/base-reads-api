@@ -252,17 +252,24 @@ export async function listSnapMetas(): Promise<{ date: string; meta: SnapDateMet
   }
   return out.sort((a, b) => a.date.localeCompare(b.date));
 }
-/** Purge snap chunks for `date` from generations OLDER than the active `keepGen` (plus legacy flat keys).
- * Never touches the active gen or any newer gen (a save still in progress). keepGen null => nothing is purged. */
-export async function purgeOrphanGens(date: string, keepGen: number | string | null) {
+/** Grace period before a non-active gen may be purged: covers saves still in progress and clock step-backs. */
+export const GEN_PURGE_GRACE_MS = 60 * 60 * 1000;
+/** Creation time encoded in a string gen id; NaN for numeric (pre-id) gens. */
+export function genTime(g: number | string) { return typeof g === "string" ? Number(g.split("-")[0]) : NaN; }
+/** Purge snap chunks for `date` that are not the active `keepGen`: legacy flat keys and numeric gens always,
+ * string gens only once their id is older than GEN_PURGE_GRACE_MS (independent of ordering vs the active gen,
+ * so a clock step-back can neither delete an in-progress save nor keep a stale one forever). keepGen null => no-op. */
+export async function purgeOrphanGens(date: string, keepGen: number | string | null, now = Date.now()) {
   if (keepGen == null) return;
   const k = await kv();
   for await (const e of k.list({ prefix: ["snap", date] })) {
     const key = e.key;
     if (key.length === 3 && typeof key[2] === "number") { await k.delete(key); continue; } // legacy flat ["snap", date, i]
-    if (key.length >= 4 && (typeof key[2] === "number" || typeof key[2] === "string")) {
-      if (genOlder(key[2] as number | string, keepGen)) await k.delete(key);
-    }
+    if (key.length < 4) continue;
+    const g = key[2];
+    if (g === keepGen) continue;
+    if (typeof g === "number") { await k.delete(key); continue; }
+    if (typeof g === "string") { const t = genTime(g); if (!Number.isFinite(t) || now - t > GEN_PURGE_GRACE_MS) await k.delete(key); }
   }
 }
 /** Persist index via generationed chunks: write new gen, atomic flip snapdate, purge orphans. */
@@ -293,7 +300,7 @@ export async function saveIndex(idx: Index, _keep?: number, _skipRetention = fal
   if (_saveCrashAfterFlip) {
     const err = new Error("save_crash_after_flip"); (err as any).name = "SaveCrashAfterFlip"; throw err;
   }
-  // purge only gens older than the one just activated
+  // purge non-active gens past the grace period (recent ones may still be in progress)
   await purgeOrphanGens(idx.date, newGen);
   idxCache.delete(idx.date);
   return meta;

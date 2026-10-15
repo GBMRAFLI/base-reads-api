@@ -762,6 +762,7 @@ Deno.test("snapshot follow-ups: freshness, tiers 30/365, legacy, orphan purge, c
     tier: "full", status: "complete",
     coverage: { pages_fetched: 1, max_pages: 1, items_indexed: 8, bazaar_total: 8, complete: true, status: "complete", partial: false, failed_pages: [] } } as any);
   const keep = (await PF.readSnapMeta("2003-01-01"))!.gen!;
+  await PF.purgeOrphanGens("2003-01-01", keep, Date.now() + 2 * PF.GEN_PURGE_GRACE_MS); // past the grace period
   let orphan = 0;
   for await (const e of k.list({ prefix: ["snap", "2003-01-01"] })) {
     if (e.key.length >= 4 && e.key[2] !== keep) orphan++;
@@ -787,17 +788,24 @@ Deno.test("snapshot follow-ups: freshness, tiers 30/365, legacy, orphan purge, c
   assertEquals((await PF.loadIndex("2004-02-02")).listings, 22);
   for await (const e of k.list({ prefix: ["snap", "2004-02-02"] })) assertEquals(e.key[2], win.gen);
 
-  // L-a: orphan purge removes only older gens, never an in-progress newer gen
-  const active = win.gen as string;
-  const newer = PF.newGenId(Date.now() + 60_000);
-  await k.set(["snap", "2004-02-02", newer, 0], new Uint8Array([1]));
+  // L-a/L7: purge keeps the active gen and any gen younger than the grace period (in-progress, even if it sorts
+  // older after a clock step-back); removes numeric gens and string gens past the grace period.
+  const active = win.gen as string; const now = Date.now(); const G = PF.GEN_PURGE_GRACE_MS;
+  const newer = PF.newGenId(now + 60_000);
+  const steppedBack = PF.newGenId(now - 5 * 60_000); // sorts older than active, but recent
+  const stale = PF.newGenId(now - 2 * G);
+  const staleNewerThanActive = "zzz-malformed"; // sorts after every id, time not parseable => purgeable
+  for (const g of [newer, steppedBack, stale, staleNewerThanActive]) await k.set(["snap", "2004-02-02", g, 0], new Uint8Array([1]));
   await k.set(["snap", "2004-02-02", 5, 0], new Uint8Array([2])); // old numeric gen
-  await k.set(["snap", "2004-02-02", PF.newGenId(1), 0], new Uint8Array([3])); // old string gen
-  await PF.purgeOrphanGens("2004-02-02", active);
+  await PF.purgeOrphanGens("2004-02-02", active, now);
   const left: unknown[] = []; for await (const e of k.list({ prefix: ["snap", "2004-02-02"] })) left.push(e.key[2]);
-  assert(left.includes(newer)); assert(left.includes(active)); assertEquals(left.length, 1 + win.chunks);
+  assert(left.includes(newer)); assert(left.includes(active)); assert(left.includes(steppedBack));
+  assert(!left.includes(stale)); assert(!left.includes(staleNewerThanActive)); assert(!left.includes(5));
+  // later, past the grace period, everything but the active gen goes
+  await PF.purgeOrphanGens("2004-02-02", active, now + 3 * G);
+  const left2: unknown[] = []; for await (const e of k.list({ prefix: ["snap", "2004-02-02"] })) left2.push(e.key[2]);
+  assertEquals(new Set(left2), new Set([active]));
   await PF.purgeOrphanGens("2004-02-02", null); // null => no-op
-  assert((await k.get(["snap", "2004-02-02", newer, 0])).value);
   clearIndexCache();
 
   // Concurrent day gate
@@ -856,4 +864,26 @@ Deno.test("deploy/listings.json matches routes and ref rules", async () => {
   const { FREE_PATHS } = await import("../main.ts");
   assert(FREE_PATHS.has(v));
   for (const p of Object.values(L.discovery_paths) as string[]) assert(FREE_PATHS.has(p), p);
+});
+
+Deno.test("isLoopback / bindHost / clientIp with mapped and 127/8 peers", async () => {
+  const { isLoopback, bindHost, clientIp } = await import("../main.ts");
+  for (const ip of ["127.0.0.1", "127.1.2.3", "::1", "::ffff:127.0.0.1", "[::1]", "0:0:0:0:0:0:0:1"]) assert(isLoopback(ip), ip);
+  for (const ip of ["128.0.0.1", "10.0.0.1", "::ffff:10.0.0.1", "127.0.0.256", "::2", ""]) assert(!isLoopback(ip), ip);
+  const r = new Request("http://h/", { headers: { "x-forwarded-for": "203.0.113.9" } });
+  const on = (k: string) => k === "TRUST_PROXY" ? "1" : undefined;
+  assertEquals(clientIp(r, "::ffff:127.0.0.1", on), "203.0.113.9");
+  assertEquals(clientIp(r, "127.0.0.5", on), "203.0.113.9");
+  assertEquals([bindHost(on), bindHost(() => undefined), bindHost((k) => k === "HOST" ? "10.1.1.1" : on(k))], ["127.0.0.1", "0.0.0.0", "10.1.1.1"]);
+});
+
+Deno.test("/healthz: booleans only, 200 with key + KV, 503 without key", async () => {
+  const { handler } = await import("../main.ts");
+  const good = await handler(new Request("http://h/healthz"), { env });
+  assertEquals([good.status, await good.json()], [200, { ok: true, signing: true, store: true }]);
+  resetKey();
+  const bad = await handler(new Request("http://h/healthz"), { env: (k: string) => k.startsWith("SIGNING_KEY") ? undefined : env(k) });
+  const body = await bad.text(); resetKey();
+  assertEquals([bad.status, JSON.parse(body)], [503, { ok: false, signing: false, store: true }]);
+  assert(!body.includes(ENV.SIGNING_KEY_PASSPHRASE));
 });
