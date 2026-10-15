@@ -1,0 +1,13 @@
+# Replace API_DOMAIN with the final hostname; Caddy obtains and renews TLS automatically.
+API_DOMAIN {
+	encode gzip
+	reverse_proxy 127.0.0.1:8000 {
+		header_up X-Forwarded-For {remote_host}
+	}
+	log {
+		output file /var/log/caddy/base-reads.log {
+			roll_size 20MiB
+			roll_keep 5
+		}
+	}
+}

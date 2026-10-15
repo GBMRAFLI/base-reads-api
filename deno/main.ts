@@ -350,6 +350,13 @@ async function paid(path: string, q: Record<string, string>, qs: string, sig: st
 }
 }
 
+/** Behind a local reverse proxy (TRUST_PROXY=1) the peer is loopback; use the last X-Forwarded-For hop the proxy appended. */
+export function clientIp(req: Request, peer: string, env: Deps["env"]) {
+  if (env("TRUST_PROXY") !== "1" || !(peer === "127.0.0.1" || peer === "::1")) return peer;
+  const hop = (req.headers.get("x-forwarded-for") ?? "").split(",").pop()?.trim() ?? "";
+  return /^[0-9a-fA-F:.]{2,45}$/.test(hop) ? hop : peer;
+}
+
 if (import.meta.main) {
   const env = (k: string) => Deno.env.get(k);
   if ((env("SNAPSHOT_SCHEDULER") ?? "1") === "1") {
@@ -358,5 +365,6 @@ if (import.meta.main) {
   }
   for (const w of startupWarnings(env)) console.warn("WARNING:", w);
   assertOnchainMode(env); // refuse to start with ONCHAIN_CHECK=log on Base mainnet
-  Deno.serve({ port: Number(env("PORT") ?? 8000) }, (req, info) => handler(req, { env, ip: (info.remoteAddr as Deno.NetAddr).hostname }));
+  Deno.serve({ hostname: env("HOST") ?? "0.0.0.0", port: Number(env("PORT") ?? 8000) },
+    (req, info) => handler(req, { env, ip: clientIp(req, (info.remoteAddr as Deno.NetAddr).hostname, env) }));
 }

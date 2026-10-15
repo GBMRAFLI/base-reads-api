@@ -11,7 +11,7 @@ pinned: false
 # Base Reads (x402)
 
 Pay-per-call Base mainnet reads and signed pre-payment checks for x402 endpoints, via [x402](https://x402.org) v2
-(USDC on Base, `exact` scheme). Deterministic code only: no LLMs, no advice. Maintained by GBMRAFLI.
+(USDC on Base, `exact` scheme). Deterministic code only: no LLMs, no advice.
 
 ## Paid routes (GET)
 

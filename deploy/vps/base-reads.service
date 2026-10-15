@@ -1,0 +1,42 @@
+[Unit]
+Description=Base Reads API (Deno)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=basereads
+Group=basereads
+WorkingDirectory=/opt/base-reads/app/deno
+EnvironmentFile=/etc/base-reads/env
+# deno.json enables the kv + cron unstable APIs; flags repeated for clarity.
+ExecStart=/usr/local/bin/deno run --unstable-kv --unstable-cron --cached-only \
+  --allow-net --allow-env --allow-read=/opt/base-reads,/var/lib/base-reads \
+  --allow-write=/var/lib/base-reads main.ts
+Restart=always
+RestartSec=3
+MemoryMax=600M
+MemoryHigh=450M
+Environment=DENO_DIR=/opt/base-reads/deno-cache
+Environment=DENO_NO_UPDATE_CHECK=1
+StateDirectory=base-reads
+StateDirectoryMode=0750
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/base-reads
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictNamespaces=true
+LockPersonality=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target

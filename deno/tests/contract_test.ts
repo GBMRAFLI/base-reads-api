@@ -793,3 +793,14 @@ Deno.test("snapshot follow-ups: freshness, tiers 30/365, legacy, orphan purge, c
   await wipeSnaps(k);
 });
 
+
+Deno.test("clientIp: proxy header only trusted from loopback with TRUST_PROXY=1", async () => {
+  const { clientIp } = await import("../main.ts");
+  const r = new Request("http://h/", { headers: { "x-forwarded-for": "6.6.6.6, 203.0.113.9" } });
+  const on = (k: string) => k === "TRUST_PROXY" ? "1" : undefined;
+  if (clientIp(r, "127.0.0.1", on) !== "203.0.113.9") throw new Error("last hop");
+  if (clientIp(r, "198.51.100.1", on) !== "198.51.100.1") throw new Error("non-loopback peer");
+  if (clientIp(r, "127.0.0.1", () => undefined) !== "127.0.0.1") throw new Error("flag off");
+  const bad = new Request("http://h/", { headers: { "x-forwarded-for": "evil<>" } });
+  if (clientIp(bad, "127.0.0.1", on) !== "127.0.0.1") throw new Error("garbage");
+});
