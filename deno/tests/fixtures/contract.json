@@ -1,0 +1,251 @@
+{
+ "canonical": "{\"_\":\"\",\"a\":{\"A\":-5,\"z\":0},\"b\":[1,null,true,\"\\u00e9\\u2028\\ud83d\\ude00\\\"\\\\\\n\\t\\u0001\"]}",
+ "index": {
+  "date": "2026-10-13",
+  "hosts": {
+   "a.example": 1,
+   "b.example": 1
+  },
+  "listings": 3,
+  "resources": {
+   "https://a.example/x": {
+    "calls30d": 9,
+    "lastCalledAt": "2026-10-13T00:00:00Z",
+    "payTo": [
+     "0xabababababababababababababababababababab",
+     "0xcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd"
+    ],
+    "payers30d": 3
+   },
+   "https://b.example/y": {
+    "calls30d": null,
+    "lastCalledAt": null,
+    "payTo": [
+     "0xabababababababababababababababababababab"
+    ],
+    "payers30d": null
+   }
+  },
+  "wallet_hosts": {
+   "0xabababababababababababababababababababab": [
+    "a.example",
+    "b.example"
+   ],
+   "0xcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd": [
+    "a.example"
+   ]
+  }
+ },
+ "req_for": {
+  "/base/address-intel": {
+   "amount": "5000",
+   "asset": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
+   "extra": {
+    "name": "USD Coin",
+    "version": "2"
+   },
+   "maxTimeoutSeconds": 120,
+   "network": "eip155:8453",
+   "payTo": "0x427F423908233DbCA2C51e4c6AE36D18f821641c",
+   "scheme": "exact"
+  },
+  "/base/basename": {
+   "amount": "3000",
+   "asset": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
+   "extra": {
+    "name": "USD Coin",
+    "version": "2"
+   },
+   "maxTimeoutSeconds": 120,
+   "network": "eip155:8453",
+   "payTo": "0x427F423908233DbCA2C51e4c6AE36D18f821641c",
+   "scheme": "exact"
+  },
+  "/base/network": {
+   "amount": "1000",
+   "asset": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
+   "extra": {
+    "name": "USD Coin",
+    "version": "2"
+   },
+   "maxTimeoutSeconds": 120,
+   "network": "eip155:8453",
+   "payTo": "0x427F423908233DbCA2C51e4c6AE36D18f821641c",
+   "scheme": "exact"
+  },
+  "/base/tx-status": {
+   "amount": "2000",
+   "asset": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
+   "extra": {
+    "name": "USD Coin",
+    "version": "2"
+   },
+   "maxTimeoutSeconds": 120,
+   "network": "eip155:8453",
+   "payTo": "0x427F423908233DbCA2C51e4c6AE36D18f821641c",
+   "scheme": "exact"
+  },
+  "/base/usdc-balance": {
+   "amount": "1000",
+   "asset": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
+   "extra": {
+    "name": "USD Coin",
+    "version": "2"
+   },
+   "maxTimeoutSeconds": 120,
+   "network": "eip155:8453",
+   "payTo": "0x427F423908233DbCA2C51e4c6AE36D18f821641c",
+   "scheme": "exact"
+  },
+  "/x402/preflight": {
+   "amount": "1000",
+   "asset": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
+   "extra": {
+    "name": "USD Coin",
+    "version": "2"
+   },
+   "maxTimeoutSeconds": 120,
+   "network": "eip155:8453",
+   "payTo": "0x427F423908233DbCA2C51e4c6AE36D18f821641c",
+   "scheme": "exact"
+  }
+ },
+ "required": {
+  "/base/address-intel": {
+   "body": "{\"x402Version\": 2, \"error\": \"PAYMENT-SIGNATURE header is required\", \"resource\": {\"url\": \"https://h.example/base/address-intel\", \"description\": \"One call: Base USDC balance, ETH balance, verified primary Basename, tx count (nonce) and is_contract for an address. Query: ?address=0x...\", \"mimeType\": \"application/json\"}, \"accepts\": [{\"scheme\": \"exact\", \"network\": \"eip155:8453\", \"amount\": \"5000\", \"asset\": \"0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913\", \"payTo\": \"0x427F423908233DbCA2C51e4c6AE36D18f821641c\", \"maxTimeoutSeconds\": 120, \"extra\": {\"name\": \"USD Coin\", \"version\": \"2\"}}], \"extensions\": {\"bazaar\": {\"info\": {\"input\": {\"type\": \"http\", \"method\": \"GET\", \"queryParams\": {\"address\": \"0x2211d1d0020daea8039e46cf1367962070d77da9\"}}, \"output\": {\"type\": \"json\"}}, \"discoverable\": true}}}",
+   "header": "eyJ4NDAyVmVyc2lvbiI6IDIsICJlcnJvciI6ICJQQVlNRU5ULVNJR05BVFVSRSBoZWFkZXIgaXMgcmVxdWlyZWQiLCAicmVzb3VyY2UiOiB7InVybCI6ICJodHRwczovL2guZXhhbXBsZS9iYXNlL2FkZHJlc3MtaW50ZWwiLCAiZGVzY3JpcHRpb24iOiAiT25lIGNhbGw6IEJhc2UgVVNEQyBiYWxhbmNlLCBFVEggYmFsYW5jZSwgdmVyaWZpZWQgcHJpbWFyeSBCYXNlbmFtZSwgdHggY291bnQgKG5vbmNlKSBhbmQgaXNfY29udHJhY3QgZm9yIGFuIGFkZHJlc3MuIFF1ZXJ5OiA/YWRkcmVzcz0weC4uLiIsICJtaW1lVHlwZSI6ICJhcHBsaWNhdGlvbi9qc29uIn0sICJhY2NlcHRzIjogW3sic2NoZW1lIjogImV4YWN0IiwgIm5ldHdvcmsiOiAiZWlwMTU1Ojg0NTMiLCAiYW1vdW50IjogIjUwMDAiLCAiYXNzZXQiOiAiMHg4MzM1ODlmQ0Q2ZURiNkUwOGY0YzdDMzJENGY3MWI1NGJkQTAyOTEzIiwgInBheVRvIjogIjB4NDI3RjQyMzkwODIzM0RiQ0EyQzUxZTRjNkFFMzZEMThmODIxNjQxYyIsICJtYXhUaW1lb3V0U2Vjb25kcyI6IDEyMCwgImV4dHJhIjogeyJuYW1lIjogIlVTRCBDb2luIiwgInZlcnNpb24iOiAiMiJ9fV0sICJleHRlbnNpb25zIjogeyJiYXphYXIiOiB7ImluZm8iOiB7ImlucHV0IjogeyJ0eXBlIjogImh0dHAiLCAibWV0aG9kIjogIkdFVCIsICJxdWVyeVBhcmFtcyI6IHsiYWRkcmVzcyI6ICIweDIyMTFkMWQwMDIwZGFlYTgwMzllNDZjZjEzNjc5NjIwNzBkNzdkYTkifX0sICJvdXRwdXQiOiB7InR5cGUiOiAianNvbiJ9fSwgImRpc2NvdmVyYWJsZSI6IHRydWV9fX0="
+  },
+  "/base/basename": {
+   "body": "{\"x402Version\": 2, \"error\": \"PAYMENT-SIGNATURE header is required\", \"resource\": {\"url\": \"https://h.example/base/basename\", \"description\": \"Resolve a Basename (name.base.eth) to its Base address, or an address to its primary Basename. Query: ?name=jesse.base.eth or ?address=0x...\", \"mimeType\": \"application/json\"}, \"accepts\": [{\"scheme\": \"exact\", \"network\": \"eip155:8453\", \"amount\": \"3000\", \"asset\": \"0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913\", \"payTo\": \"0x427F423908233DbCA2C51e4c6AE36D18f821641c\", \"maxTimeoutSeconds\": 120, \"extra\": {\"name\": \"USD Coin\", \"version\": \"2\"}}], \"extensions\": {\"bazaar\": {\"info\": {\"input\": {\"type\": \"http\", \"method\": \"GET\", \"queryParams\": {\"name\": \"jesse.base.eth\"}}, \"output\": {\"type\": \"json\"}}, \"discoverable\": true}}}",
+   "header": "eyJ4NDAyVmVyc2lvbiI6IDIsICJlcnJvciI6ICJQQVlNRU5ULVNJR05BVFVSRSBoZWFkZXIgaXMgcmVxdWlyZWQiLCAicmVzb3VyY2UiOiB7InVybCI6ICJodHRwczovL2guZXhhbXBsZS9iYXNlL2Jhc2VuYW1lIiwgImRlc2NyaXB0aW9uIjogIlJlc29sdmUgYSBCYXNlbmFtZSAobmFtZS5iYXNlLmV0aCkgdG8gaXRzIEJhc2UgYWRkcmVzcywgb3IgYW4gYWRkcmVzcyB0byBpdHMgcHJpbWFyeSBCYXNlbmFtZS4gUXVlcnk6ID9uYW1lPWplc3NlLmJhc2UuZXRoIG9yID9hZGRyZXNzPTB4Li4uIiwgIm1pbWVUeXBlIjogImFwcGxpY2F0aW9uL2pzb24ifSwgImFjY2VwdHMiOiBbeyJzY2hlbWUiOiAiZXhhY3QiLCAibmV0d29yayI6ICJlaXAxNTU6ODQ1MyIsICJhbW91bnQiOiAiMzAwMCIsICJhc3NldCI6ICIweDgzMzU4OWZDRDZlRGI2RTA4ZjRjN0MzMkQ0ZjcxYjU0YmRBMDI5MTMiLCAicGF5VG8iOiAiMHg0MjdGNDIzOTA4MjMzRGJDQTJDNTFlNGM2QUUzNkQxOGY4MjE2NDFjIiwgIm1heFRpbWVvdXRTZWNvbmRzIjogMTIwLCAiZXh0cmEiOiB7Im5hbWUiOiAiVVNEIENvaW4iLCAidmVyc2lvbiI6ICIyIn19XSwgImV4dGVuc2lvbnMiOiB7ImJhemFhciI6IHsiaW5mbyI6IHsiaW5wdXQiOiB7InR5cGUiOiAiaHR0cCIsICJtZXRob2QiOiAiR0VUIiwgInF1ZXJ5UGFyYW1zIjogeyJuYW1lIjogImplc3NlLmJhc2UuZXRoIn19LCAib3V0cHV0IjogeyJ0eXBlIjogImpzb24ifX0sICJkaXNjb3ZlcmFibGUiOiB0cnVlfX19"
+  },
+  "/base/network": {
+   "body": "{\"x402Version\": 2, \"error\": \"PAYMENT-SIGNATURE header is required\", \"resource\": {\"url\": \"https://h.example/base/network\", \"description\": \"Base mainnet head: block number, block age seconds, base fee and gas price in gwei.\", \"mimeType\": \"application/json\"}, \"accepts\": [{\"scheme\": \"exact\", \"network\": \"eip155:8453\", \"amount\": \"1000\", \"asset\": \"0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913\", \"payTo\": \"0x427F423908233DbCA2C51e4c6AE36D18f821641c\", \"maxTimeoutSeconds\": 120, \"extra\": {\"name\": \"USD Coin\", \"version\": \"2\"}}], \"extensions\": {\"bazaar\": {\"info\": {\"input\": {\"type\": \"http\", \"method\": \"GET\", \"queryParams\": {}}, \"output\": {\"type\": \"json\"}}, \"discoverable\": true}}}",
+   "header": "eyJ4NDAyVmVyc2lvbiI6IDIsICJlcnJvciI6ICJQQVlNRU5ULVNJR05BVFVSRSBoZWFkZXIgaXMgcmVxdWlyZWQiLCAicmVzb3VyY2UiOiB7InVybCI6ICJodHRwczovL2guZXhhbXBsZS9iYXNlL25ldHdvcmsiLCAiZGVzY3JpcHRpb24iOiAiQmFzZSBtYWlubmV0IGhlYWQ6IGJsb2NrIG51bWJlciwgYmxvY2sgYWdlIHNlY29uZHMsIGJhc2UgZmVlIGFuZCBnYXMgcHJpY2UgaW4gZ3dlaS4iLCAibWltZVR5cGUiOiAiYXBwbGljYXRpb24vanNvbiJ9LCAiYWNjZXB0cyI6IFt7InNjaGVtZSI6ICJleGFjdCIsICJuZXR3b3JrIjogImVpcDE1NTo4NDUzIiwgImFtb3VudCI6ICIxMDAwIiwgImFzc2V0IjogIjB4ODMzNTg5ZkNENmVEYjZFMDhmNGM3QzMyRDRmNzFiNTRiZEEwMjkxMyIsICJwYXlUbyI6ICIweDQyN0Y0MjM5MDgyMzNEYkNBMkM1MWU0YzZBRTM2RDE4ZjgyMTY0MWMiLCAibWF4VGltZW91dFNlY29uZHMiOiAxMjAsICJleHRyYSI6IHsibmFtZSI6ICJVU0QgQ29pbiIsICJ2ZXJzaW9uIjogIjIifX1dLCAiZXh0ZW5zaW9ucyI6IHsiYmF6YWFyIjogeyJpbmZvIjogeyJpbnB1dCI6IHsidHlwZSI6ICJodHRwIiwgIm1ldGhvZCI6ICJHRVQiLCAicXVlcnlQYXJhbXMiOiB7fX0sICJvdXRwdXQiOiB7InR5cGUiOiAianNvbiJ9fSwgImRpc2NvdmVyYWJsZSI6IHRydWV9fX0="
+  },
+  "/base/tx-status": {
+   "body": "{\"x402Version\": 2, \"error\": \"PAYMENT-SIGNATURE header is required\", \"resource\": {\"url\": \"https://h.example/base/tx-status\", \"description\": \"Base mainnet transaction status: success/failed/pending, block, confirmations, gas used, from/to. Query: ?hash=0x...\", \"mimeType\": \"application/json\"}, \"accepts\": [{\"scheme\": \"exact\", \"network\": \"eip155:8453\", \"amount\": \"2000\", \"asset\": \"0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913\", \"payTo\": \"0x427F423908233DbCA2C51e4c6AE36D18f821641c\", \"maxTimeoutSeconds\": 120, \"extra\": {\"name\": \"USD Coin\", \"version\": \"2\"}}], \"extensions\": {\"bazaar\": {\"info\": {\"input\": {\"type\": \"http\", \"method\": \"GET\", \"queryParams\": {\"hash\": \"0x0000000000000000000000000000000000000000000000000000000000000000\"}}, \"output\": {\"type\": \"json\"}}, \"discoverable\": true}}}",
+   "header": "eyJ4NDAyVmVyc2lvbiI6IDIsICJlcnJvciI6ICJQQVlNRU5ULVNJR05BVFVSRSBoZWFkZXIgaXMgcmVxdWlyZWQiLCAicmVzb3VyY2UiOiB7InVybCI6ICJodHRwczovL2guZXhhbXBsZS9iYXNlL3R4LXN0YXR1cyIsICJkZXNjcmlwdGlvbiI6ICJCYXNlIG1haW5uZXQgdHJhbnNhY3Rpb24gc3RhdHVzOiBzdWNjZXNzL2ZhaWxlZC9wZW5kaW5nLCBibG9jaywgY29uZmlybWF0aW9ucywgZ2FzIHVzZWQsIGZyb20vdG8uIFF1ZXJ5OiA/aGFzaD0weC4uLiIsICJtaW1lVHlwZSI6ICJhcHBsaWNhdGlvbi9qc29uIn0sICJhY2NlcHRzIjogW3sic2NoZW1lIjogImV4YWN0IiwgIm5ldHdvcmsiOiAiZWlwMTU1Ojg0NTMiLCAiYW1vdW50IjogIjIwMDAiLCAiYXNzZXQiOiAiMHg4MzM1ODlmQ0Q2ZURiNkUwOGY0YzdDMzJENGY3MWI1NGJkQTAyOTEzIiwgInBheVRvIjogIjB4NDI3RjQyMzkwODIzM0RiQ0EyQzUxZTRjNkFFMzZEMThmODIxNjQxYyIsICJtYXhUaW1lb3V0U2Vjb25kcyI6IDEyMCwgImV4dHJhIjogeyJuYW1lIjogIlVTRCBDb2luIiwgInZlcnNpb24iOiAiMiJ9fV0sICJleHRlbnNpb25zIjogeyJiYXphYXIiOiB7ImluZm8iOiB7ImlucHV0IjogeyJ0eXBlIjogImh0dHAiLCAibWV0aG9kIjogIkdFVCIsICJxdWVyeVBhcmFtcyI6IHsiaGFzaCI6ICIweDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAifX0sICJvdXRwdXQiOiB7InR5cGUiOiAianNvbiJ9fSwgImRpc2NvdmVyYWJsZSI6IHRydWV9fX0="
+  },
+  "/base/usdc-balance": {
+   "body": "{\"x402Version\": 2, \"error\": \"PAYMENT-SIGNATURE header is required\", \"resource\": {\"url\": \"https://h.example/base/usdc-balance\", \"description\": \"Base mainnet USDC + ETH balance for any address (live eth_call). Query: ?address=0x...\", \"mimeType\": \"application/json\"}, \"accepts\": [{\"scheme\": \"exact\", \"network\": \"eip155:8453\", \"amount\": \"1000\", \"asset\": \"0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913\", \"payTo\": \"0x427F423908233DbCA2C51e4c6AE36D18f821641c\", \"maxTimeoutSeconds\": 120, \"extra\": {\"name\": \"USD Coin\", \"version\": \"2\"}}], \"extensions\": {\"bazaar\": {\"info\": {\"input\": {\"type\": \"http\", \"method\": \"GET\", \"queryParams\": {\"address\": \"0x4200000000000000000000000000000000000016\"}}, \"output\": {\"type\": \"json\"}}, \"discoverable\": true}}}",
+   "header": "eyJ4NDAyVmVyc2lvbiI6IDIsICJlcnJvciI6ICJQQVlNRU5ULVNJR05BVFVSRSBoZWFkZXIgaXMgcmVxdWlyZWQiLCAicmVzb3VyY2UiOiB7InVybCI6ICJodHRwczovL2guZXhhbXBsZS9iYXNlL3VzZGMtYmFsYW5jZSIsICJkZXNjcmlwdGlvbiI6ICJCYXNlIG1haW5uZXQgVVNEQyArIEVUSCBiYWxhbmNlIGZvciBhbnkgYWRkcmVzcyAobGl2ZSBldGhfY2FsbCkuIFF1ZXJ5OiA/YWRkcmVzcz0weC4uLiIsICJtaW1lVHlwZSI6ICJhcHBsaWNhdGlvbi9qc29uIn0sICJhY2NlcHRzIjogW3sic2NoZW1lIjogImV4YWN0IiwgIm5ldHdvcmsiOiAiZWlwMTU1Ojg0NTMiLCAiYW1vdW50IjogIjEwMDAiLCAiYXNzZXQiOiAiMHg4MzM1ODlmQ0Q2ZURiNkUwOGY0YzdDMzJENGY3MWI1NGJkQTAyOTEzIiwgInBheVRvIjogIjB4NDI3RjQyMzkwODIzM0RiQ0EyQzUxZTRjNkFFMzZEMThmODIxNjQxYyIsICJtYXhUaW1lb3V0U2Vjb25kcyI6IDEyMCwgImV4dHJhIjogeyJuYW1lIjogIlVTRCBDb2luIiwgInZlcnNpb24iOiAiMiJ9fV0sICJleHRlbnNpb25zIjogeyJiYXphYXIiOiB7ImluZm8iOiB7ImlucHV0IjogeyJ0eXBlIjogImh0dHAiLCAibWV0aG9kIjogIkdFVCIsICJxdWVyeVBhcmFtcyI6IHsiYWRkcmVzcyI6ICIweDQyMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMTYifX0sICJvdXRwdXQiOiB7InR5cGUiOiAianNvbiJ9fSwgImRpc2NvdmVyYWJsZSI6IHRydWV9fX0="
+  },
+  "/x402/preflight": {
+   "body": "{\"x402Version\": 2, \"error\": \"PAYMENT-SIGNATURE header is required\", \"resource\": {\"url\": \"https://h.example/x402/preflight\", \"description\": \"Pre-pay Check: Ed25519-signed deterministic facts about an x402 endpoint before you pay it: challenge validity, reachability and latency, host listing count, payout wallet reuse across hosts, last-called and payer trend from Bazaar snapshots. Facts only, no advice. Query: ?url=https://...\", \"mimeType\": \"application/json\"}, \"accepts\": [{\"scheme\": \"exact\", \"network\": \"eip155:8453\", \"amount\": \"1000\", \"asset\": \"0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913\", \"payTo\": \"0x427F423908233DbCA2C51e4c6AE36D18f821641c\", \"maxTimeoutSeconds\": 120, \"extra\": {\"name\": \"USD Coin\", \"version\": \"2\"}}], \"extensions\": {\"bazaar\": {\"info\": {\"input\": {\"type\": \"http\", \"method\": \"GET\", \"queryParams\": {\"url\": \"https://api.example.com/paid\"}}, \"output\": {\"type\": \"json\"}}, \"discoverable\": true}}}",
+   "header": "eyJ4NDAyVmVyc2lvbiI6IDIsICJlcnJvciI6ICJQQVlNRU5ULVNJR05BVFVSRSBoZWFkZXIgaXMgcmVxdWlyZWQiLCAicmVzb3VyY2UiOiB7InVybCI6ICJodHRwczovL2guZXhhbXBsZS94NDAyL3ByZWZsaWdodCIsICJkZXNjcmlwdGlvbiI6ICJQcmUtcGF5IENoZWNrOiBFZDI1NTE5LXNpZ25lZCBkZXRlcm1pbmlzdGljIGZhY3RzIGFib3V0IGFuIHg0MDIgZW5kcG9pbnQgYmVmb3JlIHlvdSBwYXkgaXQ6IGNoYWxsZW5nZSB2YWxpZGl0eSwgcmVhY2hhYmlsaXR5IGFuZCBsYXRlbmN5LCBob3N0IGxpc3RpbmcgY291bnQsIHBheW91dCB3YWxsZXQgcmV1c2UgYWNyb3NzIGhvc3RzLCBsYXN0LWNhbGxlZCBhbmQgcGF5ZXIgdHJlbmQgZnJvbSBCYXphYXIgc25hcHNob3RzLiBGYWN0cyBvbmx5LCBubyBhZHZpY2UuIFF1ZXJ5OiA/dXJsPWh0dHBzOi8vLi4uIiwgIm1pbWVUeXBlIjogImFwcGxpY2F0aW9uL2pzb24ifSwgImFjY2VwdHMiOiBbeyJzY2hlbWUiOiAiZXhhY3QiLCAibmV0d29yayI6ICJlaXAxNTU6ODQ1MyIsICJhbW91bnQiOiAiMTAwMCIsICJhc3NldCI6ICIweDgzMzU4OWZDRDZlRGI2RTA4ZjRjN0MzMkQ0ZjcxYjU0YmRBMDI5MTMiLCAicGF5VG8iOiAiMHg0MjdGNDIzOTA4MjMzRGJDQTJDNTFlNGM2QUUzNkQxOGY4MjE2NDFjIiwgIm1heFRpbWVvdXRTZWNvbmRzIjogMTIwLCAiZXh0cmEiOiB7Im5hbWUiOiAiVVNEIENvaW4iLCAidmVyc2lvbiI6ICIyIn19XSwgImV4dGVuc2lvbnMiOiB7ImJhemFhciI6IHsiaW5mbyI6IHsiaW5wdXQiOiB7InR5cGUiOiAiaHR0cCIsICJtZXRob2QiOiAiR0VUIiwgInF1ZXJ5UGFyYW1zIjogeyJ1cmwiOiAiaHR0cHM6Ly9hcGkuZXhhbXBsZS5jb20vcGFpZCJ9fSwgIm91dHB1dCI6IHsidHlwZSI6ICJqc29uIn19LCAiZGlzY292ZXJhYmxlIjogdHJ1ZX19fQ=="
+  }
+ },
+ "rid": [
+  "exec-9335c22298f3",
+  "cand-2bad78663b83",
+  "out-265d78e731d8"
+ ],
+ "root_body": "{\"service\": \"GBMRAFLI Base Reads\", \"network\": \"eip155:8453\", \"protocol\": \"x402 v2\", \"routes\": {\"/base/usdc-balance\": {\"price_usdc\": 0.001, \"description\": \"Base mainnet USDC + ETH balance for any address (live eth_call). Query: ?address=0x...\"}, \"/base/tx-status\": {\"price_usdc\": 0.002, \"description\": \"Base mainnet transaction status: success/failed/pending, block, confirmations, gas used, from/to. Query: ?hash=0x...\"}, \"/base/basename\": {\"price_usdc\": 0.003, \"description\": \"Resolve a Basename (name.base.eth) to its Base address, or an address to its primary Basename. Query: ?name=jesse.base.eth or ?address=0x...\"}, \"/base/address-intel\": {\"price_usdc\": 0.005, \"description\": \"One call: Base USDC balance, ETH balance, verified primary Basename, tx count (nonce) and is_contract for an address. Query: ?address=0x...\"}, \"/x402/preflight\": {\"price_usdc\": 0.001, \"description\": \"Pre-pay Check: Ed25519-signed deterministic facts about an x402 endpoint before you pay it: challenge validity, reachability and latency, host listing count, payout wallet reuse across hosts, last-called and payer trend from Bazaar snapshots. Facts only, no advice. Query: ?url=https://...\"}, \"/base/network\": {\"price_usdc\": 0.001, \"description\": \"Base mainnet head: block number, block age seconds, base fee and gas price in gwei.\"}}}",
+ "routes": [
+  [
+   "/base/usdc-balance",
+   1000,
+   "Base mainnet USDC + ETH balance for any address (live eth_call). Query: ?address=0x...",
+   {
+    "address": "0x4200000000000000000000000000000000000016"
+   }
+  ],
+  [
+   "/base/tx-status",
+   2000,
+   "Base mainnet transaction status: success/failed/pending, block, confirmations, gas used, from/to. Query: ?hash=0x...",
+   {
+    "hash": "0x0000000000000000000000000000000000000000000000000000000000000000"
+   }
+  ],
+  [
+   "/base/basename",
+   3000,
+   "Resolve a Basename (name.base.eth) to its Base address, or an address to its primary Basename. Query: ?name=jesse.base.eth or ?address=0x...",
+   {
+    "name": "jesse.base.eth"
+   }
+  ],
+  [
+   "/base/address-intel",
+   5000,
+   "One call: Base USDC balance, ETH balance, verified primary Basename, tx count (nonce) and is_contract for an address. Query: ?address=0x...",
+   {
+    "address": "0x2211d1d0020daea8039e46cf1367962070d77da9"
+   }
+  ],
+  [
+   "/x402/preflight",
+   1000,
+   "Pre-pay Check: Ed25519-signed deterministic facts about an x402 endpoint before you pay it: challenge validity, reachability and latency, host listing count, payout wallet reuse across hosts, last-called and payer trend from Bazaar snapshots. Facts only, no advice. Query: ?url=https://...",
+   {
+    "url": "https://api.example.com/paid"
+   }
+  ],
+  [
+   "/base/network",
+   1000,
+   "Base mainnet head: block number, block age seconds, base fee and gas price in gwei.",
+   {}
+  ]
+ ],
+ "validate": [
+  [
+   true,
+   [],
+   [
+    {
+     "amount": "10",
+     "asset": "0x1111111111111111111111111111111111111111",
+     "network": "n",
+     "payTo": "0x2222222222222222222222222222222222222222",
+     "scheme": "exact"
+    }
+   ]
+  ],
+  [
+   false,
+   [
+    "no_402_challenge"
+   ],
+   []
+  ],
+  [
+   false,
+   [
+    "challenge_body_not_json"
+   ],
+   []
+  ],
+  [
+   false,
+   [
+    "unknown_x402Version",
+    "accepts[0].scheme_invalid",
+    "accepts[0].network_invalid",
+    "accepts[0].amount_invalid",
+    "accepts[0].asset_invalid",
+    "accepts[0].payTo_invalid",
+    "accepts[0].maxTimeoutSeconds_invalid",
+    "accepts[1]_not_object"
+   ],
+   [
+    {
+     "amount": "1.5",
+     "asset": null,
+     "network": null,
+     "payTo": "0xbad",
+     "scheme": null
+    }
+   ]
+  ],
+  [
+   false,
+   [
+    "accepts_missing_or_empty"
+   ],
+   []
+  ]
+ ]
+}

@@ -1,0 +1,42 @@
+name: tests
+on: [push, pull_request]
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: {python-version: "3.13"}
+      - run: pip install -r requirements.txt
+      - run: python tests/test_preflight.py
+  docker-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker build -t base-reads .
+      - name: run container with throwaway secrets (never real ones)
+        run: |
+          PASS=$(python3 -c "import secrets;print(secrets.token_hex(16))")
+          TOK=$(python3 -c "import secrets;print(secrets.token_hex(24))")
+          echo "::add-mask::$PASS"; echo "::add-mask::$TOK"
+          echo "TOK=$TOK" >> $GITHUB_ENV
+          docker run -d --name app -p 7860:7860 -e SNAPSHOT_SCHEDULER=0 -e SIGNING_KEY_PASSPHRASE=$PASS -e EXPORT_TOKEN=$TOK base-reads
+          for i in $(seq 1 30); do curl -sf localhost:7860/ >/dev/null && break; sleep 1; done
+      - name: smoke
+        run: |
+          curl -sf localhost:7860/ | python3 -c "import json,sys;d=json.load(sys.stdin);assert '/x402/preflight' in d['routes'] and '/base/network' in d['routes']"
+          test "$(curl -s -o /dev/null -w '%{http_code}' 'localhost:7860/x402/preflight?url=https://example.com')" = 402
+          curl -s -D - -o /dev/null 'localhost:7860/base/network' | grep -qi '^payment-required:'
+          curl -sf localhost:7860/x402/preflight/pubkey | python3 -c "import json,sys;assert json.load(sys.stdin)['alg']=='Ed25519'"
+          test "$(curl -s -o /dev/null -w '%{http_code}' localhost:7860/internal/export)" = 401
+          test "$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $TOK" localhost:7860/internal/export)" = 200
+          docker logs app 2>&1 | tail -5
+  deno:
+    runs-on: ubuntu-latest
+    defaults: {run: {working-directory: deno}}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: denoland/setup-deno@v2
+        with: {deno-version: v2.x}
+      - run: deno check main.ts
+      - run: deno test -A tests/

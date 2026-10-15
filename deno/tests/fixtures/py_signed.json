@@ -1,0 +1,58 @@
+{
+ "_note": "THROWAWAY TEST KEY. Passphrase is public on purpose. Never use in production.",
+ "passphrase": "TEST-ONLY-passphrase-not-a-secret",
+ "enc_b64": "LS0tLS1CRUdJTiBFTkNSWVBURUQgUFJJVkFURSBLRVktLS0tLQpNSUdUTUU4R0NTcUdTSWIzRFFFRkRUQkNNQ0VHQ1NzR0FRUUIya2NFQ3pBVUJBZ1pMT1F0aXU1ZUJRSUNRQUFDCkFRZ0NBUUV3SFFZSllJWklBV1VEQkFFcUJCRHdaOFIrS0dtbS8ralNOazJ0UGpVRkJFQ05mNlFZUFhsK3pqMkUKTXdIQU5MZXU0MEtoQ3dMYVcxUEFKTkpmUDhVY3kvY3VjVURmTEZVUVI1Z2h6SUpkQ1JqRFBWUWFuZGZHK0Vudwozd21scFF3ZwotLS0tLUVORCBFTkNSWVBURUQgUFJJVkFURSBLRVktLS0tLQ==",
+ "pubkey": {
+  "alg": "Ed25519",
+  "public_key_b64": "0Z5G5ZUMV5bxHFT5/Mui+r1/e2VrZoFMygMNSrmr8sQ=",
+  "key_id": "440838273608fa36"
+ },
+ "envelope": {
+  "facts": {
+   "schema": "prepay-check/v1",
+   "target": "https://ex.example/p?q=\u00fc&x=\"1\"\n",
+   "checked_at": "2026-10-14T00:00:00Z",
+   "disclaimer": "Deterministic observations only. Not advice to pay, buy or sell.",
+   "reachability": {
+    "reachable": true,
+    "http_status": 402,
+    "latency_ms": 42
+   },
+   "challenge": {
+    "valid": true,
+    "problems": [],
+    "accepts": [
+     {
+      "scheme": "exact",
+      "network": "eip155:8453",
+      "amount": "1000",
+      "asset": "0x1111111111111111111111111111111111111111",
+      "payTo": "0x2222222222222222222222222222222222222222"
+     }
+    ]
+   },
+   "bazaar": {
+    "available": true,
+    "listed": false,
+    "last_called_at": null,
+    "payer_trend": [
+     {
+      "snapshot": "2026-10-13",
+      "payers30d": null,
+      "calls30d": 5
+     }
+    ],
+    "Zkey": 1,
+    "akey": "\u65e5\u672c\ud83d\ude00"
+   }
+  },
+  "signature": {
+   "alg": "Ed25519",
+   "key_id": "440838273608fa36",
+   "public_key_b64": "0Z5G5ZUMV5bxHFT5/Mui+r1/e2VrZoFMygMNSrmr8sQ=",
+   "value_b64": "vZB5w389oMDNW+FObMmBalCaSeus0Z3t5k8qu3pplqU7DvNPMgUD53UMVyF8gBLAjpaf9BoNQf/y+DvQdhQ8BA==",
+   "signed_over": "canonical JSON of facts (sorted keys, no whitespace)"
+  }
+ },
+ "canonical": "{\"bazaar\":{\"Zkey\":1,\"akey\":\"\\u65e5\\u672c\\ud83d\\ude00\",\"available\":true,\"last_called_at\":null,\"listed\":false,\"payer_trend\":[{\"calls30d\":5,\"payers30d\":null,\"snapshot\":\"2026-10-13\"}]},\"challenge\":{\"accepts\":[{\"amount\":\"1000\",\"asset\":\"0x1111111111111111111111111111111111111111\",\"network\":\"eip155:8453\",\"payTo\":\"0x2222222222222222222222222222222222222222\",\"scheme\":\"exact\"}],\"problems\":[],\"valid\":true},\"checked_at\":\"2026-10-14T00:00:00Z\",\"disclaimer\":\"Deterministic observations only. Not advice to pay, buy or sell.\",\"reachability\":{\"http_status\":402,\"latency_ms\":42,\"reachable\":true},\"schema\":\"prepay-check/v1\",\"target\":\"https://ex.example/p?q=\\u00fc&x=\\\"1\\\"\\n\"}"
+}
