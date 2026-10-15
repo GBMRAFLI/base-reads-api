@@ -84,6 +84,22 @@
   [
    "ref=a%2Eb",
    "a.b"
+  ],
+  [
+   "ref=abc%0A",
+   null
+  ],
+  [
+   "ref=abc%0D%0A",
+   null
+  ],
+  [
+   "ref=first&ref=second",
+   "first"
+  ],
+  [
+   "ref=bad%20x&ref=good",
+   null
   ]
  ],
  "req_for": {
@@ -238,6 +254,36 @@
    1000,
    "Base mainnet head: latest block number, block age in seconds, base fee and gas price in gwei. Use it to check the chain is advancing and to estimate fees before sending a transaction. One small JSON read instead of several raw RPC calls and unit conversions.",
    {}
+  ]
+ ],
+ "strip_ref": [
+  [
+   "",
+   ""
+  ],
+  [
+   "ref=a",
+   ""
+  ],
+  [
+   "address=0x1&ref=a",
+   "address=0x1"
+  ],
+  [
+   "ref=a&address=0x1",
+   "address=0x1"
+  ],
+  [
+   "a=1&ref=x&b=2&ref=y",
+   "a=1&b=2"
+  ],
+  [
+   "a=1&ref",
+   "a=1"
+  ],
+  [
+   "a=1&referrer=z",
+   "a=1&referrer=z"
   ]
  ],
  "validate": [

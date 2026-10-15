@@ -139,10 +139,14 @@ def root():
             "routes": {k: {"price_usdc": v[0] / 1e6, "description": v[1]} for k, v in ROUTES.items()}}
 REF_RE = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
 def clean_ref(qs):
-    """Optional ?ref= attribution tag: logged with paid calls only, never part of the price, challenge or requirements."""
+    """Optional ?ref= attribution tag: logged with paid calls only, never part of the price, challenge or requirements.
+    Self-reported and unverified. If ref appears more than once, the first occurrence wins (same as Deno cleanRef)."""
     for x in qs.split("&"):
-        if x.startswith("ref="): v = urllib.parse.unquote(x[4:]); return v if REF_RE.match(v) else None
+        if x.startswith("ref="): v = urllib.parse.unquote(x[4:]); return v if REF_RE.fullmatch(v) else None
     return None
+def strip_ref(qs):
+    """Query string without ref params, so the logged input hash does not depend on attribution."""
+    return "&".join(x for x in qs.split("&") if x and not x.startswith("ref=") and x != "ref")
 def llms_txt():
     net = "Base mainnet" if NETWORK == "eip155:8453" else "Base Sepolia" if NETWORK == "eip155:84532" else NETWORK
     L = ["# GBMRAFLI Base Reads", "", f"> Pay-per-call read API for {net} over x402 v2. Each paid route answers GET without payment with HTTP 402 and a PAYMENT-REQUIRED challenge; retry with a PAYMENT-SIGNATURE header to get JSON.", "",
@@ -298,7 +302,7 @@ def deliver_pending(key, pend, path, q, qs, r, check, who):
 def log_sale(path, r, st, times, oc, qs, served):
     try:
         MS.record_sale(path, r, st, times, oc, served, ref=clean_ref(qs))
-        MS.record_observation(path, __import__("hashlib").sha256(qs.encode()).hexdigest()[:16], 200 if served else 402, None)
+        MS.record_observation(path, __import__("hashlib").sha256(strip_ref(qs).encode()).hexdigest()[:16], 200 if served else 402, None)
     except Exception as e: print("sales log write failed:", type(e).__name__, flush=True)
 def log_mismatch(path, why):
     try: MS.record_observation(path, "settle-mismatch", 502, None, note=why)
@@ -309,7 +313,7 @@ class handler(BaseHTTPRequestHandler):
         path, _, qs = s.path.partition("?"); q = dict(x.split("=", 1) for x in qs.split("&") if "=" in x)
         if path in ("/", "/index.json"):
             return s._send(200, root())
-        if path == "/llms.txt": return s._send(200, llms_txt(), ctype="text/plain; charset=utf-8")
+        if path == "/llms.txt": return s._send(200, llms_txt(), {"Cache-Control": "public, max-age=3600"}, ctype="text/plain; charset=utf-8")
         if path == "/.well-known/x402-preflight":
             try: return s._send(200, well_known())
             except RuntimeError: return s._send(503, {"error": "signing key unavailable"})

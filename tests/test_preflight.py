@@ -80,7 +80,7 @@ class T1(unittest.TestCase):
         srv = IX.ThreadingHTTPServer(("127.0.0.1", 18767), IX.handler); threading.Thread(target=srv.serve_forever, daemon=True).start()
         try:
             r = urllib.request.urlopen("http://127.0.0.1:18767/llms.txt"); t = r.read().decode()
-            self.assertTrue(r.headers["Content-Type"].startswith("text/plain"))
+            self.assertTrue(r.headers["Content-Type"].startswith("text/plain")); self.assertEqual(r.headers["Cache-Control"], "public, max-age=3600")
             for k, v in IX.ROUTES.items(): self.assertIn(f"- {k} ({v[0] / 1e6:.3f} USDC)", t)
             for w in ("x402 v2", "EIP-3009", "/.well-known/bazaar-snapshot.json", "/x402/preflight/pubkey", IX.USDC): self.assertIn(w, t)
             for k, ex in IX.ROUTES.items():
@@ -92,6 +92,14 @@ class T1(unittest.TestCase):
                     except urllib.error.HTTPError as e: self.assertEqual(e.code, 402); got.append((e.read(), e.headers["PAYMENT-REQUIRED"]))
                 self.assertEqual(len(set(got)), 1, k)
         finally: srv.shutdown()
+    def test_ref_newline_rejected_first_wins_and_hash_ignores_ref(self):
+        self.assertIsNone(IX.clean_ref("ref=abc%0A")); self.assertIsNone(IX.clean_ref("ref=abc%0D%0A"))
+        self.assertEqual(IX.clean_ref("ref=first&ref=second"), "first")
+        req = IX.req_for("/base/network"); hs = []
+        for qs in ("address=0x1", "address=0x1&ref=agent-7", "ref=x&address=0x1"):
+            IX.log_sale("/base/network", req, {"success": True, "payer": "0x" + "02" * 20, "transaction": "0x" + os.urandom(32).hex()}, ("a", "b", "c"), {"settled": None}, qs, True)
+            hs.append(MS.rows("observations.jsonl")[-1]["inputHash"])
+        self.assertEqual(len(set(hs)), 1)
     def test_ref_logged_with_sale_and_exported(self):
         req = IX.req_for("/base/network"); tx = "0x" + "ef" * 32
         IX.log_sale("/base/network", req, {"success": True, "payer": "0x" + "02" * 20, "transaction": tx}, ("a", "b", "c"), {"settled": None}, "ref=agent.x_1", True)

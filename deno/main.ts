@@ -50,11 +50,14 @@ export function facilitatorInfo(env: Deps["env"]) {
   return { name, url: fac, auth: cdpEnabled(fac, env) ? "cdp_jwt" : "none" };
 }
 const REF_RE = /^[A-Za-z0-9._-]{1,64}$/;
-/** Optional ?ref= attribution tag: logged with paid calls only, never part of the price, challenge or requirements. */
+/** Optional ?ref= attribution tag: logged with paid calls only, never part of the price, challenge or requirements.
+ * Self-reported and unverified. If ref appears more than once, the first occurrence wins (same as Python clean_ref). */
 export function cleanRef(qs: string): string | null {
   for (const x of qs.split("&")) if (x.startsWith("ref=")) { let v: string; try { v = unquote(x.slice(4)); } catch { return null; } return REF_RE.test(v) ? v : null; }
   return null;
 }
+/** Query string without ref params, so the logged input hash does not depend on attribution. */
+export const stripRef = (qs: string) => qs.split("&").filter((x) => x && !x.startsWith("ref=") && x !== "ref").join("&");
 export function llmsTxt(env: Deps["env"]) {
   const c = cfg(env); const N = c.NETWORK;
   const net = N === "eip155:8453" ? "Base mainnet" : N === "eip155:84532" ? "Base Sepolia" : N;
@@ -141,7 +144,7 @@ export async function handler(req: Request, d: Deps): Promise<Response> {
   const raw = req.url.slice(req.url.indexOf("/", 8)); const qi = raw.indexOf("?");
   const path = qi < 0 ? raw : raw.slice(0, qi), qs = qi < 0 ? "" : raw.slice(qi + 1); const q = pyQuery(qs);
   if (path === "/" || path === "/index.json") return send(200, root(env));
-  if (path === "/llms.txt") return new Response(llmsTxt(env), { status: 200, headers: { ...HDRS, "Content-Type": "text/plain; charset=utf-8" } });
+  if (path === "/llms.txt") return new Response(llmsTxt(env), { status: 200, headers: { ...HDRS, "Content-Type": "text/plain; charset=utf-8", "Cache-Control": "public, max-age=3600" } });
   if (path === "/.well-known/x402-preflight") {
     try { return send(200, await wellKnown(env)); } catch (e) { if (e instanceof SigningUnavailable) return send(503, { error: "signing key unavailable" }); throw e; }
   }
@@ -213,7 +216,7 @@ async function paid(path: string, q: Record<string, string>, qs: string, sig: st
   const sale = (tx: string) => ({ success: true, transaction: tx, payer: who, network: N });
   const log = (tx: string, oc: any, served: boolean, times: [string, string, string]) => {
     bg((async () => {
-      try { await recordSale(path, r, sale(tx), times, oc, served, env, cleanRef(qs)); await recordObservation(path, (await sha256hex(qs)).slice(0, 16), served ? 200 : 402, null); }
+      try { await recordSale(path, r, sale(tx), times, oc, served, env, cleanRef(qs)); await recordObservation(path, (await sha256hex(stripRef(qs))).slice(0, 16), served ? 200 : 402, null); }
       catch (e) { console.log("sales log write failed:", (e as Error).name); }
     })());
   };

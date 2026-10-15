@@ -504,9 +504,13 @@ Deno.test("L2 slot TTL covers worst case; release is versionstamp-checked and ne
 });
 Deno.test("llms.txt identical to Python, text/plain; ref sanitizer identical", async () => {
   const r = await handler(new Request("http://h.example/llms.txt"), { env });
-  assert(r.headers.get("Content-Type")!.startsWith("text/plain")); assertEquals(await r.text(), C.llms_txt);
+  assert(r.headers.get("Content-Type")!.startsWith("text/plain")); assertEquals(await r.clone().text(), C.llms_txt);
   const { cleanRef } = await import("../main.ts");
   for (const [q, want] of C.ref) assertEquals(cleanRef(q), want, q);
+  assertEquals([cleanRef("ref=abc%0A"), cleanRef("ref=first&ref=second")], [null, "first"]);
+  const { stripRef } = await import("../main.ts");
+  for (const [q, want] of C.strip_ref) assertEquals(stripRef(q), want, q);
+  assertEquals(r.headers.get("Cache-Control"), "public, max-age=3600");
 });
 Deno.test("?ref= never changes the 402 challenge, header or requirements; every paid route answers 402", async () => {
   for (const [k, , ex] of Object.entries(ROUTES).map(([k, v]) => [k, v[0], v[2]] as const)) {
@@ -525,4 +529,10 @@ Deno.test("ref is logged with the paid call and appears in the export", async ()
   assertEquals(x.records.executions.find((e: any) => e.tx === tx).ref, "agent.x_1");
   await recordSale("/base/network", req, { success: true, payer: "0x" + "02".repeat(20), transaction: "0x" + "ee".repeat(32) }, ["a", "b", "c"], { settled: null }, true, env, null);
   assert(!("ref" in ((await rows("executions.jsonl")).at(-1) as any)));
+});
+Deno.test("observation inputHash is the same with and without ref", async () => {
+  const { stripRef } = await import("../main.ts");
+  const { sha256hex } = await import("../lib/util.ts");
+  const h = async (qs: string) => (await sha256hex(stripRef(qs))).slice(0, 16);
+  assertEquals(await h("address=0x1&ref=agent-7"), await h("address=0x1")); assertEquals(await h("ref=x&address=0x1"), await h("address=0x1"));
 });
