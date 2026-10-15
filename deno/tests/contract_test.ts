@@ -539,7 +539,7 @@ Deno.test("observation inputHash is the same with and without ref", async () => 
 Deno.test("openapi.json identical to Python; prices equal the 402 challenge; verify file exact", async () => {
   const r = await handler(new Request("http://h.example/openapi.json"), { env }); const t = await r.text();
   assertEquals(r.status, 200); assertEquals(t, C.openapi_body);
-  const o = JSON.parse(t); assertEquals(o.openapi, "3.1.0"); assertEquals(o.info.title, "Base Reads"); assert(!("contact" in o.info));
+  const o = JSON.parse(t); assertEquals(o.openapi, "3.1.0"); assertEquals(o.info.title, "Base Reads"); assertEquals(o.info.contact.email, "gbmrafli@agentmail.to");
   assertEquals(Object.keys(o.paths), Object.keys(ROUTES));
   for (const k of Object.keys(ROUTES)) {
     const res = await handler(new Request("http://h.example" + k), { env }); assertEquals(res.status, 402);
@@ -549,4 +549,28 @@ Deno.test("openapi.json identical to Python; prices equal the 402 challenge; ver
   }
   const v = await handler(new Request("http://h.example/.well-known/402index-verify.txt"), { env });
   assert(v.headers.get("Content-Type")!.startsWith("text/plain")); assertEquals(await v.text(), "be918d4df21371f971ccaa589e4ed1adbe9a077a824950b1db21cebfbbf5ae3c");
+});
+Deno.test("HEAD on free routes, nosniff, favicon, openapi payTo/contact/cache, env verify token, bazaar input schema on every route", async () => {
+  const { FREE_PATHS, FAVICON_B64, VERIFY_402INDEX_DEFAULT } = await import("../main.ts");
+  for (const p of FREE_PATHS) {
+    const g = await handler(new Request("http://h.example" + p), { env }); const gb = await g.arrayBuffer();
+    const h = await handler(new Request("http://h.example" + p, { method: "HEAD" }), { env });
+    assertEquals([h.status, h.body], [g.status, null], p); assertEquals(g.headers.get("X-Content-Type-Options"), "nosniff", p);
+    for (const k of ["Content-Type", "Cache-Control"]) assertEquals(h.headers.get(k), g.headers.get(k), p + " " + k); void gb;
+  }
+  const o = await (await handler(new Request("http://h.example/openapi.json"), { env })).json();
+  assertEquals(o.info.contact, { email: "gbmrafli@agentmail.to" });
+  for (const k of Object.keys(ROUTES)) {
+    const hr = await handler(new Request("http://h.example" + k, { method: "HEAD" }), { env }); assertEquals(hr.status, 501); await hr.body?.cancel();
+    const r = await handler(new Request("http://h.example" + k), { env }); assertEquals(r.status, 402); assertEquals(r.headers.get("X-Content-Type-Options"), "nosniff");
+    const ch = await r.json(); assertEquals(o.paths[k].get["x-payment-info"].payTo, ch.accepts[0].payTo);
+    assert("queryParams" in ch.extensions.bazaar.schema.properties.input.properties, k);
+  }
+  const oa = await handler(new Request("http://h.example/openapi.json"), { env }); assertEquals(oa.headers.get("Cache-Control"), "public, max-age=3600"); await oa.body?.cancel();
+  const f = await handler(new Request("http://h.example/favicon.ico"), { env }); const fb = new Uint8Array(await f.arrayBuffer());
+  assertEquals([f.headers.get("Content-Type"), Array.from(fb.slice(0, 4)), fb.length], ["image/x-icon", [0, 0, 1, 0], atob(FAVICON_B64).length]);
+  assertEquals(FAVICON_B64, C.favicon_b64);
+  const v1 = await handler(new Request("http://h.example/.well-known/402index-verify.txt"), { env: (k) => k === "INDEX_VERIFY_TOKEN" ? "tok-from-env" : env(k) });
+  assertEquals(await v1.text(), "tok-from-env");
+  const v2 = await handler(new Request("http://h.example/.well-known/402index-verify.txt"), { env }); assertEquals(await v2.text(), VERIFY_402INDEX_DEFAULT);
 });

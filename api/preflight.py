@@ -7,7 +7,7 @@ from Crypto.Signature import eddsa
 ADDR = re.compile(r"^0x[0-9a-fA-F]{40}$")
 SNAP_DIR = os.environ.get("SNAPSHOT_DIR", os.path.join(os.path.dirname(__file__), "..", "data", "snapshots"))
 KEY_PATH = os.environ.get("SIGNING_KEY_PATH", os.path.join(os.path.dirname(__file__), "..", "data", "signing_key.enc.pem"))
-UA = "gbmrafli-prepay-check/1.0"
+UA = "base-reads-prepay-check/1.0"
 SCHEMA = "prepay-check/v1"
 
 # ---------- signing key (Ed25519, encrypted at rest, never printed) ----------

@@ -27,7 +27,7 @@ ROUTES = {
  "/base/network": (1000, "Base mainnet head: latest block number, block age in seconds, base fee and gas price in gwei. Use it to check the chain is advancing and to estimate fees before sending a transaction. One small JSON read instead of several raw RPC calls and unit conversions.", {}),
 }
 def rpc(m, p):
-    r = urllib.request.Request(RPC, json.dumps({"jsonrpc": "2.0", "id": 1, "method": m, "params": p}).encode(), {"Content-Type": "application/json", "User-Agent": "gbmrafli-base-reads/1.0"})
+    r = urllib.request.Request(RPC, json.dumps({"jsonrpc": "2.0", "id": 1, "method": m, "params": p}).encode(), {"Content-Type": "application/json", "User-Agent": "base-reads/1.0"})
     d = json.loads(urllib.request.urlopen(r, timeout=15).read())
     if "error" in d: raise ValueError(d["error"].get("message"))
     return d["result"]
@@ -103,6 +103,8 @@ def bazaar(path):
     if d["params"]:
         inp["queryParams"] = ex
         inp_s["queryParams"] = {"type": "object", "properties": d["params"], "required": d["required"]}
+    else:  # no inputs: still declare an (empty) input schema so discovery tools do not flag "input schema missing"
+        inp_s["queryParams"] = {"type": "object", "properties": {}, "additionalProperties": False}
     return {"info": {"input": inp, "output": {"type": "json", "example": d["output"]}},
             "schema": {"$schema": "https://json-schema.org/draft/2020-12/schema", "type": "object",
                        "properties": {"input": {"type": "object", "properties": inp_s, "required": ["type", "method"], "additionalProperties": False},
@@ -117,7 +119,7 @@ def required(path, host=""):
     return {"x402Version": 2, "error": "PAYMENT-SIGNATURE header is required", "resource": {"url": (PUBLIC or ("https://" + safe_host(host))) + path, "description": desc, "mimeType": "application/json"},
             "accepts": [req_for(path)], "extensions": {"bazaar": bazaar(path)}}
 def fac(p, body):
-    r = urllib.request.Request(FAC + p, json.dumps(body).encode(), {"Content-Type": "application/json", "User-Agent": "gbmrafli-base-reads/1.0", **cdp_auth.headers(FAC, p)})
+    r = urllib.request.Request(FAC + p, json.dumps(body).encode(), {"Content-Type": "application/json", "User-Agent": "base-reads/1.0", **cdp_auth.headers(FAC, p)})
     try: return json.loads(urllib.request.urlopen(r, timeout=40).read())
     except urllib.error.HTTPError as e: return json.loads(e.read() or b"{}")
 b64 = lambda o: base64.b64encode(json.dumps(o).encode()).decode()
@@ -159,7 +161,12 @@ def llms_txt():
           "- /.well-known/x402-preflight-key-history.json : signing key history", "- /x402/preflight/pubkey : Ed25519 public key for verifying signed facts",
           "- Each 402 challenge carries extensions.bazaar (input schema and output example) for x402 Bazaar listing", "", "Facts only, no investment advice.", ""]
     return "\n".join(L)
-VERIFY_402INDEX = "be918d4df21371f971ccaa589e4ed1adbe9a077a824950b1db21cebfbbf5ae3c"  # served with no trailing newline: exact token, byte-for-byte
+VERIFY_402INDEX_DEFAULT = "be918d4df21371f971ccaa589e4ed1adbe9a077a824950b1db21cebfbbf5ae3c"
+def verify_token():
+    """402index ownership token: INDEX_VERIFY_TOKEN if set, else the built-in constant. Served with no trailing newline."""
+    return os.environ.get("INDEX_VERIFY_TOKEN") or VERIFY_402INDEX_DEFAULT
+FAVICON_B64 = "AAABAAEAEBAAAAEAIABoBAAAFgAAACgAAAAQAAAAIAAAAAEAIAAAAAAAQAQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA0lIA/9JSAP8AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAANJSAP/SUgD/0lIA/9JSAP/SUgD/0lIA/9JSAP/SUgD/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAANJSAP/SUgD/0lIA/9JSAP/SUgD/0lIA/9JSAP/SUgD/0lIA/9JSAP8AAAAAAAAAAAAAAAAAAAAAAAAAANJSAP/SUgD/0lIA/9JSAP/SUgD/0lIA/9JSAP/SUgD/0lIA/9JSAP/SUgD/0lIA/wAAAAAAAAAAAAAAANJSAP/SUgD/0lIA/9JSAP/SUgD/0lIA/9JSAP/SUgD/0lIA/9JSAP/SUgD/0lIA/9JSAP/SUgD/AAAAAAAAAADSUgD/0lIA/9JSAP/SUgD/0lIA///////////////////////SUgD/0lIA/9JSAP/SUgD/0lIA/wAAAAAAAAAA0lIA/9JSAP/SUgD/0lIA/9JSAP//////0lIA/9JSAP/SUgD//////9JSAP/SUgD/0lIA/9JSAP8AAAAA0lIA/9JSAP/SUgD/0lIA/9JSAP/SUgD//////9JSAP/SUgD/0lIA///////SUgD/0lIA/9JSAP/SUgD/0lIA/9JSAP/SUgD/0lIA/9JSAP/SUgD/0lIA///////////////////////SUgD/0lIA/9JSAP/SUgD/0lIA/9JSAP8AAAAA0lIA/9JSAP/SUgD/0lIA/9JSAP//////0lIA/9JSAP/SUgD//////9JSAP/SUgD/0lIA/9JSAP8AAAAAAAAAANJSAP/SUgD/0lIA/9JSAP/SUgD//////9JSAP/SUgD/0lIA///////SUgD/0lIA/9JSAP/SUgD/AAAAAAAAAADSUgD/0lIA/9JSAP/SUgD/0lIA///////////////////////SUgD/0lIA/9JSAP/SUgD/0lIA/wAAAAAAAAAAAAAAANJSAP/SUgD/0lIA/9JSAP/SUgD/0lIA/9JSAP/SUgD/0lIA/9JSAP/SUgD/0lIA/wAAAAAAAAAAAAAAAAAAAAAAAAAA0lIA/9JSAP/SUgD/0lIA/9JSAP/SUgD/0lIA/9JSAP/SUgD/0lIA/wAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAADSUgD/0lIA/9JSAP/SUgD/0lIA/9JSAP/SUgD/0lIA/wAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA0lIA/9JSAP8AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=="  # 16x16 ICO from scripts/gen_favicon.py
+FREE_PATHS = ("/", "/index.json", "/favicon.ico", "/llms.txt", "/openapi.json", "/.well-known/402index-verify.txt", "/.well-known/x402-preflight", "/.well-known/x402-preflight-key-history.json", "/.well-known/bazaar-snapshot.json", "/x402/preflight/pubkey", "/bazaar/snapshots")
 def openapi():
     """OpenAPI 3.1 for the paid routes, generated from ROUTES + discovery.json so prices cannot drift from the 402 challenge."""
     paths = {}
@@ -169,8 +176,8 @@ def openapi():
         paths[k] = {"get": {"operationId": k.strip("/").replace("/", "_").replace("-", "_"), "summary": desc.split(". ")[0][:120], "description": desc, "parameters": params,
             "responses": {"200": {"description": "Result (served after the payment is confirmed on-chain)", "content": {"application/json": {"example": d["output"]}}},
                           "402": {"description": "Payment required: x402 v2 challenge in the PAYMENT-REQUIRED header and body"}},
-            "x-payment-info": {"protocols": ["x402"], "pricingMode": "fixed", "price": f"{price / 1e6:.3f}", "amount": str(price), "currency": "USDC", "asset": USDC, "network": NETWORK}}}
-    return {"openapi": "3.1.0", "info": {"title": "Base Reads", "version": "1.0.0",
+            "x-payment-info": {"protocols": ["x402"], "pricingMode": "fixed", "price": f"{price / 1e6:.3f}", "amount": str(price), "currency": "USDC", "asset": USDC, "network": NETWORK, "payTo": PAY_TO}}}
+    return {"openapi": "3.1.0", "info": {"title": "Base Reads", "version": "1.0.0", "contact": {"email": "gbmrafli@agentmail.to"},
             "description": "Pay-per-call read API for Base over x402 v2. Deterministic data, no advice.",
             "x-guidance": "Call any path with GET. Without payment you get HTTP 402 and a PAYMENT-REQUIRED challenge (x402 v2, exact scheme, USDC on Base). Sign an EIP-3009 transferWithAuthorization for the stated amount and retry with the PAYMENT-SIGNATURE header; the JSON is returned once the transfer is confirmed on-chain."},
             "paths": paths}
@@ -324,13 +331,21 @@ def log_mismatch(path, why):
     except Exception as e: print("sales log write failed:", type(e).__name__, flush=True)
 class handler(BaseHTTPRequestHandler):
     def log_message(s, f, *a): pass
+    head = False
+    def do_HEAD(s):
+        """HEAD on free routes: same status and headers as GET, no body. Paid routes keep their previous behaviour (501)."""
+        if s.path.partition("?")[0] not in FREE_PATHS: return s.send_error(501, "Unsupported method ('HEAD')")
+        s.head = True
+        try: s.do_GET()
+        finally: s.head = False
     def do_GET(s):
         path, _, qs = s.path.partition("?"); q = dict(x.split("=", 1) for x in qs.split("&") if "=" in x)
         if path in ("/", "/index.json"):
             return s._send(200, root())
         if path == "/llms.txt": return s._send(200, llms_txt(), {"Cache-Control": "public, max-age=3600"}, ctype="text/plain; charset=utf-8")
-        if path == "/openapi.json": return s._send(200, openapi())
-        if path == "/.well-known/402index-verify.txt": return s._send(200, VERIFY_402INDEX, ctype="text/plain; charset=utf-8")
+        if path == "/openapi.json": return s._send(200, openapi(), {"Cache-Control": "public, max-age=3600"})
+        if path == "/.well-known/402index-verify.txt": return s._send(200, verify_token(), ctype="text/plain; charset=utf-8")
+        if path == "/favicon.ico": return s._send(200, base64.b64decode(FAVICON_B64), {"Cache-Control": "public, max-age=86400"}, ctype="image/x-icon")
         if path == "/.well-known/x402-preflight":
             try: return s._send(200, well_known())
             except RuntimeError: return s._send(503, {"error": "signing key unavailable"})
@@ -351,9 +366,9 @@ class handler(BaseHTTPRequestHandler):
         code, out, hd = paid(path, q, qs, sig, t_req, ip=s.client_address[0])
         return s._send(code, out, hd)
     def _send(s, code, obj, hd={}, ctype="application/json"):
-        b = obj.encode() if isinstance(obj, str) else json.dumps(obj).encode()
+        b = obj if isinstance(obj, bytes) else obj.encode() if isinstance(obj, str) else json.dumps(obj).encode()
         try:
-            s.send_response(code); s.send_header("Content-Type", ctype); s.send_header("Content-Length", str(len(b)))
+            s.send_response(code); s.send_header("Content-Type", ctype); s.send_header("Content-Length", str(len(b))); s.send_header("X-Content-Type-Options", "nosniff")
             s.send_header("Access-Control-Allow-Origin", "*"); s.send_header("Access-Control-Expose-Headers", "PAYMENT-REQUIRED, PAYMENT-RESPONSE")
             for k, v in hd.items(): s.send_header(k, v)
             s.end_headers(); s.wfile.write(b)

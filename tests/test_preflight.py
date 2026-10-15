@@ -96,7 +96,7 @@ class T1(unittest.TestCase):
         srv = IX.ThreadingHTTPServer(("127.0.0.1", 18768), IX.handler); threading.Thread(target=srv.serve_forever, daemon=True).start()
         try:
             o = json.loads(urllib.request.urlopen("http://127.0.0.1:18768/openapi.json").read())
-            self.assertEqual((o["openapi"], o["info"]["title"]), ("3.1.0", "Base Reads")); self.assertNotIn("contact", o["info"])
+            self.assertEqual((o["openapi"], o["info"]["title"]), ("3.1.0", "Base Reads")); self.assertEqual(o["info"]["contact"]["email"], "gbmrafli@agentmail.to")
             self.assertEqual(list(o["paths"]), list(IX.ROUTES))
             for k in IX.ROUTES:
                 try: urllib.request.urlopen("http://127.0.0.1:18768" + k); self.fail(k)
@@ -107,6 +107,32 @@ class T1(unittest.TestCase):
             r = urllib.request.urlopen("http://127.0.0.1:18768/.well-known/402index-verify.txt")
             self.assertTrue(r.headers["Content-Type"].startswith("text/plain")); self.assertEqual(r.read(), b"be918d4df21371f971ccaa589e4ed1adbe9a077a824950b1db21cebfbbf5ae3c")
         finally: srv.shutdown()
+    def test_head_nosniff_favicon_payto_token_ua_bazaar(self):
+        import http.client
+        sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "scripts")); import gen_favicon
+        self.assertEqual(base64.b64decode(IX.FAVICON_B64), gen_favicon.build())
+        srv = IX.ThreadingHTTPServer(("127.0.0.1", 18769), IX.handler); threading.Thread(target=srv.serve_forever, daemon=True).start()
+        def req(m, p):
+            c = http.client.HTTPConnection("127.0.0.1", 18769); c.request(m, p); r = c.getresponse(); b = r.read(); c.close(); return r.status, dict(r.getheaders()), b
+        try:
+            for p in IX.FREE_PATHS:
+                g, h = req("GET", p), req("HEAD", p)
+                self.assertEqual(g[0], h[0], p); self.assertEqual(h[2], b"", p); self.assertEqual(g[1].get("X-Content-Type-Options"), "nosniff", p)
+                for k in ("Content-Type", "Content-Length", "Cache-Control"): self.assertEqual(g[1].get(k), h[1].get(k), (p, k))
+            for k in IX.ROUTES:
+                self.assertEqual(req("HEAD", k)[0], 501); st, hd, _ = req("GET", k); self.assertEqual(st, 402); self.assertEqual(hd["X-Content-Type-Options"], "nosniff")
+            st, hd, b = req("GET", "/favicon.ico"); self.assertEqual((st, hd["Content-Type"], b[:4]), (200, "image/x-icon", b"\0\0\1\0")); self.assertIn("max-age", hd["Cache-Control"])
+            st, hd, b = req("GET", "/openapi.json"); self.assertEqual(hd["Cache-Control"], "public, max-age=3600"); o = json.loads(b)
+            self.assertEqual(o["info"]["contact"], {"email": "gbmrafli@agentmail.to"})
+            for k in IX.ROUTES:
+                ch = json.loads(req("GET", k)[2])["accepts"][0]; self.assertEqual(o["paths"][k]["get"]["x-payment-info"]["payTo"], ch["payTo"])
+            os.environ["INDEX_VERIFY_TOKEN"] = "tok-from-env"
+            try: self.assertEqual(req("GET", "/.well-known/402index-verify.txt")[2], b"tok-from-env")
+            finally: os.environ.pop("INDEX_VERIFY_TOKEN")
+            self.assertEqual(req("GET", "/.well-known/402index-verify.txt")[2], IX.VERIFY_402INDEX_DEFAULT.encode())
+        finally: srv.shutdown()
+        self.assertEqual(PF.UA, "base-reads-prepay-check/1.0")
+        for k in IX.ROUTES: self.assertIn("queryParams", IX.bazaar(k)["schema"]["properties"]["input"]["properties"], k)
     def test_ref_newline_rejected_first_wins_and_hash_ignores_ref(self):
         self.assertIsNone(IX.clean_ref("ref=abc%0A")); self.assertIsNone(IX.clean_ref("ref=abc%0D%0A"))
         self.assertEqual(IX.clean_ref("ref=first&ref=second"), "first")

@@ -2,7 +2,7 @@
 import { sign } from "./sign.ts";
 import { kv } from "./store.ts";
 import { isoSec } from "./util.ts";
-export const SCHEMA = "prepay-check/v1", UA = "gbmrafli-prepay-check/1.0";
+export const SCHEMA = "prepay-check/v1", UA = "base-reads-prepay-check/1.0";
 const ADDR = /^0x[0-9a-fA-F]{40}$/;
 
 // ---------- SSRF guard ----------
