@@ -22,6 +22,8 @@ def build():
     return {
         "routes": [[k, v[0], v[1], v[2]] for k, v in IX.ROUTES.items()],
         "root_body": json.dumps(root),
+        "llms_txt": IX.llms_txt(),
+        "ref": [[q, IX.clean_ref(q)] for q in ["", "ref=agent.x_1-2", "a=1&ref=ok", "ref=" + "a" * 64, "ref=" + "a" * 65, "ref=bad%20x", "ref=%3Cscript%3E", "ref=", "ref=caf%C3%A9", "ref=a%2Eb"]],
         "required": {k: {"body": json.dumps(IX.required(k, "h.example")), "header": IX.b64(IX.required(k, "h.example"))} for k in IX.ROUTES},
         "req_for": {k: IX.req_for(k) for k in IX.ROUTES},
         "rid": [MS.rid("exec", None, "/base/network"), MS.rid("cand", "v1", "chain_reads", "/base/network"), MS.rid("out", "0x" + "ab" * 32, "/x402/preflight")],

@@ -76,6 +76,34 @@ class T1(unittest.TestCase):
             pk = json.loads(urllib.request.urlopen("http://127.0.0.1:18766/x402/preflight/pubkey").read()); self.assertEqual(pk["alg"], "Ed25519")
             idx = json.loads(urllib.request.urlopen("http://127.0.0.1:18766/").read()); self.assertEqual(idx["routes"]["/x402/preflight"]["price_usdc"], 0.001)
         finally: srv.shutdown()
+    def test_llms_txt_and_ref_never_changes_402(self):
+        srv = IX.ThreadingHTTPServer(("127.0.0.1", 18767), IX.handler); threading.Thread(target=srv.serve_forever, daemon=True).start()
+        try:
+            r = urllib.request.urlopen("http://127.0.0.1:18767/llms.txt"); t = r.read().decode()
+            self.assertTrue(r.headers["Content-Type"].startswith("text/plain"))
+            for k, v in IX.ROUTES.items(): self.assertIn(f"- {k} ({v[0] / 1e6:.3f} USDC)", t)
+            for w in ("x402 v2", "EIP-3009", "/.well-known/bazaar-snapshot.json", "/x402/preflight/pubkey", IX.USDC): self.assertIn(w, t)
+            for k, ex in IX.ROUTES.items():
+                qs = "&".join(f"{a}={b}" for a, b in ex[2].items())
+                got = []
+                for extra in ("", "ref=agent-7", "ref=" + "z" * 200, "ref=%3Cx%3E"):
+                    u = f"http://127.0.0.1:18767{k}?" + "&".join(x for x in (qs, extra) if x)
+                    try: urllib.request.urlopen(u); self.fail(u)
+                    except urllib.error.HTTPError as e: self.assertEqual(e.code, 402); got.append((e.read(), e.headers["PAYMENT-REQUIRED"]))
+                self.assertEqual(len(set(got)), 1, k)
+        finally: srv.shutdown()
+    def test_ref_logged_with_sale_and_exported(self):
+        req = IX.req_for("/base/network"); tx = "0x" + "ef" * 32
+        IX.log_sale("/base/network", req, {"success": True, "payer": "0x" + "02" * 20, "transaction": tx}, ("a", "b", "c"), {"settled": None}, "ref=agent.x_1", True)
+        ex = [r for r in MS.rows("executions.jsonl") if r.get("tx") == tx][-1]; self.assertEqual(ex["ref"], "agent.x_1")
+        IX.log_sale("/base/network", req, {"success": True, "payer": "0x" + "02" * 20, "transaction": "0x" + "ee" * 32}, ("a", "b", "c"), {"settled": None}, "ref=" + "a" * 65, True)
+        self.assertNotIn("ref", MS.rows("executions.jsonl")[-1])
+        old = os.environ.get("EXPORT_TOKEN"); os.environ["EXPORT_TOKEN"] = "t" * 40
+        try: code, out = IX.export("Bearer " + "t" * 40, {})
+        finally:
+            if old is None: os.environ.pop("EXPORT_TOKEN")
+            else: os.environ["EXPORT_TOKEN"] = old
+        self.assertEqual(code, 200); self.assertIn("agent.x_1", [r.get("ref") for r in out["records"]["executions"]])
 class T2(unittest.TestCase):
     def fake(self, *ips): return lambda h, p, *a: [(2, 1, 6, "", (ip, p)) for ip in ips]
     def test_pins_public_ip(self):

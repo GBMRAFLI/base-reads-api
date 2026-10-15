@@ -19,12 +19,12 @@ PORT = int(os.environ.get("PORT", 8443))
 REG = "0xb94704422c2a1e396835a571837aa5ae53285a95"  # Basenames registry on Base
 ADDR = re.compile(r"^0x[0-9a-fA-F]{40}$"); HASH = re.compile(r"^0x[0-9a-fA-F]{64}$")
 ROUTES = {
- "/base/usdc-balance": (1000, "Base mainnet USDC + ETH balance for any address (live eth_call). Query: ?address=0x...", {"address": "0x4200000000000000000000000000000000000016"}),
- "/base/tx-status": (2000, "Base mainnet transaction status: success/failed/pending, block, confirmations, gas used, from/to. Query: ?hash=0x...", {"hash": "0x" + "0"*64}),
- "/base/basename": (3000, "Resolve a Basename (name.base.eth) to its Base address, or an address to its primary Basename. Query: ?name=jesse.base.eth or ?address=0x...", {"name": "jesse.base.eth"}),
- "/base/address-intel": (5000, "One call: Base USDC balance, ETH balance, verified primary Basename, tx count (nonce) and is_contract for an address. Query: ?address=0x...", {"address": "0x2211d1d0020daea8039e46cf1367962070d77da9"}),
- "/x402/preflight": (1000, "Pre-pay Check: Ed25519-signed deterministic facts about an x402 endpoint before you pay it: challenge validity, reachability and latency, host listing count, payout wallet reuse across hosts, last-called and payer trend from Bazaar snapshots. Facts only, no advice. Query: ?url=https://...", {"url": "https://x402.org/protected"}),
- "/base/network": (1000, "Base mainnet head: block number, block age seconds, base fee and gas price in gwei.", {}),
+ "/base/usdc-balance": (1000, "Live Base mainnet USDC and ETH balance for one address, read with eth_call at the latest block; returns decimal and raw values plus the block number. Use it to check a wallet can cover a payment or that funds arrived before acting. Simpler than running an RPC client and decoding ERC-20 calls yourself, and the block number makes each reading reproducible. Query: ?address=0x...", {"address": "0x4200000000000000000000000000000000000016"}),
+ "/base/tx-status": (2000, "Base mainnet transaction status: success, failed or pending, with block, confirmations, gas used, effective gas price, from/to and log count. Use it after sending or receiving a payment to confirm it landed and how deep it is. One normalized JSON answer instead of combining receipt and block calls and computing confirmations yourself. Query: ?hash=0x...", {"hash": "0x" + "0"*64}),
+ "/base/basename": (3000, "Resolve a Basename (name.base.eth) to its Base address, or an address to its primary Basename, checked both ways so a reverse name is only returned when it resolves back. Use it to turn a human name into a payout address or to label an address. Avoids hand-written ENS-style namehash and resolver calls. Query: ?name=jesse.base.eth or ?address=0x...", {"name": "jesse.base.eth"}),
+ "/base/address-intel": (5000, "One call for an address on Base: USDC balance, ETH balance, verified primary Basename, transaction count (nonce) and whether it is a contract. Use it to profile a counterparty or payout wallet before interacting. Replaces four or five separate reads with a single priced request. Query: ?address=0x...", {"address": "0x2211d1d0020daea8039e46cf1367962070d77da9"}),
+ "/x402/preflight": (1000, "Pre-pay Check: Ed25519-signed, deterministic facts about another x402 endpoint before you pay it: challenge validity, reachability and latency, host listing count, payout wallet reuse across hosts, last-called and payer trend from daily Bazaar snapshots. Use it when choosing between paid endpoints. Signed facts you can verify against the published key, not ratings; facts only, no advice. Query: ?url=https://...", {"url": "https://x402.org/protected"}),
+ "/base/network": (1000, "Base mainnet head: latest block number, block age in seconds, base fee and gas price in gwei. Use it to check the chain is advancing and to estimate fees before sending a transaction. One small JSON read instead of several raw RPC calls and unit conversions.", {}),
 }
 def rpc(m, p):
     r = urllib.request.Request(RPC, json.dumps({"jsonrpc": "2.0", "id": 1, "method": m, "params": p}).encode(), {"Content-Type": "application/json", "User-Agent": "gbmrafli-base-reads/1.0"})
@@ -135,8 +135,26 @@ def export(auth, q):
 REPO_URL = os.environ.get("REPO_URL", "https://github.com/GBMRAFLI/base-reads-api")
 def root():
     return {"service": "GBMRAFLI Base Reads", "network": NETWORK, "protocol": "x402 v2", "facilitator": facilitator_info(),
-            "free": ["/.well-known/x402-preflight", "/.well-known/x402-preflight-key-history.json", "/.well-known/bazaar-snapshot.json", "/x402/preflight/pubkey", "/bazaar/snapshots"],
+            "free": ["/llms.txt", "/.well-known/x402-preflight", "/.well-known/x402-preflight-key-history.json", "/.well-known/bazaar-snapshot.json", "/x402/preflight/pubkey", "/bazaar/snapshots"],
             "routes": {k: {"price_usdc": v[0] / 1e6, "description": v[1]} for k, v in ROUTES.items()}}
+REF_RE = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
+def clean_ref(qs):
+    """Optional ?ref= attribution tag: logged with paid calls only, never part of the price, challenge or requirements."""
+    for x in qs.split("&"):
+        if x.startswith("ref="): v = urllib.parse.unquote(x[4:]); return v if REF_RE.match(v) else None
+    return None
+def llms_txt():
+    net = "Base mainnet" if NETWORK == "eip155:8453" else "Base Sepolia" if NETWORK == "eip155:84532" else NETWORK
+    L = ["# GBMRAFLI Base Reads", "", f"> Pay-per-call read API for {net} over x402 v2. Each paid route answers GET without payment with HTTP 402 and a PAYMENT-REQUIRED challenge; retry with a PAYMENT-SIGNATURE header to get JSON.", "",
+         "## Payment", "", "- Protocol: x402 v2, scheme exact", f"- Network: {NETWORK} ({net})", f"- Asset: USDC {USDC}", "- Authorization: EIP-3009 transferWithAuthorization only (Permit2 is rejected)",
+         "- Responses are served only after the transfer is confirmed on-chain", "- Optional ?ref=<tag> (A-Z a-z 0-9 . _ -, max 64) is recorded for attribution and never changes price or challenge", "",
+         "## Paid routes (GET, JSON)", ""]
+    L += [f"- {k} ({v[0] / 1e6:.3f} USDC): {v[1]}" for k, v in ROUTES.items()]
+    L += ["", "## Discovery (free)", "", "- / : service index with routes and prices", "- /bazaar/snapshots : daily Bazaar snapshot summary",
+          "- /.well-known/bazaar-snapshot.json : signed snapshot series metadata", "- /.well-known/x402-preflight : Pre-pay Check schema and signing key",
+          "- /.well-known/x402-preflight-key-history.json : signing key history", "- /x402/preflight/pubkey : Ed25519 public key for verifying signed facts",
+          "- Each 402 challenge carries extensions.bazaar (input schema and output example) for x402 Bazaar listing", "", "Facts only, no investment advice.", ""]
+    return "\n".join(L)
 def facilitator_info():
     """Which facilitator verifies/settles payments, derived from FACILITATOR (never hardcoded in responses)."""
     h = (urllib.parse.urlsplit(FAC).hostname or "").lower()
@@ -279,7 +297,7 @@ def deliver_pending(key, pend, path, q, qs, r, check, who):
     return 200, out, pay_resp(True, pend["tx"], who)
 def log_sale(path, r, st, times, oc, qs, served):
     try:
-        MS.record_sale(path, r, st, times, oc, served)
+        MS.record_sale(path, r, st, times, oc, served, ref=clean_ref(qs))
         MS.record_observation(path, __import__("hashlib").sha256(qs.encode()).hexdigest()[:16], 200 if served else 402, None)
     except Exception as e: print("sales log write failed:", type(e).__name__, flush=True)
 def log_mismatch(path, why):
@@ -291,6 +309,7 @@ class handler(BaseHTTPRequestHandler):
         path, _, qs = s.path.partition("?"); q = dict(x.split("=", 1) for x in qs.split("&") if "=" in x)
         if path in ("/", "/index.json"):
             return s._send(200, root())
+        if path == "/llms.txt": return s._send(200, llms_txt(), ctype="text/plain; charset=utf-8")
         if path == "/.well-known/x402-preflight":
             try: return s._send(200, well_known())
             except RuntimeError: return s._send(503, {"error": "signing key unavailable"})
@@ -310,10 +329,10 @@ class handler(BaseHTTPRequestHandler):
         if not sig: pr = required(path, s.headers.get("Host", "")); return s._send(402, pr, {"PAYMENT-REQUIRED": b64(pr)})
         code, out, hd = paid(path, q, qs, sig, t_req, ip=s.client_address[0])
         return s._send(code, out, hd)
-    def _send(s, code, obj, hd={}):
-        b = json.dumps(obj).encode()
+    def _send(s, code, obj, hd={}, ctype="application/json"):
+        b = obj.encode() if isinstance(obj, str) else json.dumps(obj).encode()
         try:
-            s.send_response(code); s.send_header("Content-Type", "application/json"); s.send_header("Content-Length", str(len(b)))
+            s.send_response(code); s.send_header("Content-Type", ctype); s.send_header("Content-Length", str(len(b)))
             s.send_header("Access-Control-Allow-Origin", "*"); s.send_header("Access-Control-Expose-Headers", "PAYMENT-REQUIRED, PAYMENT-RESPONSE")
             for k, v in hd.items(): s.send_header(k, v)
             s.end_headers(); s.wfile.write(b)
