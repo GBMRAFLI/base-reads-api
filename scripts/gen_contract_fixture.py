@@ -2,6 +2,14 @@
 The Deno tests compare their output against it; tests/test_preflight.py checks the file is current."""
 import base64, json, os, sys, tempfile
 R = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
+def cdp_vector():
+    """Deterministic JWT for a THROWAWAY Ed25519 key (seed 0x00..0x1f), fixed time and nonce."""
+    sys.path.insert(0, os.path.join(R, "api")); import cdp_auth
+    from Crypto.PublicKey import ECC
+    seed = bytes(range(32)); pub = ECC.construct(curve="ed25519", seed=seed).public_key().export_key(format="raw")
+    secret = base64.b64encode(seed + pub).decode()
+    return {"key_id": "test-key-id", "secret": secret, "now": 1792800000, "nonce": "0123456789012345",
+            "jwt": cdp_auth.jwt("test-key-id", secret, "POST", "api.cdp.coinbase.com", "/platform/v2/x402/settle", now=1792800000, nonce="0123456789012345")}
 def build():
     os.environ.pop("PUBLIC_URL", None); os.environ.pop("NETWORK", None)
     os.environ.setdefault("DATA_STORE", tempfile.mkdtemp()); os.environ["SNAPSHOT_DIR"] = tempfile.mkdtemp()
@@ -19,6 +27,7 @@ def build():
         "rid": [MS.rid("exec", None, "/base/network"), MS.rid("cand", "v1", "chain_reads", "/base/network"), MS.rid("out", "0x" + "ab" * 32, "/x402/preflight")],
         "validate": [list(PF.validate_challenge(c)) for c in ch],
         "index": PF.build_index(items, "2026-10-13"),
+        "cdp_jwt": cdp_vector(),
         "canonical": PF.canonical({"b": [1, None, True, "é\u2028😀\"\\\n\t\x01"], "a": {"z": 0, "A": -5}, "_": ""}).decode(),
     }
 if __name__ == "__main__":

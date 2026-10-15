@@ -52,3 +52,16 @@ record format. Storage: Deno KV. Daily Bazaar snapshot: `Deno.cron` at 00:15 UTC
 Entry point `deno/main.ts`; env: `SIGNING_KEY_PASSPHRASE`, `SIGNING_KEY_ENC_B64`, `EXPORT_TOKEN` (+ optional `PAY_TO_ADDRESS`,
 `SELF_WALLETS`, `PUBLIC_URL`, `RPC`, `FACILITATOR`, `NETWORK`). Contract fixtures come from the Python reference
 (`python scripts/gen_contract_fixture.py`); `tests/fixtures/py_signed.json` holds a public THROWAWAY test key only.
+
+## Bazaar discovery and the CDP facilitator (optional)
+Every 402 challenge carries `extensions.bazaar` in the `declareDiscoveryExtension` format: `info` (GET input with
+query-param examples, JSON output example) plus a JSON `schema`. Descriptions and examples live in `api/discovery.json`
+(mirrored at `deno/lib/discovery.json`; a test keeps them identical). Check a deployment for free, without a key:
+`curl -X POST https://api.cdp.coinbase.com/platform/v2/x402/validate -H 'Content-Type: application/json' -d '{"resource":"<url>","method":"GET"}'`.
+
+The default facilitator stays PayAI. To settle through the CDP facilitator (needed for Bazaar indexing) set
+`FACILITATOR=https://api.cdp.coinbase.com/platform/v2/x402` **and** `CDP_API_KEY_ID` / `CDP_API_KEY_SECRET`
+(Ed25519 key from the CDP portal). Each verify/settle call then carries a fresh 2-minute EdDSA JWT; if either key is
+missing, requests go out without auth exactly as before. CDP returns the same settle fields (`success`, `transaction`,
+`payer`, `network`), so the settlement tx hash handling is unchanged.
+

@@ -3,7 +3,7 @@ Zero-LLM: every route is 100% deterministic code (JSON-RPC reads only)."""
 import json, os, re, base64, time, urllib.request, urllib.parse, sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import preflight as PF
-import sales_log as MS
+import sales_log as MS, cdp_auth
 iso = lambda t: time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(t)) + ".%03dZ" % int((t % 1) * 1000)
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from Crypto.Hash import keccak as _k
@@ -23,7 +23,7 @@ ROUTES = {
  "/base/tx-status": (2000, "Base mainnet transaction status: success/failed/pending, block, confirmations, gas used, from/to. Query: ?hash=0x...", {"hash": "0x" + "0"*64}),
  "/base/basename": (3000, "Resolve a Basename (name.base.eth) to its Base address, or an address to its primary Basename. Query: ?name=jesse.base.eth or ?address=0x...", {"name": "jesse.base.eth"}),
  "/base/address-intel": (5000, "One call: Base USDC balance, ETH balance, verified primary Basename, tx count (nonce) and is_contract for an address. Query: ?address=0x...", {"address": "0x2211d1d0020daea8039e46cf1367962070d77da9"}),
- "/x402/preflight": (1000, "Pre-pay Check: Ed25519-signed deterministic facts about an x402 endpoint before you pay it: challenge validity, reachability and latency, host listing count, payout wallet reuse across hosts, last-called and payer trend from Bazaar snapshots. Facts only, no advice. Query: ?url=https://...", {"url": "https://api.example.com/paid"}),
+ "/x402/preflight": (1000, "Pre-pay Check: Ed25519-signed deterministic facts about an x402 endpoint before you pay it: challenge validity, reachability and latency, host listing count, payout wallet reuse across hosts, last-called and payer trend from Bazaar snapshots. Facts only, no advice. Query: ?url=https://...", {"url": "https://x402.org/protected"}),
  "/base/network": (1000, "Base mainnet head: block number, block age seconds, base fee and gas price in gwei.", {}),
 }
 def rpc(m, p):
@@ -94,12 +94,26 @@ def handle(path, q):
         return 200, {"chain": "base", "chain_id": 8453, "block": int(b["number"], 16), "block_age_s": max(0, int(time.time()) - int(b["timestamp"], 16)), "base_fee_gwei": int(b.get("baseFeePerGas", "0x0"), 16) / 1e9, "gas_price_gwei": int(rpc("eth_gasPrice", []), 16) / 1e9}
 def req_for(path):
     return {"scheme": "exact", "network": NETWORK, "amount": str(ROUTES[path][0]), "asset": USDC, "payTo": PAY_TO, "maxTimeoutSeconds": 120, "extra": {"name": "USD Coin" if NETWORK == "eip155:8453" else "USDC", "version": "2"}}
+DISCOVERY = json.load(open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "discovery.json")))
+def bazaar(path):
+    """extensions.bazaar in the declareDiscoveryExtension format (info + JSON schema), method already set to GET
+    as the official resource-server extension does. Field descriptions and output examples: api/discovery.json."""
+    ex, d = ROUTES[path][2], DISCOVERY[path]
+    inp = {"type": "http", "method": "GET"}; inp_s = {"type": {"type": "string", "const": "http"}, "method": {"type": "string", "enum": ["GET", "HEAD", "DELETE"]}}
+    if d["params"]:
+        inp["queryParams"] = ex
+        inp_s["queryParams"] = {"type": "object", "properties": d["params"], "required": d["required"]}
+    return {"info": {"input": inp, "output": {"type": "json", "example": d["output"]}},
+            "schema": {"$schema": "https://json-schema.org/draft/2020-12/schema", "type": "object",
+                       "properties": {"input": {"type": "object", "properties": inp_s, "required": ["type", "method"], "additionalProperties": False},
+                                      "output": {"type": "object", "properties": {"type": {"type": "string"}, "example": {"type": "object"}}, "required": ["type"]}},
+                       "required": ["input"]}}
 def required(path, host=""):
     price, desc, ex = ROUTES[path]
     return {"x402Version": 2, "error": "PAYMENT-SIGNATURE header is required", "resource": {"url": (PUBLIC or ("https://" + host)) + path, "description": desc, "mimeType": "application/json"},
-            "accepts": [req_for(path)], "extensions": {"bazaar": {"info": {"input": {"type": "http", "method": "GET", "queryParams": ex}, "output": {"type": "json"}}, "discoverable": True}}}
+            "accepts": [req_for(path)], "extensions": {"bazaar": bazaar(path)}}
 def fac(p, body):
-    r = urllib.request.Request(FAC + p, json.dumps(body).encode(), {"Content-Type": "application/json", "User-Agent": "gbmrafli-base-reads/1.0"})
+    r = urllib.request.Request(FAC + p, json.dumps(body).encode(), {"Content-Type": "application/json", "User-Agent": "gbmrafli-base-reads/1.0", **cdp_auth.headers(FAC, p)})
     try: return json.loads(urllib.request.urlopen(r, timeout=40).read())
     except urllib.error.HTTPError as e: return json.loads(e.read() or b"{}")
 b64 = lambda o: base64.b64encode(json.dumps(o).encode()).decode()
