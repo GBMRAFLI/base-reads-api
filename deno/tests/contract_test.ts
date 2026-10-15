@@ -942,7 +942,7 @@ Deno.test("ledger: rolling the KV back to before a payment never re-opens its au
   assert(LG.isConsumed("auth", key), "nonce X recorded in the ledger");
   // roll the KV back: drop everything written since the snapshot (nonce lock + pending)
   for await (const e of k.list({ prefix: ["nonce"] })) if (!before.has(JSON.stringify(e.key))) await k.delete(e.key);
-  await k.delete(["pending", key]);
+  await k.delete(["pending", key]); await k.delete(["authused", key]); // ledger-only from here
   assertEquals((await k.get(["nonce", key])).versionstamp, null);
   assert(LG.isConsumed("auth", key), "ledger untouched by the KV rollback");
   const [code, body] = await t.call(sig);
@@ -977,4 +977,38 @@ Deno.test("finality: settled only after MIN_CONFIRMATIONS", async () => {
   assertEquals(await f(101, 3).then((x) => [x.settled, x.reason, x.confirmations]), [null, "awaiting_confirmations", 2]);
   assertEquals(await f(102, 3).then((x) => [x.settled, x.confirmations]), [true, 3]);
   assertEquals((await f(0, 1)).settled, true); // default 1: receipt is enough (previous behaviour)
+});
+
+Deno.test("defense in depth: reuse rejected when the authorization / tx is only in the KV or only in the ledger", async () => {
+  await resetGuards(); const { kv } = await import("../lib/store.ts"); const k = await kv();
+  // authorization present only in the KV copy
+  const t = rig({ v: { settled: true } }); const n = rnd(); const key = "auth:" + PAYER.toLowerCase() + ":" + n.toLowerCase();
+  await k.set(["authused", key], 1); assert(!LG.isConsumed("auth", key));
+  const [c, b] = await t.call(pay("/base/network", {}, n));
+  assertEquals([c, b.error], [402, "payment authorization already used"]); assertEquals(t.calls.filter((x) => x === "/settle").length, 0);
+  // authorization present only in the ledger
+  const n2 = rnd(); const key2 = "auth:" + PAYER.toLowerCase() + ":" + n2.toLowerCase(); LG.consume("auth", key2);
+  assertEquals((await k.get(["authused", key2])).versionstamp, null);
+  assertEquals((await t.call(pay("/base/network", {}, n2)))[0], 402);
+  // tx: only in KV, only in ledger, in neither
+  const SGm = await import("../lib/settle_guard.ts");
+  const t1 = rnd(); await k.set(["txused", t1], 1); assertEquals(await SGm.claimTx(t1), false);
+  const t2 = rnd(); LG.consume("tx", t2); assertEquals(await SGm.claimTx(t2), false);
+  const t3 = rnd(); assertEquals(await SGm.claimTx(t3), true);
+  assert(LG.isConsumed("tx", t3)); assert((await k.get(["txused", t3])).versionstamp !== null); // written to both
+});
+
+Deno.test("startup refuses an in-memory ledger on mainnet; testnet needs explicit opt-in", async () => {
+  const e = (m: Record<string, string>) => (k: string) => m[k];
+  assert(LG.ledgerConfigError(e({}))?.includes("mainnet")); // NETWORK defaults to mainnet
+  assert(LG.ledgerConfigError(e({ NETWORK: "eip155:8453", LEDGER_MEMORY_OK: "1" }))?.includes("mainnet"));
+  assert(LG.ledgerConfigError(e({ NETWORK: "eip155:84532" })) !== null);
+  assertEquals(LG.ledgerConfigError(e({ NETWORK: "eip155:84532", LEDGER_MEMORY_OK: "1" })), null);
+  assertEquals(LG.ledgerConfigError(e({ KV_PATH: "/var/lib/x/kv.sqlite3" })), null);
+  assertEquals(LG.ledgerConfigError(e({ LEDGER_PATH: "/var/lib/x/l.sqlite3" })), null);
+  // real process: mainnet config without any path exits with the error before serving
+  const p = new Deno.Command(Deno.execPath(), { args: ["run", "-A", "--config", new URL("../deno.json", import.meta.url).pathname, new URL("../main.ts", import.meta.url).pathname],
+    clearEnv: true, env: { PATH: Deno.env.get("PATH") ?? "", HOME: Deno.env.get("HOME") ?? "", PORT: "0", SNAPSHOT_SCHEDULER: "0" }, stdout: "piped", stderr: "piped" });
+  const out = await p.output(); const err = new TextDecoder().decode(out.stderr);
+  assert(!out.success); assert(err.includes("payment ledger needs a file"), err.slice(0, 300));
 });

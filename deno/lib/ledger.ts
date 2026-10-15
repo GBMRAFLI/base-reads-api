@@ -18,6 +18,15 @@ export function ledgerPath(env: (k: string) => string | undefined = (k) => Deno.
   return kvp ? kvp.replace(/[^/]*$/, "") + "ledger.sqlite3" : ":memory:";
 }
 /** Open (or return) the ledger. Without a path, the already-open ledger is reused, else LEDGER_PATH/KV_PATH decides. */
+/** Startup guard: a file ledger is required. In-memory only with LEDGER_MEMORY_OK=1 and never on Base mainnet.
+ * The ledger needs a local filesystem (node:sqlite); serverless hosts without one are not supported. */
+export function ledgerConfigError(env: (k: string) => string | undefined): string | null {
+  if (ledgerPath(env) !== ":memory:") return null;
+  const net = env("NETWORK") ?? "eip155:8453";
+  if (net === "eip155:8453") return "payment ledger needs a file: set LEDGER_PATH or KV_PATH (in-memory is never allowed on Base mainnet)";
+  if (env("LEDGER_MEMORY_OK") !== "1") return "payment ledger needs a file: set LEDGER_PATH or KV_PATH (or LEDGER_MEMORY_OK=1 on testnet)";
+  return null;
+}
 export function openLedger(path?: string): DatabaseSync {
   if (db && (path === undefined || dbPath === path)) return db;
   path ??= ledgerPath();
@@ -48,6 +57,7 @@ export function ledgerCount(): number {
 export async function migrateFromKv(k: Deno.Kv): Promise<{ auth: number; tx: number }> {
   const out = { auth: 0, tx: 0 };
   for await (const e of k.list({ prefix: ["nonce"] })) if (typeof e.key[1] === "string" && consume("auth", e.key[1], { migrated: true })) out.auth++;
+  for await (const e of k.list({ prefix: ["authused"] })) if (typeof e.key[1] === "string" && consume("auth", e.key[1], { migrated: true })) out.auth++;
   for await (const e of k.list({ prefix: ["txused"] })) if (typeof e.key[1] === "string" && consume("tx", e.key[1], { migrated: true })) out.tx++;
   return out;
 }

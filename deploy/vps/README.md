@@ -24,6 +24,10 @@
      settlement tx hashes. Append-only (UPDATE/DELETE are rejected by triggers), WAL with `synchronous=FULL`, so an
      entry is fsync'ed before the payment is settled or served. Deploys, rollbacks and `--restore-kv` never touch it.
      On start, replay keys left in the KV by older releases are imported once.
+     The ledger needs a local filesystem (node:sqlite); serverless hosts without one are not supported. The server
+     refuses to start without a file ledger (`LEDGER_PATH`, or derived from `KV_PATH`); an in-memory ledger is only
+     allowed on testnet with `LEDGER_MEMORY_OK=1`, never on Base mainnet. As defense in depth, spent authorizations
+     and tx hashes are also written to the KV (`authused`, `txused`); a reuse is rejected if either store has it.
    `base-reads-kv-backup.timer` makes a daily consistent copy of both (14 daily + 8 weekly each).
    Backups are local to the server only and are lost with it. For an offsite copy, add an executable
    `/etc/base-reads/backup-offsite.sh`; it receives the backup path and must encrypt (e.g. age or gpg) before uploading.

@@ -326,7 +326,7 @@ async function paid(path: string, q: Record<string, string>, qs: string, sig: st
   }
   // KV claim is only an in-flight lock; the append-only ledger is the source of truth for spent authorizations,
   // so a rolled-back or restored KV can never let a spent authorization through again.
-  if (LG.isConsumed("auth", key)) return [402, { error: "payment authorization already used" }, noPay("replay", N)];
+  if (await SG.authUsed(key)) return [402, { error: "payment authorization already used" }, noPay("replay", N)];
   const body = { x402Version: 2, paymentPayload: payload, paymentRequirements: r };
   const v = await fac("/verify", body); const tVer = iso();
   if (!v.isValid) { const why = facErr(v.invalidReason); await FAILS.fail({ ip: ids.ip }, "verify"); return [402, { error: why }, noPay(why, N)]; }
@@ -340,7 +340,7 @@ async function paid(path: string, q: Record<string, string>, qs: string, sig: st
   }
   if (code !== 200) return [code, out, {}]; // bad input: not settled, not charged
   // point of no return: record the authorization as consumed (fsync'ed) before asking for settlement
-  if (!LG.consume("auth", key, { path, payload_sha256: await SG.payloadHash(payload!) })) return [402, { error: "payment authorization already used" }, noPay("replay", N)];
+  if (!await SG.consumeAuth(key, { path, payload_sha256: await SG.payloadHash(payload!) })) return [402, { error: "payment authorization already used" }, noPay("replay", N)];
   const st = await fac("/settle", body); const tSet = iso(); const times: [string, string, string] = [tReq, tVer, tSet];
   const tx: string | null = typeof st.transaction === "string" && SG.TX_RE.test(st.transaction) ? st.transaction.toLowerCase() : null;
   if (typeof st.payer === "string" && st.payer.toLowerCase() !== who) mismatch("facilitator_payer_differs_from_signed_from");
@@ -395,7 +395,7 @@ if (import.meta.main) {
     Deno.cron("fail-counter-purge", "7 0 * * *", async () => { await FAILS.purge(); });
   }
   for (const w of startupWarnings(env)) console.warn("WARNING:", w);
-  if (!env("LEDGER_PATH") && !env("KV_PATH")) console.warn("WARNING: LEDGER_PATH and KV_PATH unset: payment ledger is in memory only (not durable)");
+  const lerr = LG.ledgerConfigError(env); if (lerr) throw new Error(lerr); // refuse to start without a durable ledger
   LG.openLedger(LG.ledgerPath(env));
   const mig = await LG.migrateFromKv(await kv()); // one-time import of replay keys kept in KV by older releases
   if (mig.auth || mig.tx) console.log("ledger: imported", JSON.stringify(mig));
