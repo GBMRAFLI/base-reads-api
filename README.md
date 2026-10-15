@@ -10,26 +10,66 @@ pinned: false
 
 # Base Reads (x402)
 
-Pay-per-call Base mainnet reads for agents, via [x402](https://x402.org) v2 (USDC on Base, `exact` scheme). Deterministic JSON-RPC reads only; no LLMs.
+Pay-per-call Base mainnet reads and signed pre-payment checks for x402 endpoints, via [x402](https://x402.org) v2
+(USDC on Base, `exact` scheme). Deterministic code only: no LLMs, no advice. Maintained by GBMRAFLI.
 
-| Route | Price | Returns |
+## Paid routes (GET)
+
+| Route | Price (USDC) | Returns |
 |---|---|---|
-| `GET /base/usdc-balance?address=0x…` | $0.001 | USDC + ETH balance |
-| `GET /base/tx-status?hash=0x…` | $0.002 | success/failed/pending, block, confirmations, gas |
-| `GET /base/basename?name=jesse` or `?address=0x…` | $0.003 | Basename ⇄ address (reverse is forward-verified) |
-| `GET /base/network` | $0.001 | block, block age, base fee, gas price |
-| `GET /base/address-intel?address=0x…` | $0.005 | USDC+ETH, verified Basename, tx count, is_contract |
+| `/base/usdc-balance?address=0x…` | $0.001 | USDC + ETH balance |
+| `/base/tx-status?hash=0x…` | $0.002 | success/failed/pending, block, confirmations, gas |
+| `/base/basename?name=jesse` or `?address=0x…` | $0.003 | Basename ⇄ address (reverse is forward-verified) |
+| `/base/network` | $0.001 | block, block age, base fee, gas price |
+| `/base/address-intel?address=0x…` | $0.005 | USDC+ETH, verified Basename, tx count, is_contract |
+| `/x402/preflight?url=https://…` | $0.001 | Pre-pay Check: Ed25519-signed facts about another x402 endpoint |
 
-Unpaid requests return `402` with a `PAYMENT-REQUIRED` header. Invalid input or RPC errors are never settled, so you are not charged for them.
+Unpaid requests return `402` with a `PAYMENT-REQUIRED` header (x402 v2, with Bazaar discovery metadata).
+Invalid input or upstream errors are never settled, so you are not charged for them. A paid response is returned only
+after the payment is settled **and** independently confirmed on Base (see [SECURITY.md](SECURITY.md)); if the chain
+has not shown the transfer yet you get `202` and the same request (same payment header) is served once it does.
 
-Maintained by GBMRAFLI.
+## Free routes (GET)
 
-## Pre-pay Check (`GET /x402/preflight?url=`) — $0.001 USDC on Base
-Signed (Ed25519) deterministic facts about an x402 endpoint before you pay it: challenge validity,
-reachability and latency, host listing count, payout wallet reuse across hosts, last-called time and
-payer trend from daily Bazaar snapshots. Facts only; no advice. Public key: `GET /x402/preflight/pubkey`.
+| Route | Returns |
+|---|---|
+| `/` | service info, prices, facilitator in use |
+| `/.well-known/x402-preflight` | public key, key_id, fingerprint, how to verify, facilitator, repo |
+| `/.well-known/x402-preflight-key-history.json` | current and retired signing keys with dates |
+| `/x402/preflight/pubkey` | `{alg, public_key_b64, key_id, fingerprint, fingerprint_short, created_at}` |
+| `/bazaar/snapshots` | daily Bazaar snapshot history: counts of listings, hosts, payout wallets, 30-day calls and payers |
+| `/.well-known/bazaar-snapshot.json` | signed snapshot-series metadata (version, started_at, last_updated, total_snapshots, covered_listings) |
+
+## Pre-pay Check
+Facts only: challenge validity, reachability and latency, Bazaar listing, host listing count, payout wallet reuse
+across hosts, last-called time and payer trend from daily snapshots. Example response (abridged):
+
+```json
+{"facts": {"schema": "prepay-check/v1", "target": "https://x402.org/protected", "checked_at": "2026-10-15T00:00:00Z",
+           "disclaimer": "Deterministic observations only. Not advice to pay, buy or sell.",
+           "reachability": {"reachable": true, "http_status": 402, "latency_ms": 180},
+           "challenge": {"valid": true, "problems": [], "accepts": [{"scheme": "exact", "network": "eip155:8453", "amount": "10000", "payTo": "0x…"}]},
+           "bazaar": {"available": true, "snapshot_date": "2026-10-15", "listed": true, "host_listing_count": 3, "payout_wallet_reuse": {}, "payer_trend": []}},
+ "signature": {"alg": "Ed25519", "key_id": "72cb9da845cc948f", "public_key_b64": "…", "value_b64": "…",
+               "signed_over": "canonical JSON of facts (sorted keys, no whitespace)"}}
+```
+
+### Verify the signature
+```python
+import base64, json
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+body = ...  # the JSON response above
+msg = json.dumps(body["facts"], sort_keys=True, separators=(",", ":")).encode()
+Ed25519PublicKey.from_public_bytes(base64.b64decode(body["signature"]["public_key_b64"])).verify(base64.b64decode(body["signature"]["value_b64"]), msg)
+```
+Then check `signature.key_id` against `GET /.well-known/x402-preflight` (or pin the fingerprint). `key_id` is the first
+16 hex characters of SHA-256 of the raw public key; `fingerprint` is `SHA256:` + base64 of the same digest.
 Hook examples for the official clients: `examples/ts/preflight-hook.ts`, `examples/python/preflight_hook.py`.
-Daily snapshot job: `python scripts/bazaar_snapshot.py` (see `render.yaml`).
+
+## Facilitator
+Payments are verified and settled by the facilitator in `FACILITATOR` (default PayAI, `https://facilitator.payai.network`;
+optionally the CDP facilitator, see below). The one in use is shown live in `/` and `/.well-known/x402-preflight`.
+The seller never signs or sends funds; it only receives USDC at its payee wallet.
 
 ## Sales log
 Both paid routes write to one sales log (chain_reads = `/base/*`, endpoint_check =

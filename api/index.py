@@ -3,7 +3,7 @@ Zero-LLM: every route is 100% deterministic code (JSON-RPC reads only)."""
 import json, os, re, base64, time, urllib.request, urllib.parse, sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import preflight as PF
-import sales_log as MS, cdp_auth
+import sales_log as MS, cdp_auth, settle_guard as SG
 iso = lambda t: time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(t)) + ".%03dZ" % int((t % 1) * 1000)
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from Crypto.Hash import keccak as _k
@@ -108,9 +108,13 @@ def bazaar(path):
                        "properties": {"input": {"type": "object", "properties": inp_s, "required": ["type", "method"], "additionalProperties": False},
                                       "output": {"type": "object", "properties": {"type": {"type": "string"}, "example": {"type": "object"}}, "required": ["type"]}},
                        "required": ["input"]}}
+HOST_RE = re.compile(r"^[A-Za-z0-9.-]{1,253}(:[0-9]{1,5})?$")
+def safe_host(h):
+    """The Host header is client-controlled; only a plain hostname[:port] may appear in the challenge's resource URL."""
+    return h if HOST_RE.match(h or "") else "invalid-host"
 def required(path, host=""):
     price, desc, ex = ROUTES[path]
-    return {"x402Version": 2, "error": "PAYMENT-SIGNATURE header is required", "resource": {"url": (PUBLIC or ("https://" + host)) + path, "description": desc, "mimeType": "application/json"},
+    return {"x402Version": 2, "error": "PAYMENT-SIGNATURE header is required", "resource": {"url": (PUBLIC or ("https://" + safe_host(host))) + path, "description": desc, "mimeType": "application/json"},
             "accepts": [req_for(path)], "extensions": {"bazaar": bazaar(path)}}
 def fac(p, body):
     r = urllib.request.Request(FAC + p, json.dumps(body).encode(), {"Content-Type": "application/json", "User-Agent": "gbmrafli-base-reads/1.0", **cdp_auth.headers(FAC, p)})
@@ -128,12 +132,137 @@ def export(auth, q):
     since = urllib.parse.unquote(q.get("since", ""))
     out = {n.split(".")[0]: [r for r in MS.rows(n) if not since or (r.get("startedAt") or r.get("verifiedAt") or r.get("observedAt") or r.get("incurredAt") or "") >= since] for n in EXPORT_FILES}
     return 200, {"payTo": PAY_TO, "network": NETWORK, "asset": USDC, "exportedAt": MS.iso(), "records": out}
+REPO_URL = os.environ.get("REPO_URL", "https://github.com/GBMRAFLI/base-reads-api")
+def root():
+    return {"service": "GBMRAFLI Base Reads", "network": NETWORK, "protocol": "x402 v2", "facilitator": facilitator_info(),
+            "free": ["/.well-known/x402-preflight", "/.well-known/x402-preflight-key-history.json", "/.well-known/bazaar-snapshot.json", "/x402/preflight/pubkey", "/bazaar/snapshots"],
+            "routes": {k: {"price_usdc": v[0] / 1e6, "description": v[1]} for k, v in ROUTES.items()}}
+def facilitator_info():
+    """Which facilitator verifies/settles payments, derived from FACILITATOR (never hardcoded in responses)."""
+    h = (urllib.parse.urlsplit(FAC).hostname or "").lower()
+    name = "CDP" if h == cdp_auth.CDP_HOST else "PayAI" if h == "payai.network" or h.endswith(".payai.network") else h
+    return {"name": name, "url": FAC, "auth": "cdp_jwt" if cdp_auth.enabled(FAC) else "none"}
+def well_known():
+    pub = PF.public_key_info()
+    return {"service": "GBMRAFLI Base Reads", "schema": PF.SCHEMA, "alg": "Ed25519", "key_id": pub["key_id"], "public_key_b64": pub["public_key_b64"],
+            "fingerprint": pub["fingerprint"], "fingerprint_short": pub["fingerprint_short"], "created_at": pub["created_at"],
+            "verify": ["Take the paid /x402/preflight response body: {facts, signature}.",
+                       "Serialize facts as canonical JSON: keys sorted, separators (',', ':'), ASCII-only escapes (Python json.dumps(facts, sort_keys=True, separators=(',', ':'))).",
+                       "Verify signature.value_b64 (base64) over those bytes with Ed25519 (RFC 8032) and public_key_b64 (32-byte raw key).",
+                       "Check signature.key_id matches key_id here; key_id = first 16 hex chars of sha256(raw public key)."],
+            "facilitator": facilitator_info(), "repo": REPO_URL, "routes": {"pubkey": "/x402/preflight/pubkey", "key_history": "/.well-known/x402-preflight-key-history.json", "paid_check": "/x402/preflight", "snapshots": "/bazaar/snapshots", "snapshot_meta": "/.well-known/bazaar-snapshot.json"}}
+def snapshot_meta():
+    """Free, signed metadata about the daily Bazaar snapshot series (no snapshot contents)."""
+    dates = PF.snapshot_dates(); last = dates[-1] if dates else None
+    meta = {"version": 1, "started_at": dates[0] if dates else None, "last_updated": last, "total_snapshots": len(dates),
+            "covered_listings": len(PF.load_index(last).get("resources", {})) if last else 0}
+    env = PF.sign(meta)
+    return {"metadata": env["facts"], "signature": env["signature"], "pubkey_url": "/x402/preflight/pubkey"}
+_SNAP_SUM = {}
+def snapshot_summary(limit=30):
+    """Free: daily Bazaar snapshot history (counts only), newest first."""
+    out = []
+    for d in reversed(PF.snapshot_dates()[-limit:]):
+        if d not in _SNAP_SUM:
+            idx = PF.load_index(d); res = idx.get("resources", {})
+            _SNAP_SUM[d] = {"date": d, "resources": len(res), "hosts": len(idx.get("hosts", {})), "payout_wallets": len(idx.get("wallet_hosts", {})),
+                            "calls30d_total": sum((r.get("calls30d") or 0) for r in res.values()), "payers30d_total": sum((r.get("payers30d") or 0) for r in res.values())}
+        out.append(_SNAP_SUM[d])
+    return {"source": "x402 Bazaar discovery API, crawled daily at 00:15 UTC", "snapshots": out}
+REPLAY, FAILS = SG.Replay(), SG.FailLimiter()
+ONCHAIN_CHECK = os.environ.get("ONCHAIN_CHECK", "block")   # block: serve only after the nonce-bound USDC Transfer is confirmed on Base; log: serve on facilitator success, record mismatch
+import threading
+_TX_LOCK, _TX_SEEN = threading.Lock(), set()
+def tx_already_used(tx):
+    """Atomically claim a settlement tx for one served sale (in-process set + durable check against the sales log)."""
+    t = tx.lower()
+    with _TX_LOCK:
+        if t in _TX_SEEN or any((r.get("tx") or "").lower() == t for r in MS.rows("executions.jsonl")): return True
+        _TX_SEEN.add(t); return False
+def no_pay(st):
+    return {"PAYMENT-RESPONSE": b64({"success": False, "errorReason": st, "network": NETWORK})}
+def paid(path, q, qs, sig, t_req, check=None):
+    """verify -> run handler -> settle -> independent on-chain check -> serve. Returns (code, body, headers).
+    block (default): the resource is returned ONLY when Base shows a successful tx with USDC Transfer(payer -> payTo, >= amount)
+    and, for EIP-3009 payments, AuthorizationUsed(payer, nonce) in the same receipt. Facilitator success alone never serves.
+    If the receipt is not visible yet: 202 + the payment is parked; repeating the same request serves it once confirmed.
+    log: serve on facilitator success and record any on-chain mismatch (lower latency, weaker)."""
+    payload, err = SG.parse_payment(sig)
+    if err: return 400, {"error": err}, {}
+    r = req_for(path); nonce = SG.nonce_of(payload)
+    check = check or (lambda tx, rq, payer: MS.verify_onchain(rpc, tx, rq["asset"], rq["payTo"], rq["amount"], payer, NETWORK, attempts=3, wait=1.0, nonce=nonce))
+    key = SG.replay_key(payload, sig)
+    if not REPLAY.claim(key, SG.expiry(payload)):
+        pend = REPLAY.take_pending(key)
+        if pend and pend["path"] == path: return deliver_pending(key, pend, path, q, qs, r, check)
+        if pend: REPLAY.set_pending(key, pend)
+        return 409, {"error": "payment authorization already used or in flight"}, no_pay("replay")
+    bad = SG.precheck(payload, r)
+    if bad: return 402, {"error": bad}, no_pay(bad)
+    who = SG.payer_of(payload)
+    if FAILS.blocked(who): return 429, {"error": "too many failed settlements, retry later"}, {}
+    body = {"x402Version": 2, "paymentPayload": payload, "paymentRequirements": r}
+    v = fac("/verify", body); t_ver = iso(time.time())
+    if not v.get("isValid"): return 402, {"error": v.get("invalidReason", "invalid")}, no_pay(v.get("invalidReason"))
+    try: code, out = handle(path, q)
+    except RuntimeError: return 503, {"error": "signing unavailable, not charged"}, {}
+    except Exception: return 502, {"error": "upstream error, not charged"}, {}
+    if code != 200: return code, out, {}  # bad input: not settled, not charged
+    st = fac("/settle", body); t_set = iso(time.time())
+    tx = st.get("transaction") if isinstance(st.get("transaction"), str) and SG.TX_RE.match(st.get("transaction")) else None
+    payer = st.get("payer") if isinstance(st.get("payer"), str) and SG.ADDR_RE.match(st.get("payer")) else who
+    times = (t_req, t_ver, t_set)
+    if not st.get("success"):
+        oc = check(tx, r, payer) if tx else {"settled": False, "reason": "no_tx_hash"}
+        if oc.get("settled") is True and not tx_already_used(tx):   # facilitator said failed, chain says paid: honor it
+            log_sale(path, r, dict(st, success=True, transaction=tx, payer=payer), times, dict(oc, note="settle_reported_failure_but_confirmed_onchain"), qs, True)
+            return 200, out, {"PAYMENT-RESPONSE": b64(dict(st, success=True, transaction=tx))}
+        FAILS.fail(who)
+        return 402, {"error": st.get("errorReason", "settle failed")}, {"PAYMENT-RESPONSE": b64(st)}
+    if not tx: log_mismatch(path, "settle_success_without_valid_tx_hash"); return 502, {"error": "settlement response invalid, contact support with your payment"}, {}
+    if tx_already_used(tx): log_mismatch(path, "settlement_tx_reused"); return 409, {"error": "settlement transaction already used"}, no_pay("replay")
+    if ONCHAIN_CHECK == "log":
+        oc = check(tx, r, payer); log_sale(path, r, st, times, oc, qs, True)
+        if oc.get("settled") is not True: log_mismatch(path, "onchain_" + str(oc.get("reason")))
+        return 200, out, {"PAYMENT-RESPONSE": b64(st)}
+    oc = check(tx, r, payer)
+    if oc.get("settled") is True: log_sale(path, r, st, times, oc, qs, True); return 200, out, {"PAYMENT-RESPONSE": b64(st)}
+    if oc.get("settled") is None:
+        REPLAY.set_pending(key, {"path": path, "tx": tx, "payer": payer, "st": st, "times": times})
+        return 202, {"status": "settled_pending_onchain_confirmation", "transaction": tx,
+                     "retry": "repeat the same request with the same payment header; it is served once the transfer is confirmed on Base"}, {"PAYMENT-RESPONSE": b64(st)}
+    log_sale(path, r, st, times, oc, qs, False)
+    return 402, {"error": "settlement not confirmed on-chain: " + str(oc.get("reason"))}, {"PAYMENT-RESPONSE": b64(st)}
+def deliver_pending(key, pend, path, q, qs, r, check):
+    oc = check(pend["tx"], r, pend["payer"])
+    if oc.get("settled") is None: REPLAY.set_pending(key, pend); return 202, {"status": "settled_pending_onchain_confirmation", "transaction": pend["tx"]}, {"PAYMENT-RESPONSE": b64(pend["st"])}
+    if oc.get("settled") is False: log_sale(path, r, pend["st"], pend["times"], oc, qs, False); return 402, {"error": "settlement not confirmed on-chain: " + str(oc.get("reason"))}, {}
+    try: code, out = handle(path, q)
+    except Exception: REPLAY.set_pending(key, pend); return 502, {"error": "upstream error, retry the same request"}, {}
+    if code != 200: REPLAY.set_pending(key, pend); return code, out, {}
+    log_sale(path, r, pend["st"], pend["times"], oc, qs, True)
+    return 200, out, {"PAYMENT-RESPONSE": b64(pend["st"])}
+def log_sale(path, r, st, times, oc, qs, served):
+    try:
+        MS.record_sale(path, r, st, times, oc, served)
+        MS.record_observation(path, __import__("hashlib").sha256(qs.encode()).hexdigest()[:16], 200 if served else 402, None)
+    except Exception as e: print("sales log write failed:", type(e).__name__, flush=True)
+def log_mismatch(path, why):
+    try: MS.record_observation(path, "settle-mismatch", 502, None, note=why)
+    except Exception as e: print("sales log write failed:", type(e).__name__, flush=True)
 class handler(BaseHTTPRequestHandler):
     def log_message(s, f, *a): pass
     def do_GET(s):
         path, _, qs = s.path.partition("?"); q = dict(x.split("=", 1) for x in qs.split("&") if "=" in x)
         if path in ("/", "/index.json"):
-            return s._send(200, {"service": "GBMRAFLI Base Reads", "network": NETWORK, "protocol": "x402 v2", "routes": {k: {"price_usdc": v[0] / 1e6, "description": v[1]} for k, v in ROUTES.items()}})
+            return s._send(200, root())
+        if path == "/.well-known/x402-preflight":
+            try: return s._send(200, well_known())
+            except RuntimeError: return s._send(503, {"error": "signing key unavailable"})
+        if path == "/bazaar/snapshots": return s._send(200, snapshot_summary())
+        if path in ("/.well-known/bazaar-snapshot.json", "/.well-known/x402-preflight-key-history.json"):
+            try: return s._send(200, snapshot_meta() if "bazaar" in path else PF.key_history())
+            except RuntimeError: return s._send(503, {"error": "signing key unavailable"})
         if path == "/internal/export":
             code, obj = export(s.headers.get("Authorization", ""), q); return s._send(code, obj)
         if path == "/x402/preflight/pubkey":
@@ -144,24 +273,8 @@ class handler(BaseHTTPRequestHandler):
         t_req = iso(time.time())
         sig = s.headers.get("PAYMENT-SIGNATURE") or s.headers.get("X-PAYMENT")
         if not sig: pr = required(path, s.headers.get("Host", "")); return s._send(402, pr, {"PAYMENT-REQUIRED": b64(pr)})
-        # validate input before charging
-        try: payload = json.loads(base64.b64decode(sig))
-        except Exception: return s._send(400, {"error": "bad payment header"})
-        r = req_for(path); body = {"x402Version": 2, "paymentPayload": payload, "paymentRequirements": r}
-        v = fac("/verify", body); t_ver = iso(time.time())
-        if not v.get("isValid"): return s._send(402, {"error": v.get("invalidReason", "invalid")}, {"PAYMENT-RESPONSE": b64({"success": False, "errorReason": v.get("invalidReason"), "network": NETWORK})})
-        try: code, out = handle(path, q)
-        except RuntimeError: return s._send(503, {"error": "signing unavailable, not charged"})
-        except Exception as e: return s._send(502, {"error": "upstream error, not charged"})
-        if code != 200: return s._send(code, out)  # bad input: not settled, not charged
-        st = fac("/settle", body)
-        if not st.get("success"): return s._send(402, {"error": st.get("errorReason", "settle failed")}, {"PAYMENT-RESPONSE": b64(st)})
-        t_set = iso(time.time()); s._send(200, out, {"PAYMENT-RESPONSE": b64(st)})  # deliver first, then verify on-chain
-        try:
-            oc = MS.verify_onchain(rpc, st.get("transaction"), r["asset"], r["payTo"], r["amount"], st.get("payer"), NETWORK)
-            MS.record_sale(path, r, st, (t_req, t_ver, t_set), oc)
-            MS.record_observation(path, __import__("hashlib").sha256(qs.encode()).hexdigest()[:16], 200, None)
-        except Exception as e: print("sales log write failed:", type(e).__name__, flush=True)
+        code, out, hd = paid(path, q, qs, sig, t_req)
+        return s._send(code, out, hd)
     def _send(s, code, obj, hd={}):
         b = json.dumps(obj).encode()
         try:

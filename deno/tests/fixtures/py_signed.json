@@ -5,7 +5,10 @@
  "pubkey": {
   "alg": "Ed25519",
   "public_key_b64": "0Z5G5ZUMV5bxHFT5/Mui+r1/e2VrZoFMygMNSrmr8sQ=",
-  "key_id": "440838273608fa36"
+  "key_id": "440838273608fa36",
+  "fingerprint": "SHA256:RAg4JzYI+jbIhDdXwkemiO28ug1tjIHE72VyDvUj5RA",
+  "fingerprint_short": "4408 3827 3608 fa36",
+  "created_at": null
  },
  "envelope": {
   "facts": {

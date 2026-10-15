@@ -62,9 +62,24 @@ export function loadKey(env: (k: string) => string | undefined = (k) => Deno.env
   cached.catch(() => { cached = null; });
   return cached;
 }
-export async function publicKeyInfo() {
+/** Identity of a raw Ed25519 public key: key_id, SSH-style fingerprint, grouped short form (same as Python key_meta). */
+export function keyMeta(raw: Uint8Array, createdAt: string | null = null) {
+  const d = sha256(raw); const kid = hex(d).slice(0, 16);
+  return { alg: "Ed25519", public_key_b64: b64e(raw), key_id: kid, fingerprint: "SHA256:" + b64e(d).replace(/=+$/, ""),
+    fingerprint_short: kid.match(/.{4}/g)!.join(" "), created_at: createdAt };
+}
+export async function publicKeyInfo(env: (k: string) => string | undefined = (k) => Deno.env.get(k)) {
   const { pubRaw } = await loadKey();
-  return { alg: "Ed25519", public_key_b64: b64e(pubRaw), key_id: hex(sha256(pubRaw)).slice(0, 16) };
+  return keyMeta(pubRaw, env("SIGNING_KEY_CREATED_AT") || null);
+}
+export async function keyHistory(env: (k: string) => string | undefined = (k) => Deno.env.get(k)) {
+  let retired: any[] = []; try { const x = JSON.parse(env("SIGNING_KEY_HISTORY") || "[]"); if (Array.isArray(x)) retired = x; } catch { /* ignore */ }
+  const out: Record<string, unknown>[] = [];
+  for (const k of retired) {
+    let raw: Uint8Array; try { raw = b64d(k.public_key_b64); } catch { continue; }
+    if (raw.length === 32) out.push({ ...keyMeta(raw, k.created_at ?? null), retired_at: k.retired_at ?? null, status: "retired" });
+  }
+  return { current: { ...(await publicKeyInfo(env)), status: "active" }, retired: out };
 }
 export async function sign(facts: Record<string, unknown>) {
   const { priv } = await loadKey(); const pub = await publicKeyInfo();
