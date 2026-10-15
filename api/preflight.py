@@ -37,8 +37,28 @@ def key_meta(raw, created_at=None):
     return {"alg": "Ed25519", "public_key_b64": base64.b64encode(raw).decode(), "key_id": kid,
             "fingerprint": "SHA256:" + base64.b64encode(d).decode().rstrip("="), "fingerprint_short": " ".join(kid[i:i + 4] for i in range(0, 16, 4)),
             "created_at": created_at}
+ISO_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,9})?Z$")
+def iso_or_none(x):
+    """Strict ISO-8601 UTC (YYYY-MM-DDTHH:MM:SS[.fff]Z) that is a real date, else None."""
+    if not isinstance(x, str) or not ISO_RE.match(x): return None
+    try: time.strptime(x[:19], "%Y-%m-%dT%H:%M:%S")
+    except ValueError: return None
+    return x
+def startup_warnings(env=os.environ):
+    """Non-fatal configuration problems, logged once at startup."""
+    w = []; ca = env.get("SIGNING_KEY_CREATED_AT")
+    if ca and not iso_or_none(ca): w.append("SIGNING_KEY_CREATED_AT is not strict ISO-8601 UTC (YYYY-MM-DDTHH:MM:SSZ); published as null")
+    try:
+        h = json.loads(env.get("SIGNING_KEY_HISTORY") or "[]")
+        if not isinstance(h, list): w.append("SIGNING_KEY_HISTORY is not a JSON list; ignored")
+        else:
+            for i, k in enumerate(h):
+                for f in ("created_at", "retired_at"):
+                    if isinstance(k, dict) and k.get(f) is not None and not iso_or_none(k[f]): w.append(f"SIGNING_KEY_HISTORY[{i}].{f} is not strict ISO-8601 UTC; published as null")
+    except ValueError: w.append("SIGNING_KEY_HISTORY is not valid JSON; ignored")
+    return w
 def _created_at():
-    if os.environ.get("SIGNING_KEY_CREATED_AT"): return os.environ["SIGNING_KEY_CREATED_AT"]
+    if os.environ.get("SIGNING_KEY_CREATED_AT"): return iso_or_none(os.environ["SIGNING_KEY_CREATED_AT"])
     if not os.environ.get("SIGNING_KEY_ENC_B64") and os.path.exists(KEY_PATH):
         return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(os.path.getmtime(KEY_PATH)))
     return None
@@ -50,9 +70,9 @@ def key_history():
     except ValueError: retired = []
     out = []
     for k in retired if isinstance(retired, list) else []:
-        try: raw = base64.b64decode(k["public_key_b64"])
+        try: raw = base64.b64decode(str(k["public_key_b64"]), validate=True)
         except Exception: continue
-        if len(raw) == 32: out.append(dict(key_meta(raw, k.get("created_at")), retired_at=k.get("retired_at"), status="retired"))
+        if len(raw) == 32: out.append(dict(key_meta(raw, iso_or_none(k.get("created_at"))), retired_at=iso_or_none(k.get("retired_at")), status="retired"))
     return {"current": dict(public_key_info(), status="active"), "retired": out}
 def canonical(o): return json.dumps(o, sort_keys=True, separators=(",", ":")).encode()
 def sign(facts):
@@ -66,11 +86,25 @@ def verify(envelope):
 
 # ---------- target URL safety (no SSRF, no DNS rebinding) ----------
 import http.client, ssl
-_EXTRA = [ipaddress.ip_network(c.strip()) for c in os.environ.get("PREFLIGHT_EXTRA_ALLOWED_CIDRS", "").split(",") if c.strip()]  # local proxy testing only
+def _extra_cidrs(env=os.environ):
+    """PREFLIGHT_EXTRA_ALLOWED_CIDRS bypasses the address checks (local proxy tests only). Refuse to start with it
+    unless PREFLIGHT_TEST_MODE=1 is also set, so it cannot be left on in production by accident."""
+    raw = env.get("PREFLIGHT_EXTRA_ALLOWED_CIDRS", "")
+    if not raw.strip(): return []
+    if env.get("PREFLIGHT_TEST_MODE") != "1":
+        raise SystemExit("PREFLIGHT_EXTRA_ALLOWED_CIDRS is set without PREFLIGHT_TEST_MODE=1: refusing to start (it disables SSRF address checks)")
+    print("WARNING: PREFLIGHT_EXTRA_ALLOWED_CIDRS active (test mode): SSRF address checks relaxed for", raw, flush=True)
+    return [ipaddress.ip_network(c.strip()) for c in raw.split(",") if c.strip()]
+_EXTRA = _extra_cidrs()
+_EMBED_V4 = [ipaddress.ip_network(n) for n in ("::ffff:0:0/96", "::/96", "64:ff9b::/96", "64:ff9b:1::/48", "2002::/16", "2001::/32")]
 def ip_allowed(ip):
+    """Only globally routable unicast. is_global also excludes shared/CGNAT 100.64/10, which is_private does not.
+    IPv6 forms that embed an IPv4 address (mapped, compatible, NAT64, 6to4, Teredo) are refused outright."""
     a = ipaddress.ip_address(ip)
     if any(a in n for n in _EXTRA): return True
-    return not (a.is_private or a.is_loopback or a.is_link_local or a.is_reserved or a.is_multicast or a.is_unspecified)
+    if a.version == 6 and any(a in n for n in _EMBED_V4): return False
+    return a.is_global and not (a.is_private or a.is_loopback or a.is_link_local or a.is_reserved or a.is_multicast or a.is_unspecified)
+ALLOWED_PORTS = (443, 8443)
 def resolve_pinned(host, port, resolver=socket.getaddrinfo):
     """Resolve ONCE. Reject if ANY answer is non-public; return the first IP to pin the connection to."""
     try: ips = [a[4][0] for a in resolver(host, port, 0, socket.SOCK_STREAM)]
@@ -83,8 +117,11 @@ def check_url(url, resolver=socket.getaddrinfo):
     """-> (parts, pinned_ip, error)."""
     try: u = urllib.parse.urlsplit(url); port = u.port or 443
     except Exception: return None, None, "unparseable url"
+    if any(c in url for c in "\r\n\t ") or "\\" in url: return None, None, "unparseable url"
     if u.scheme != "https" or not u.hostname: return None, None, "url must be https://host/..."
     if len(url) > 2048: return None, None, "url too long"
+    if u.username is not None or u.password is not None: return None, None, "credentials in url not allowed"
+    if port not in ALLOWED_PORTS: return None, None, "port not allowed (443, 8443)"
     ip, err = resolve_pinned(u.hostname, port, resolver)
     if err == "dns_unresolvable": return u, None, err
     if err: return None, None, err

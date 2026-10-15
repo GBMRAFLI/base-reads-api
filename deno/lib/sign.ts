@@ -54,9 +54,13 @@ export function loadKey(env: (k: string) => string | undefined = (k) => Deno.env
     const enc = env("SIGNING_KEY_ENC_B64");
     if (!enc) throw new SigningUnavailable("SIGNING_KEY_ENC_B64 missing");
     const pkcs8 = await decryptPem(new TextDecoder().decode(b64d(enc)), pass);
-    const priv = await crypto.subtle.importKey("pkcs8", pkcs8 as Uint8Array<ArrayBuffer>, { name: "Ed25519" }, true, ["sign"]);
-    const jwk = await crypto.subtle.exportKey("jwk", priv);
-    const pubRaw = b64d(jwk.x!.replace(/-/g, "+").replace(/_/g, "/") + "=".repeat((4 - jwk.x!.length % 4) % 4));
+    // Public key: derived once from a short-lived extractable import whose JWK is dropped immediately.
+    // The key kept for signing is NON-extractable (exportKey on it throws), and the decrypted PKCS#8 bytes are zeroed.
+    const tmp = await crypto.subtle.importKey("pkcs8", pkcs8 as Uint8Array<ArrayBuffer>, { name: "Ed25519" }, true, ["sign"]);
+    const x = (await crypto.subtle.exportKey("jwk", tmp)).x!;
+    const pubRaw = b64d(x.replace(/-/g, "+").replace(/_/g, "/") + "=".repeat((4 - x.length % 4) % 4));
+    const priv = await crypto.subtle.importKey("pkcs8", pkcs8 as Uint8Array<ArrayBuffer>, { name: "Ed25519" }, false, ["sign"]);
+    pkcs8.fill(0);
     return { priv, pubRaw };
   })();
   cached.catch(() => { cached = null; });
@@ -68,21 +72,28 @@ export function keyMeta(raw: Uint8Array, createdAt: string | null = null) {
   return { alg: "Ed25519", public_key_b64: b64e(raw), key_id: kid, fingerprint: "SHA256:" + b64e(d).replace(/=+$/, ""),
     fingerprint_short: kid.match(/.{4}/g)!.join(" "), created_at: createdAt };
 }
+/** Strict ISO-8601 UTC timestamp (YYYY-MM-DDTHH:MM:SS[.fff]Z) that is a real date; returns it or null. */
+export const ISO_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,9})?Z$/;
+export function isoOrNull(x: unknown): string | null {
+  if (typeof x !== "string" || !ISO_RE.test(x)) return null;
+  const t = Date.parse(x); if (!Number.isFinite(t)) return null;
+  return new Date(t).toISOString().slice(0, 19) === x.slice(0, 19) ? x : null; // rejects 2026-02-30 etc.
+}
 export async function publicKeyInfo(env: (k: string) => string | undefined = (k) => Deno.env.get(k)) {
-  const { pubRaw } = await loadKey();
-  return keyMeta(pubRaw, env("SIGNING_KEY_CREATED_AT") || null);
+  const { pubRaw } = await loadKey(env);
+  return keyMeta(pubRaw, isoOrNull(env("SIGNING_KEY_CREATED_AT")));
 }
 export async function keyHistory(env: (k: string) => string | undefined = (k) => Deno.env.get(k)) {
   let retired: any[] = []; try { const x = JSON.parse(env("SIGNING_KEY_HISTORY") || "[]"); if (Array.isArray(x)) retired = x; } catch { /* ignore */ }
   const out: Record<string, unknown>[] = [];
   for (const k of retired) {
-    let raw: Uint8Array; try { raw = b64d(k.public_key_b64); } catch { continue; }
-    if (raw.length === 32) out.push({ ...keyMeta(raw, k.created_at ?? null), retired_at: k.retired_at ?? null, status: "retired" });
+    let raw: Uint8Array; try { raw = b64d(String(k?.public_key_b64)); } catch { continue; }
+    if (raw.length === 32) out.push({ ...keyMeta(raw, isoOrNull(k?.created_at)), retired_at: isoOrNull(k?.retired_at), status: "retired" });
   }
   return { current: { ...(await publicKeyInfo(env)), status: "active" }, retired: out };
 }
-export async function sign(facts: Record<string, unknown>) {
-  const { priv } = await loadKey(); const pub = await publicKeyInfo();
+export async function sign(facts: Record<string, unknown>, env: (k: string) => string | undefined = (k) => Deno.env.get(k)) {
+  const { priv } = await loadKey(env); const pub = await publicKeyInfo(env);
   const sig = new Uint8Array(await crypto.subtle.sign("Ed25519", priv, new TextEncoder().encode(canonical(facts))));
   return { facts, signature: { alg: "Ed25519", key_id: pub.key_id, public_key_b64: pub.public_key_b64, value_b64: b64e(sig),
     signed_over: "canonical JSON of facts (sorted keys, no whitespace)" } };

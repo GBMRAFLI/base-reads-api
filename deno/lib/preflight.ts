@@ -14,7 +14,9 @@ export function ipAllowed(ip: string): boolean {
     if (/^(fe[89ab]|fc|fd|ff)/.test(s)) return false;                       // link-local, ULA, multicast
     const m = s.match(/^::ffff:(\d+\.\d+\.\d+\.\d+)$/); if (m) return ipAllowed(m[1]);
     if (s.startsWith("2001:db8") || s.startsWith("64:ff9b") || s.startsWith("100::")) return false;
-    return true;
+    if (s.startsWith("2002:") || /^2001:0{0,4}:/.test(s) || s.startsWith("::")) return false; // 6to4, Teredo, IPv4-compatible (embed IPv4)
+    return /^[23][0-9a-f]{0,3}:/.test(s);                                    // only global unicast 2000::/3
+
   }
   const [a, b] = v4(ip);
   if (a === 0 || a === 10 || a === 127 || a >= 224) return false;           // this-net, private, loopback, multicast+reserved
@@ -28,6 +30,7 @@ export function ipAllowed(ip: string): boolean {
   return true;
 }
 // Returns IPs, [] when the name does not exist, or null when DNS lookup itself is unavailable in the runtime.
+export const ALLOWED_PORTS = new Set(["443", "8443"]);
 export type Resolver = (host: string) => Promise<string[] | null>;
 export const dnsResolver: Resolver = async (host) => {
   const out: string[] = []; let usable = false;
@@ -38,30 +41,98 @@ export const dnsResolver: Resolver = async (host) => {
   return usable ? out : null;
 };
 const isIpLiteral = (h: string) => /^\d+\.\d+\.\d+\.\d+$/.test(h) || h.includes(":");
-export async function checkUrl(url: string, resolver: Resolver = dnsResolver): Promise<{ u: URL | null; err: string | null }> {
+export async function checkUrl(url: string, resolver: Resolver = dnsResolver): Promise<{ u: URL | null; err: string | null; ips?: string[] }> {
   let u: URL; try { u = new URL(url); } catch { return { u: null, err: "unparseable url" }; }
   if (u.protocol !== "https:" || !u.hostname) return { u: null, err: "url must be https://host/..." };
   if (url.length > 2048) return { u: null, err: "url too long" };
+  if (u.username || u.password) return { u: null, err: "credentials in url not allowed" };
+  if (u.port && !ALLOWED_PORTS.has(u.port)) return { u: null, err: "port not allowed (443, 8443)" };
   const host = u.hostname.replace(/^\[|\]$/g, "");
   const ips = isIpLiteral(host) ? [host] : await resolver(host);
-  if (ips === null) return { u, err: null };   // no DNS API: rely on fetch (Deploy has no route to our private networks)
+  // Refuse when we cannot see the addresses we would connect to: no DNS API, or no answers.
+  if (ips === null) return { u: null, err: "dns resolution unavailable" };
   if (!ips.length) return { u, err: "dns_unresolvable" };
   for (const ip of ips) if (!ipAllowed(ip)) return { u: null, err: "target resolves to a non-public address" };
-  return { u, err: null };
+  return { u, err: null, ips };
 }
 
 // ---------- probe (one unpaid GET, no redirects) ----------
 export type Fetcher = (u: string, init: RequestInit) => Promise<Response>;
-export async function probe(u: URL, timeoutMs = 8000, f: Fetcher = fetch): Promise<[Record<string, unknown>, any]> {
-  const t0 = performance.now();
-  let res: Response;
+/** Read at most `cap` bytes of a body, then cancel the stream (never buffers an unbounded response). */
+async function readCapped(res: Response, cap: number): Promise<Uint8Array> {
+  const out = new Uint8Array(cap); let n = 0;
+  if (!res.body) return out.slice(0, 0);
+  const rd = res.body.getReader();
   try {
-    res = await f(u.toString(), { method: "GET", redirect: "manual", headers: { "User-Agent": UA, "Accept": "application/json" }, signal: AbortSignal.timeout(timeoutMs) });
+    while (n < cap) { const { value, done } = await rd.read(); if (done) break; const take = Math.min(value.length, cap - n); out.set(value.subarray(0, take), n); n += take; }
+  } catch { /* truncated */ } finally { rd.cancel().catch(() => {}); }
+  return out.slice(0, n);
+}
+// ---------- pinned HTTPS (no DNS rebinding) ----------
+/** Opens a TCP connection to the already-checked IP and upgrades it to TLS with the ORIGINAL hostname (SNI + certificate
+ * verification), the same as the Python PinnedHTTPSConnection. fetch() would resolve the name again. */
+export type Connector = (ip: string, port: number, host: string) => Promise<{ readable: ReadableStream<Uint8Array>; writable: WritableStream<Uint8Array>; close(): void }>;
+export const pinnedConnect: Connector = async (ip, port, host) => {
+  const tcp = await Deno.connect({ hostname: ip, port, transport: "tcp" });
+  try { return await Deno.startTls(tcp, { hostname: host, alpnProtocols: ["http/1.1"] }); } catch (e) { try { tcp.close(); } catch { /* consumed */ } throw e; }
+};
+export type RawResponse = { status: number; headers: Headers; body: Uint8Array };
+/** One HTTP/1.1 GET over a pinned connection. Header block and body each capped at 64 KB; Connection: close; no redirects. */
+export async function pinnedGet(u: URL, ip: string, timeoutMs = 8000, connect: Connector = pinnedConnect, cap = 65536): Promise<RawResponse> {
+  const port = Number(u.port || 443); const host = u.hostname.replace(/^\[|\]$/g, "");
+  let timer: ReturnType<typeof setTimeout> | undefined; let conn: Awaited<ReturnType<Connector>> | null = null;
+  const work = (async () => {
+    conn = await connect(ip, port, host);
+    const hostHdr = u.port ? `${u.hostname}:${u.port}` : u.hostname;
+    const req = `GET ${u.pathname || "/"}${u.search} HTTP/1.1\r\nHost: ${hostHdr}\r\nUser-Agent: ${UA}\r\nAccept: application/json\r\nAccept-Encoding: identity\r\nConnection: close\r\n\r\n`;
+    const w = conn.writable.getWriter(); await w.write(new TextEncoder().encode(req)); w.releaseLock();
+    const rd = conn.readable.getReader(); let buf = new Uint8Array(0); const limit = cap * 2 + 8192;
+    try {
+      while (buf.length < limit) { const { value, done } = await rd.read(); if (done) break; const nb = new Uint8Array(buf.length + value.length); nb.set(buf); nb.set(value, buf.length); buf = nb; }
+    } finally { rd.cancel().catch(() => {}); }
+    return parseHttp(buf, cap);
+  })();
+  try {
+    return await Promise.race([work, new Promise<never>((_, rej) => { timer = setTimeout(() => rej(Object.assign(new Error("timeout"), { name: "TimeoutError" })), timeoutMs); })]);
+  } finally { clearTimeout(timer); try { (conn as any)?.close(); } catch { /* closed */ } }
+}
+export function parseHttp(buf: Uint8Array, cap = 65536): RawResponse {
+  let he = -1; for (let i = 0; i + 3 < buf.length && i < cap; i++) if (buf[i] === 13 && buf[i + 1] === 10 && buf[i + 2] === 13 && buf[i + 3] === 10) { he = i; break; }
+  if (he < 0) throw Object.assign(new Error("bad response"), { name: "ProtocolError" });
+  const lines = new TextDecoder().decode(buf.subarray(0, he)).split("\r\n");
+  const m = lines[0].match(/^HTTP\/1\.[01] (\d{3})/); if (!m) throw Object.assign(new Error("bad status"), { name: "ProtocolError" });
+  const headers = new Headers();
+  for (const l of lines.slice(1)) { const i = l.indexOf(":"); if (i > 0) try { headers.append(l.slice(0, i).trim(), l.slice(i + 1).trim()); } catch { /* invalid header */ } }
+  let body = buf.subarray(he + 4);
+  if ((headers.get("transfer-encoding") ?? "").toLowerCase().includes("chunked")) {
+    const out: number[] = []; let p = 0; const td = new TextDecoder();
+    while (p < body.length && out.length < cap) {
+      let e = p; while (e + 1 < body.length && !(body[e] === 13 && body[e + 1] === 10)) e++;
+      const n = parseInt(td.decode(body.subarray(p, e)).split(";")[0], 16); if (!Number.isFinite(n) || n === 0) break;
+      const st = e + 2; for (let i = st; i < Math.min(st + n, body.length) && out.length < cap; i++) out.push(body[i]); p = st + n + 2;
+    }
+    body = Uint8Array.from(out);
+  } else {
+    const cl = Number(headers.get("content-length")); if (Number.isFinite(cl) && cl >= 0 && headers.has("content-length")) body = body.subarray(0, cl);
+  }
+  return { status: Number(m[1]), headers, body: body.slice(0, cap) };
+}
+/** One unpaid GET. Production: pinned to the checked IP (`ip`), no re-resolution. A Fetcher is only for tests. */
+export async function probe(u: URL, timeoutMs = 8000, f?: Fetcher, ip?: string, connect: Connector = pinnedConnect): Promise<[Record<string, unknown>, any]> {
+  const t0 = performance.now();
+  let res: { status: number; headers: Headers }; let buf: Uint8Array;
+  try {
+    if (f) {
+      const r = await f(u.toString(), { method: "GET", redirect: "manual", headers: { "User-Agent": UA, "Accept": "application/json" }, signal: AbortSignal.timeout(timeoutMs) });
+      res = r; buf = await readCapped(r, 65536);
+    } else {
+      if (!ip) throw Object.assign(new Error("no pinned ip"), { name: "ConnectionError" });
+      const r = await pinnedGet(u, ip, timeoutMs, connect); res = r; buf = r.body;
+    }
   } catch (e) {
     const name = (e as Error)?.name === "TimeoutError" ? "TimeoutError" : "ConnectionError";
     return [{ reachable: false, error_class: name, latency_ms: Math.round(performance.now() - t0) }, null];
   }
-  const buf = new Uint8Array(await res.arrayBuffer()).slice(0, 65536);
   const lat = Math.round(performance.now() - t0);
   let ch: any = null;
   const pr = res.headers.get("payment-required");
@@ -161,16 +232,16 @@ export async function bazaarFacts(url: string, paytoList: string[], maxTrend = 1
     payout_wallet_reuse: wl, last_called_at: cur ? cur.lastCalledAt : null, payer_trend: trend };
 }
 
-export async function preflight(url: string, opts: { resolver?: Resolver; fetcher?: Fetcher; now?: number } = {}): Promise<[number, unknown]> {
-  const { u, err } = await checkUrl(url, opts.resolver);
+export async function preflight(url: string, opts: { resolver?: Resolver; fetcher?: Fetcher; connect?: Connector; now?: number; env?: (k: string) => string | undefined } = {}): Promise<[number, unknown]> {
+  const { u, err, ips } = await checkUrl(url, opts.resolver);
   if (!u) return [400, { error: err }];
   const base = { schema: SCHEMA, target: url, checked_at: isSoc(opts.now), disclaimer: "Deterministic observations only. Not advice to pay, buy or sell." };
   let reach: Record<string, unknown>, ch: any;
   if (err === "dns_unresolvable") { reach = { reachable: false, error_class: "dns_unresolvable" }; ch = null; }
-  else [reach, ch] = await probe(u, 8000, opts.fetcher);
+  else [reach, ch] = await probe(u, 8000, opts.fetcher, ips?.[0], opts.connect);
   const [valid, problems, acc] = validateChallenge(ch);
   const facts = { ...base, reachability: reach, challenge: { valid, problems, accepts: acc },
     bazaar: await bazaarFacts(url, acc.map((a) => a.payTo as string).filter(Boolean)) };
-  return [200, await sign(facts)];
+  return [200, await sign(facts, opts.env)];
 }
 function isSoc(now?: number) { return isoSec(now ?? Date.now()); }
