@@ -582,3 +582,25 @@ Deno.test("HEAD gate uses the raw request path like GET routing", async () => {
   }
   const h = await handler(new Request("http://h.example/llms.txt?x=1", { method: "HEAD" }), { env }); assertEquals([h.status, h.body], [200, null]);
 });
+Deno.test("usage cut: snapshot capped at N pages, 1 retry, coverage recorded, at most one attempt per 24 h, no startup run", async () => {
+  const S = await import("../lib/snapshot.ts"); const { kv } = await import("../lib/store.ts"); const k = await kv();
+  const mk = (i: number) => ({ resource: `https://h${i % 7}.example/r${i}`, accepts: [{ payTo: "0x" + (i % 3).toString(16).padStart(40, "0") }], quality: {} });
+  let calls = 0;
+  const f = (async (u: string) => { calls++; const off = Number(new URL(u).searchParams.get("offset"));
+    return new Response(JSON.stringify({ items: Array.from({ length: 1000 }, (_, i) => mk(off + i)), pagination: { total: 38020 } })); }) as typeof fetch;
+  const idx = await S.runSnapshot(f, 3, "2001-01-01");
+  assertEquals([calls, idx.listings, idx.coverage], [3, 3000, { pages_fetched: 3, max_pages: 3, items_indexed: 3000, bazaar_total: 38020, complete: false }]);
+  assertEquals([S.maxPages(() => undefined), S.maxPages(() => "5"), S.maxPages(() => "0"), S.maxPages(() => "x"), S.PAGE_TIMEOUT_MS, S.RETRIES], [3, 5, 3, 3, 15000, 1]);
+  let n = 0; const bad = (async () => { n++; throw new Error("down"); }) as typeof fetch;
+  let threw = false; try { await S.runSnapshot(bad, 3, "2001-01-02"); } catch { threw = true; } assert(threw); assertEquals(n, 2); // 1 try + 1 retry, then stop
+  await k.delete(["snapattempt"]); const t0 = Date.UTC(2001, 0, 3); n = 0;
+  assertEquals(await S.scheduledSnapshot(bad, t0), "failed");
+  assertEquals(await S.scheduledSnapshot(f, t0 + 3600_000), "skipped"); // failure also waits 24 h
+  assertEquals(await S.scheduledSnapshot(f, t0 + 25 * 3600_000), "ok");
+  await k.delete(["snapattempt"]);
+  const src = await Deno.readTextFile(new URL("../main.ts", import.meta.url));
+  assert(!src.includes("snapshotIfMissing")); assert(src.includes('"7 0 * * *"'));
+  const facts = await bazaarFacts("https://h1.example/r1", []); assertEquals((facts as any).coverage.complete, false);
+  for (const d of ["2001-01-01", "2001-01-02", "2001-01-03", new Date().toISOString().slice(0, 10)]) { for await (const e of k.list({ prefix: ["snap", d] })) await k.delete(e.key); await k.delete(["snapdate", d]); }
+  clearIndexCache();
+});

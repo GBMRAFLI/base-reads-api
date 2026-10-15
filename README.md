@@ -93,7 +93,7 @@ Transfer logs into the payee on Base, matched to the settlement tx hashes from P
 ## Deno Deploy port (`deno/`)
 TypeScript port with the same routes, 402 challenges (byte-identical body and `PAYMENT-REQUIRED` header), Ed25519 signed
 facts (same encrypted key and pubkey, byte-identical signatures), `/internal/export` with the same bearer auth, and the same
-record format. Storage: Deno KV. Daily Bazaar snapshot: `Deno.cron` at 00:15 UTC.
+record format. Storage: Deno KV. Daily Bazaar snapshot: `Deno.cron` at 00:15 UTC only (never at startup), at most one attempt per 24 h, capped at `SNAPSHOT_MAX_PAGES` pages of 1000 listings (default 3; 15 s per page, 1 retry), 14 days kept. On Deno the snapshot is therefore partial: preflight `bazaar.coverage` (`items_indexed`, `bazaar_total`, `complete`) says how much of the Bazaar the counts cover, and `listed: false` means "not in the indexed part" when `complete` is false.
 Entry point `deno/main.ts`; env: `SIGNING_KEY_PASSPHRASE`, `SIGNING_KEY_ENC_B64`, `EXPORT_TOKEN` (+ optional `PAY_TO_ADDRESS`,
 `SELF_WALLETS`, `PUBLIC_URL`, `RPC`, `FACILITATOR`, `NETWORK`). Contract fixtures come from the Python reference
 (`python scripts/gen_contract_fixture.py`); `tests/fixtures/py_signed.json` holds a public THROWAWAY test key only.

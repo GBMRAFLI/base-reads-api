@@ -166,7 +166,8 @@ export function validateChallenge(ch: any): [boolean, string[], Record<string, u
 
 // ---------- Bazaar snapshot index (same shape as Python build_index) ----------
 export type Index = { date: string; listings: number; hosts: Record<string, number>; wallet_hosts: Record<string, string[]>;
-  resources: Record<string, { payers30d: unknown; calls30d: unknown; lastCalledAt: unknown; payTo: string[] }> };
+  resources: Record<string, { payers30d: unknown; calls30d: unknown; lastCalledAt: unknown; payTo: string[] }>;
+  coverage?: { pages_fetched: number; max_pages: number; items_indexed: number; bazaar_total: number | null; complete: boolean } };
 export function hostOf(url: string) { try { return new URL(url).hostname.toLowerCase(); } catch { return ""; } }
 export class IndexAssembler {
   hosts: Record<string, number> = {}; wallets = new Map<string, Set<string>>(); res: Index["resources"] = {}; n = 0;
@@ -229,7 +230,9 @@ export async function bazaarFacts(url: string, paytoList: string[], maxTrend = 1
   const trend = [];
   for (const d of dates.slice(-maxTrend)) { const r = (d === last ? idx : await loadIndex(d)).resources[key]; trend.push({ snapshot: d, payers30d: r ? r.payers30d : null, calls30d: r ? r.calls30d : null }); }
   return { available: true, snapshot_date: last, listed: cur !== null, listed_payTo: listed, host_listing_count: idx.hosts[h] ?? 0,
-    payout_wallet_reuse: wl, last_called_at: cur ? cur.lastCalledAt : null, payer_trend: trend };
+    payout_wallet_reuse: wl, last_called_at: cur ? cur.lastCalledAt : null, payer_trend: trend,
+    // Partial snapshot: counts cover only the indexed listings; listed:false then means "not in the indexed part".
+    coverage: idx.coverage ?? { complete: null } };
 }
 
 export async function preflight(url: string, opts: { resolver?: Resolver; fetcher?: Fetcher; connect?: Connector; now?: number; env?: (k: string) => string | undefined } = {}): Promise<[number, unknown]> {

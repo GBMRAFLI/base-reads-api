@@ -9,7 +9,7 @@ import { CDP_HOST, enabled as cdpEnabled, headers as cdpHeaders } from "./lib/cd
 import * as SG from "./lib/settle_guard.ts";
 import { SCHEMA, snapshotDates, loadIndex } from "./lib/preflight.ts";
 import { isoOrNull, keyHistory, publicKeyInfo, sign, SigningUnavailable } from "./lib/sign.ts";
-import { snapshotIfMissing, runSnapshot } from "./lib/snapshot.ts";
+import { scheduledSnapshot } from "./lib/snapshot.ts";
 import { EXPORT_FILES, rows } from "./lib/store.ts";
 import { recordObservation, recordSale, verifyOnchain } from "./lib/stream.ts";
 import { ADDR, b64json, iso, pyQuery, sha256hex, unquote } from "./lib/util.ts";
@@ -332,9 +332,8 @@ async function paid(path: string, q: Record<string, string>, qs: string, sig: st
 if (import.meta.main) {
   const env = (k: string) => Deno.env.get(k);
   if ((env("SNAPSHOT_SCHEDULER") ?? "1") === "1") {
-    Deno.cron("bazaar-snapshot", "15 0 * * *", async () => { await runSnapshot(); });
-    Deno.cron("fail-counter-purge", "7 * * * *", async () => { await FAILS.purge(); });
-    snapshotIfMissing().catch((e) => console.log("snapshot failed:", (e as Error).name));
+    Deno.cron("bazaar-snapshot", "15 0 * * *", async () => { await scheduledSnapshot(); }); // bounded, max once per 24 h
+    Deno.cron("fail-counter-purge", "7 0 * * *", async () => { await FAILS.purge(); });
   }
   for (const w of startupWarnings(env)) console.warn("WARNING:", w);
   assertOnchainMode(env); // refuse to start with ONCHAIN_CHECK=log on Base mainnet
