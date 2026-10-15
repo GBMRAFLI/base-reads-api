@@ -1,4 +1,5 @@
 // Port of api/settle_guard.py (see SECURITY.md). Replay claims live in Deno KV with atomic checks, so they hold across isolates.
+import * as LG from "./ledger.ts";
 import { kv } from "./store.ts";
 import { sha256hex } from "./util.ts";
 export const MAX_HEADER = 16384, MIN_VALID_WINDOW = 6;
@@ -87,11 +88,9 @@ export async function takePending(key: string): Promise<any | null> {
   const r = await k.atomic().check(e).delete(["pending", key]).commit();
   return r.ok ? e.value : null;
 }
-/** Durable, atomic: a settlement tx hash is stored in KV (no expiry) the first time it backs a sale; false if already used. */
-export async function claimTx(tx: string): Promise<boolean> {
-  const k = await kv(); const kk = ["txused", tx.toLowerCase()];
-  return (await k.atomic().check({ key: kk, versionstamp: null }).set(kk, Date.now()).commit()).ok;
-}
+/** Durable, atomic: a settlement tx hash is recorded in the append-only payment ledger (separate file, fsync'ed)
+ * the first time it backs a sale; false if already used. Never stored in the KV store, so KV restores cannot re-open it. */
+export async function claimTx(tx: string): Promise<boolean> { return LG.consume("tx", tx); }
 /** Per-IP limit key: IPv4 as-is, IPv6 collapsed to its /64 (one subscriber/host usually owns a whole /64). */
 export function ipKey(ip: string | null | undefined): string | null {
   if (!ip) return null;

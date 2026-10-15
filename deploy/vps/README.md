@@ -14,10 +14,16 @@
    release are restored. The newest 5 releases are kept.
    - Default rollback is code-only: the live KV is never replaced, so used nonces / tx hashes and sale records stay.
    - `--restore-kv` is for releases that migrate KV data. The service is stopped before the KV copy, so paid routes are
-     down for the whole deploy. On rollback the copy is restored and `kv-merge.ts` copies every `txused`, `nonce`, `rec`,
-     `pending` and `inflight` key from the live KV into it first, so replay protection and accounting survive.
+     down for the whole deploy. On rollback the copy is restored and `kv-merge.ts` copies every `rec`, `pending` and
+     `inflight` key from the live KV into it first. Replay protection does not depend on this: it lives in the ledger.
    - `--restore-kv` copies live in `/var/backups/base-reads/predeploy-*` (root, mode 700). They are full copies of the KV,
      including sale records, so treat them as sensitive; only the newest 5 are kept.
-5. KV lives in `KV_PATH` (SQLite); `base-reads-kv-backup.timer` makes a daily consistent copy (14 daily + 8 weekly).
+5. Storage is split in two SQLite files:
+   - `KV_PATH` (Deno KV): snapshots, caches, metadata, sale records, in-flight locks. Recoverable; may be restored.
+   - `LEDGER_PATH` (default: `ledger.sqlite3` next to the KV file): spent payment authorizations (payer + nonce) and
+     settlement tx hashes. Append-only (UPDATE/DELETE are rejected by triggers), WAL with `synchronous=FULL`, so an
+     entry is fsync'ed before the payment is settled or served. Deploys, rollbacks and `--restore-kv` never touch it.
+     On start, replay keys left in the KV by older releases are imported once.
+   `base-reads-kv-backup.timer` makes a daily consistent copy of both (14 daily + 8 weekly each).
    Backups are local to the server only and are lost with it. For an offsite copy, add an executable
    `/etc/base-reads/backup-offsite.sh`; it receives the backup path and must encrypt (e.g. age or gpg) before uploading.

@@ -7,6 +7,7 @@ import { PAY_TO_DEFAULT, ROUTES } from "./lib/routes.ts";
 import DISCOVERY from "./lib/discovery.json" with { type: "json" };
 import { CDP_HOST, enabled as cdpEnabled, headers as cdpHeaders } from "./lib/cdp_auth.ts";
 import * as SG from "./lib/settle_guard.ts";
+import * as LG from "./lib/ledger.ts";
 import { SCHEMA, snapshotDates, loadIndex } from "./lib/preflight.ts";
 import { isoOrNull, keyHistory, loadKey, publicKeyInfo, sign, SigningUnavailable } from "./lib/sign.ts";
 import { scheduledSnapshot, latestSnapStatus, loadFail, mapErrorCode } from "./lib/snapshot.ts";
@@ -282,7 +283,8 @@ async function paid(path: string, q: Record<string, string>, qs: string, sig: st
   const bad = SG.precheck(payload, r); // before the claim: malformed/foreign payloads never consume a nonce slot
   if (bad) return [402, { error: bad }, noPay(bad, N)];
   const who = SG.payerOf(payload)!; const nonce = SG.nonceOf(payload)!; const ids = { ip: d.ip ?? null, payer: who };
-  const check = d.check ?? ((tx: string, rq: any, payer: string | undefined) => verifyOnchain(rpc, tx, rq.asset, rq.payTo, rq.amount, payer, N, 3, 1000, undefined, nonce));
+  const minConf = Math.max(1, Number(env("MIN_CONFIRMATIONS") ?? 1) || 1);
+  const check = d.check ?? ((tx: string, rq: any, payer: string | undefined) => verifyOnchain(rpc, tx, rq.asset, rq.payTo, rq.amount, payer, N, 3, 1000, undefined, nonce, minConf));
   const bg = d.background ?? (() => {});
   const sale = (tx: string) => ({ success: true, transaction: tx, payer: who, network: N });
   const log = (tx: string, oc: any, served: boolean, times: [string, string, string]) => {
@@ -322,6 +324,9 @@ async function paid(path: string, q: Record<string, string>, qs: string, sig: st
     if (pend) await SG.setPending(key, pend);
     return [409, { error: "payment authorization already used or in flight" }, noPay("replay", N)];
   }
+  // KV claim is only an in-flight lock; the append-only ledger is the source of truth for spent authorizations,
+  // so a rolled-back or restored KV can never let a spent authorization through again.
+  if (LG.isConsumed("auth", key)) return [402, { error: "payment authorization already used" }, noPay("replay", N)];
   const body = { x402Version: 2, paymentPayload: payload, paymentRequirements: r };
   const v = await fac("/verify", body); const tVer = iso();
   if (!v.isValid) { const why = facErr(v.invalidReason); await FAILS.fail({ ip: ids.ip }, "verify"); return [402, { error: why }, noPay(why, N)]; }
@@ -334,6 +339,8 @@ async function paid(path: string, q: Record<string, string>, qs: string, sig: st
     return [502, { error: "upstream error, not charged" }, {}];
   }
   if (code !== 200) return [code, out, {}]; // bad input: not settled, not charged
+  // point of no return: record the authorization as consumed (fsync'ed) before asking for settlement
+  if (!LG.consume("auth", key, { path, payload_sha256: await SG.payloadHash(payload!) })) return [402, { error: "payment authorization already used" }, noPay("replay", N)];
   const st = await fac("/settle", body); const tSet = iso(); const times: [string, string, string] = [tReq, tVer, tSet];
   const tx: string | null = typeof st.transaction === "string" && SG.TX_RE.test(st.transaction) ? st.transaction.toLowerCase() : null;
   if (typeof st.payer === "string" && st.payer.toLowerCase() !== who) mismatch("facilitator_payer_differs_from_signed_from");
@@ -388,6 +395,10 @@ if (import.meta.main) {
     Deno.cron("fail-counter-purge", "7 0 * * *", async () => { await FAILS.purge(); });
   }
   for (const w of startupWarnings(env)) console.warn("WARNING:", w);
+  if (!env("LEDGER_PATH") && !env("KV_PATH")) console.warn("WARNING: LEDGER_PATH and KV_PATH unset: payment ledger is in memory only (not durable)");
+  LG.openLedger(LG.ledgerPath(env));
+  const mig = await LG.migrateFromKv(await kv()); // one-time import of replay keys kept in KV by older releases
+  if (mig.auth || mig.tx) console.log("ledger: imported", JSON.stringify(mig));
   assertOnchainMode(env); // refuse to start with ONCHAIN_CHECK=log on Base mainnet
   Deno.serve({ hostname: bindHost(env), port: Number(env("PORT") ?? 8000) },
     (req, info) => handler(req, { env, ip: clientIp(req, (info.remoteAddr as Deno.NetAddr).hostname, env) }));

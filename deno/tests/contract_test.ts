@@ -1,4 +1,5 @@
-import { assert, assertEquals } from "jsr:@std/assert@1";
+import * as LG from "../lib/ledger.ts";
+import { assert, assertEquals, assertThrows } from "jsr:@std/assert@1";
 import { canonical, pyDumps } from "../lib/canonical.ts";
 import { decryptPem, publicKeyInfo, resetKey, sign, verify } from "../lib/sign.ts";
 import { checkUrl, IndexAssembler, validateChallenge, preflight, saveIndex, bazaarFacts, clearIndexCache } from "../lib/preflight.ts";
@@ -895,7 +896,7 @@ Deno.test("/healthz: booleans only, 200 with key + KV, 503 without key", async (
   assertEquals((await handler(new Request("http://h/healthz"), { env, ip: viaProxy })).status, 404);
 });
 
-Deno.test("kv-merge: restored KV keeps newer replay + accounting keys from the live KV", async () => {
+Deno.test("kv-merge: restored KV keeps newer accounting + in-flight keys from the live KV", async () => {
   const { mergeProtected, PROTECTED } = await import("../../deploy/vps/kv-merge.ts");
   const dir = await Deno.makeTempDir(); const live = dir + "/live.sqlite3"; const old = dir + "/old.sqlite3";
   const a = await Deno.openKv(old);
@@ -909,10 +910,10 @@ Deno.test("kv-merge: restored KV keeps newer replay + accounting keys from the l
   await b.set(["snap", "x"], 2); // not protected: the restored value stays
   b.close();
   const counts = await mergeProtected(live, old);
-  assertEquals(counts, { txused: 1, nonce: 1, rec: 1, pending: 1, inflight: 1 });
-  assertEquals(Object.keys(PROTECTED).sort(), ["inflight", "nonce", "pending", "rec", "txused"]);
+  assertEquals(counts, { rec: 1, pending: 1, inflight: 1 });
+  assertEquals(Object.keys(PROTECTED).sort(), ["inflight", "pending", "rec"]); // replay state lives in the ledger, not here
   const c = await Deno.openKv(old);
-  for (const k of [["txused", "0xold"], ["txused", "0xnew"], ["nonce", "0xpayer", "n1"], ["pending", "k1"], ["inflight", "p", "0xpayer"], ["rec", "sales", "1"], ["rec", "sales", "2"]]) {
+  for (const k of [["pending", "k1"], ["inflight", "p", "0xpayer"], ["rec", "sales", "1"], ["rec", "sales", "2"]]) {
     assert((await c.get(k)).versionstamp !== null, JSON.stringify(k));
   }
   assertEquals((await c.get(["snap", "x"])).value, 1);
@@ -928,4 +929,52 @@ Deno.test("deploy.sh: KV backup/restore only in --restore-kv mode, service stopp
   const merge = s.indexOf("kv-merge.ts", guard2);
   assert(guard2 > guard1 && merge > guard2 && merge < restore, "restore must be guarded and preceded by the merge");
   assertEquals(s.split('mv "$KVF.restore" "$KVF"').length, 2);
+  assert(!/LEDGER/.test(s.replace(/^#.*$/gm, "")), "deploy.sh must never touch the payment ledger");
+});
+
+Deno.test("ledger: rolling the KV back to before a payment never re-opens its authorization (402 on reuse)", async () => {
+  await resetGuards(); const { kv } = await import("../lib/store.ts"); const k = await kv();
+  const t = rig({ v: { settled: true } }); const nonceX = rnd(); const sig = pay("/base/network", {}, nonceX);
+  // KV snapshot taken before the payment (replay-relevant prefixes)
+  const before = new Set<string>(); for await (const e of k.list({ prefix: ["nonce"] })) before.add(JSON.stringify(e.key));
+  assertEquals((await t.call(sig))[0], 200);
+  const key = "auth:" + PAYER.toLowerCase() + ":" + nonceX.toLowerCase();
+  assert(LG.isConsumed("auth", key), "nonce X recorded in the ledger");
+  // roll the KV back: drop everything written since the snapshot (nonce lock + pending)
+  for await (const e of k.list({ prefix: ["nonce"] })) if (!before.has(JSON.stringify(e.key))) await k.delete(e.key);
+  await k.delete(["pending", key]);
+  assertEquals((await k.get(["nonce", key])).versionstamp, null);
+  assert(LG.isConsumed("auth", key), "ledger untouched by the KV rollback");
+  const [code, body] = await t.call(sig);
+  assertEquals([code, body.error], [402, "payment authorization already used"]);
+  assertEquals(t.calls.filter((x) => x === "/settle").length, 1); // never settled twice
+});
+
+Deno.test("ledger file: append-only, fsync-durable settings, survives reopen, imports old KV keys", async () => {
+  const dir = await Deno.makeTempDir(); const p = dir + "/ledger.sqlite3";
+  LG.openLedger(p);
+  assert(LG.consume("auth", "auth:0xa:0x1")); assert(!LG.consume("auth", "AUTH:0xA:0x1")); // case-insensitive, first use only
+  assert(LG.consume("tx", "0xT1")); assert(!LG.consume("tx", "0xt1"));
+  const db = LG.openLedger(p);
+  assertEquals((db.prepare("PRAGMA synchronous").get() as any).synchronous, 2); // FULL
+  assertEquals((db.prepare("PRAGMA journal_mode").get() as any).journal_mode, "wal");
+  assertThrows(() => db.exec("DELETE FROM consumed")); assertThrows(() => db.exec("UPDATE consumed SET at = 0"));
+  LG.closeLedger(); LG.openLedger(p); assert(LG.isConsumed("auth", "auth:0xa:0x1")); assert(LG.isConsumed("tx", "0xt1"));
+  const old = await Deno.openKv(dir + "/kv.sqlite3");
+  await old.set(["nonce", "auth:0xb:0x2"], 1); await old.set(["txused", "0xt2"], 1); await old.set(["txused", "0xt1"], 1);
+  assertEquals(await LG.migrateFromKv(old), { auth: 1, tx: 1 }); assertEquals(await LG.migrateFromKv(old), { auth: 0, tx: 0 });
+  old.close(); assertEquals(LG.ledgerCount(), 4);
+  LG.closeLedger(); await Deno.remove(dir, { recursive: true });
+  assertEquals(LG.ledgerPath((k) => k === "KV_PATH" ? "/var/lib/x/kv.sqlite3" : undefined), "/var/lib/x/ledger.sqlite3");
+  assertEquals(LG.ledgerPath((k) => k === "LEDGER_PATH" ? "/data/l.db" : "/var/lib/x/kv.sqlite3"), "/data/l.db");
+});
+
+Deno.test("finality: settled only after MIN_CONFIRMATIONS", async () => {
+  const r = reqFor("/base/network", env); const pad = (a: string) => "0x" + "0".repeat(24) + a.slice(2).toLowerCase();
+  const rc = { status: "0x1", blockNumber: "0x64", logs: [{ address: r.asset, topics: [TRANSFER, pad(PAYER), pad(r.payTo)], data: "0x3e8" }] };
+  const f = (head: number, min: number) => verifyOnchain(async (m: string) => m === "eth_blockNumber" ? "0x" + head.toString(16) : rc,
+    "0x" + "ab".repeat(32), r.asset, r.payTo, r.amount, PAYER, "eip155:8453", 1, 0, async () => {}, null, min) as Promise<any>;
+  assertEquals(await f(101, 3).then((x) => [x.settled, x.reason, x.confirmations]), [null, "awaiting_confirmations", 2]);
+  assertEquals(await f(102, 3).then((x) => [x.settled, x.confirmations]), [true, 3]);
+  assertEquals((await f(0, 1)).settled, true); // default 1: receipt is enough (previous behaviour)
 });

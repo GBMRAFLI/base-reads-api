@@ -12,7 +12,7 @@ export function selfWallets(payTo: string, env = (k: string) => Deno.env.get(k))
   return w;
 }
 export async function verifyOnchain(rpc: Rpc, tx: string | undefined, asset: string, payTo: string, amount: string, payer: string | undefined,
-  network = "eip155:8453", attempts = 4, wait = 2000, sleep = (ms: number) => new Promise((r) => setTimeout(r, ms)), nonce?: string | null) {
+  network = "eip155:8453", attempts = 4, wait = 2000, sleep = (ms: number) => new Promise((r) => setTimeout(r, ms)), nonce?: string | null, minConf = 1) {
   if (!tx) return { settled: false, reason: "no_tx_hash" };
   let rc: any = null;
   for (let i = 0; i < attempts; i++) {
@@ -29,7 +29,14 @@ export async function verifyOnchain(rpc: Rpc, tx: string | undefined, asset: str
       if (to.toLowerCase() === payTo.toLowerCase() && (payer == null || frm.toLowerCase() === payer.toLowerCase()) && v >= BigInt(amount))
       {
         if (nonce != null && !authUsed(rc, asset, frm, nonce)) return { settled: false, reason: "nonce_not_in_settlement_tx" };
-        return { settled: true, network, block: parseInt(rc.blockNumber, 16), from: frm, to, value: Number(v), nonceBound: nonce != null };
+        const block = parseInt(rc.blockNumber, 16);
+        if (minConf > 1) { // finality: require minConf confirmations (the receipt block counts as 1)
+          let head = NaN; try { head = parseInt(String(await rpc("eth_blockNumber", [])), 16); } catch { /* treated as unknown */ }
+          const confirmations = Number.isFinite(head) ? head - block + 1 : 0;
+          if (confirmations < minConf) return { settled: null, reason: "awaiting_confirmations", block, confirmations, required: minConf };
+          return { settled: true, network, block, confirmations, from: frm, to, value: Number(v), nonceBound: nonce != null };
+        }
+        return { settled: true, network, block, from: frm, to, value: Number(v), nonceBound: nonce != null };
       }
     }
   }
