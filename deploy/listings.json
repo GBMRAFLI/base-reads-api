@@ -1,0 +1,114 @@
+{
+  "base_url": "https://89-116-220-218.sslip.io",
+  "_note": "All URLs are base_url + path. To move domains: change base_url (and PUBLIC_URL on the server), run `deno run -A deploy/gen_listings.ts <new base_url>`, then resubmit each directory below. null = not decided / not known yet.",
+  "service": {
+    "name": "Base Reads",
+    "summary": "Pay-per-call read API for Base over x402 v2. Deterministic data, no advice.",
+    "protocol": "x402 v2",
+    "scheme": "exact",
+    "network": "Base mainnet (eip155:8453)",
+    "asset": "USDC",
+    "contact_email": "gbmrafli@agentmail.to",
+    "repo": "https://github.com/GBMRAFLI/base-reads-api",
+    "category": null
+  },
+  "discovery_paths": {
+    "llms_txt": "/llms.txt",
+    "openapi": "/openapi.json",
+    "index": "/index.json",
+    "pubkey": "/x402/preflight/pubkey",
+    "key_history": "/.well-known/x402-preflight-key-history.json",
+    "snapshots": "/bazaar/snapshots"
+  },
+  "ref": {
+    "param": "ref",
+    "format": "A-Z a-z 0-9 . _ - ; max 64; first occurrence wins; recorded with paid calls only; never changes price or challenge"
+  },
+  "directories": {
+    "bazaar": {
+      "listing_kind": "automatic: indexed from settled payments through the CDP facilitator; listing is keyed by the resource URL (base_url + path)",
+      "submit_url": null,
+      "resubmit_on_domain_change": "one settled paid call per route at the new base_url",
+      "ref": null,
+      "verify": null
+    },
+    "402index": {
+      "listing_kind": "manual registration",
+      "submit_url": null,
+      "resubmit_on_domain_change": "register the new base_url and re-verify ownership",
+      "ref": null,
+      "verify": {
+        "path": "/.well-known/402index-verify.txt",
+        "source": "INDEX_VERIFY_TOKEN env, else built-in default; a new domain may get a new token"
+      }
+    },
+    "x402scan": {
+      "listing_kind": "manual registration of the origin; reads the 402 challenge and /openapi.json",
+      "submit_url": null,
+      "resubmit_on_domain_change": "register the new origin",
+      "ref": null,
+      "verify": null
+    }
+  },
+  "routes": [
+    {
+      "path": "/base/usdc-balance",
+      "method": "GET",
+      "price_usdc": "0.001",
+      "amount_atomic": "1000",
+      "query_params": [
+        "address"
+      ],
+      "description": "Live Base mainnet USDC and ETH balance for one address, read with eth_call at the latest block; returns decimal and raw values plus the block number. Use it to check a wallet can cover a payment or that funds arrived before acting. Simpler than running an RPC client and decoding ERC-20 calls yourself, and the block number makes each reading reproducible. Query: ?address=0x..."
+    },
+    {
+      "path": "/base/tx-status",
+      "method": "GET",
+      "price_usdc": "0.002",
+      "amount_atomic": "2000",
+      "query_params": [
+        "hash"
+      ],
+      "description": "Base mainnet transaction status: success, failed or pending, with block, confirmations, gas used, effective gas price, from/to and log count. Use it after sending or receiving a payment to confirm it landed and how deep it is. One normalized JSON answer instead of combining receipt and block calls and computing confirmations yourself. Query: ?hash=0x..."
+    },
+    {
+      "path": "/base/basename",
+      "method": "GET",
+      "price_usdc": "0.003",
+      "amount_atomic": "3000",
+      "query_params": [
+        "name",
+        "address"
+      ],
+      "description": "Resolve a Basename (name.base.eth) to its Base address, or an address to its primary Basename, checked both ways so a reverse name is only returned when it resolves back. Use it to turn a human name into a payout address or to label an address. Avoids hand-written ENS-style namehash and resolver calls. Query: ?name=jesse.base.eth or ?address=0x..."
+    },
+    {
+      "path": "/base/address-intel",
+      "method": "GET",
+      "price_usdc": "0.005",
+      "amount_atomic": "5000",
+      "query_params": [
+        "address"
+      ],
+      "description": "One call for an address on Base: USDC balance, ETH balance, verified primary Basename, transaction count (nonce) and whether it is a contract. Use it to profile a counterparty or payout wallet before interacting. Replaces four or five separate reads with a single priced request. Query: ?address=0x..."
+    },
+    {
+      "path": "/x402/preflight",
+      "method": "GET",
+      "price_usdc": "0.001",
+      "amount_atomic": "1000",
+      "query_params": [
+        "url"
+      ],
+      "description": "Pre-pay Check: Ed25519-signed, deterministic facts about another x402 endpoint before you pay it: challenge validity, reachability and latency, host listing count, payout wallet reuse across hosts, last-called and payer trend from daily Bazaar snapshots. Use it when choosing between paid endpoints. Signed facts you can verify against the published key, not ratings; facts only, no advice. Query: ?url=https://..."
+    },
+    {
+      "path": "/base/network",
+      "method": "GET",
+      "price_usdc": "0.001",
+      "amount_atomic": "1000",
+      "query_params": [],
+      "description": "Base mainnet head: latest block number, block age in seconds, base fee and gas price in gwei. Use it to check the chain is advancing and to estimate fees before sending a transaction. One small JSON read instead of several raw RPC calls and unit conversions."
+    }
+  ]
+}

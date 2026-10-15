@@ -838,3 +838,22 @@ Deno.test("clientIp: proxy header only trusted from loopback with TRUST_PROXY=1"
   const bad = new Request("http://h/", { headers: { "x-forwarded-for": "evil<>" } });
   if (clientIp(bad, "127.0.0.1", on) !== "127.0.0.1") throw new Error("garbage");
 });
+
+Deno.test("deploy/listings.json matches routes and ref rules", async () => {
+  const L = JSON.parse(await Deno.readTextFile(new URL("../../deploy/listings.json", import.meta.url)));
+  const { buildRoutes } = await import("../../deploy/gen_listings.ts");
+  const { cleanRef } = await import("../main.ts");
+  assertEquals(L.routes, buildRoutes()); // regenerate with deploy/gen_listings.ts if this fails
+  assert(/^https:\/\/[a-z0-9.-]+$/.test(L.base_url), "base_url: https origin, no trailing slash");
+  const refs: string[] = [];
+  for (const [name, d] of Object.entries(L.directories as Record<string, any>)) {
+    if (d.ref == null) continue;
+    assertEquals(cleanRef("ref=" + encodeURIComponent(d.ref)), d.ref, `ref for ${name} must survive cleanRef`);
+    refs.push(d.ref);
+  }
+  assertEquals(new Set(refs).size, refs.length, "ref values must be unique per directory");
+  const v = L.directories["402index"].verify.path;
+  const { FREE_PATHS } = await import("../main.ts");
+  assert(FREE_PATHS.has(v));
+  for (const p of Object.values(L.discovery_paths) as string[]) assert(FREE_PATHS.has(p), p);
+});
