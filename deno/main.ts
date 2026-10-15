@@ -49,10 +49,33 @@ export function facilitatorInfo(env: Deps["env"]) {
   const name = h === CDP_HOST ? "CDP" : (h === "payai.network" || h.endsWith(".payai.network")) ? "PayAI" : h;
   return { name, url: fac, auth: cdpEnabled(fac, env) ? "cdp_jwt" : "none" };
 }
+const REF_RE = /^[A-Za-z0-9._-]{1,64}$/;
+/** Optional ?ref= attribution tag: logged with paid calls only, never part of the price, challenge or requirements.
+ * Self-reported and unverified. If ref appears more than once, the first occurrence wins (same as Python clean_ref). */
+export function cleanRef(qs: string): string | null {
+  for (const x of qs.split("&")) if (x.startsWith("ref=")) { let v: string; try { v = unquote(x.slice(4)); } catch { return null; } return REF_RE.test(v) ? v : null; }
+  return null;
+}
+/** Query string without ref params, so the logged input hash does not depend on attribution. */
+export const stripRef = (qs: string) => qs.split("&").filter((x) => x && !x.startsWith("ref=") && x !== "ref").join("&");
+export function llmsTxt(env: Deps["env"]) {
+  const c = cfg(env); const N = c.NETWORK;
+  const net = N === "eip155:8453" ? "Base mainnet" : N === "eip155:84532" ? "Base Sepolia" : N;
+  const L = ["# GBMRAFLI Base Reads", "", `> Pay-per-call read API for ${net} over x402 v2. Each paid route answers GET without payment with HTTP 402 and a PAYMENT-REQUIRED challenge; retry with a PAYMENT-SIGNATURE header to get JSON.`, "",
+    "## Payment", "", "- Protocol: x402 v2, scheme exact", `- Network: ${N} (${net})`, `- Asset: USDC ${c.USDC}`, "- Authorization: EIP-3009 transferWithAuthorization only (Permit2 is rejected)",
+    "- Responses are served only after the transfer is confirmed on-chain", "- Optional ?ref=<tag> (A-Z a-z 0-9 . _ -, max 64) is recorded for attribution and never changes price or challenge", "",
+    "## Paid routes (GET, JSON)", "",
+    ...Object.entries(ROUTES).map(([k, v]) => `- ${k} (${(v[0] / 1e6).toFixed(3)} USDC): ${v[1]}`),
+    "", "## Discovery (free)", "", "- / : service index with routes and prices", "- /bazaar/snapshots : daily Bazaar snapshot summary",
+    "- /.well-known/bazaar-snapshot.json : signed snapshot series metadata", "- /.well-known/x402-preflight : Pre-pay Check schema and signing key",
+    "- /.well-known/x402-preflight-key-history.json : signing key history", "- /x402/preflight/pubkey : Ed25519 public key for verifying signed facts",
+    "- Each 402 challenge carries extensions.bazaar (input schema and output example) for x402 Bazaar listing", "", "Facts only, no investment advice.", ""];
+  return L.join("\n");
+}
 export function root(env: Deps["env"]) {
   const c = cfg(env);
   return { service: "GBMRAFLI Base Reads", network: c.NETWORK, protocol: "x402 v2", facilitator: facilitatorInfo(env),
-    free: ["/.well-known/x402-preflight", "/.well-known/x402-preflight-key-history.json", "/.well-known/bazaar-snapshot.json", "/x402/preflight/pubkey", "/bazaar/snapshots"],
+    free: ["/llms.txt", "/.well-known/x402-preflight", "/.well-known/x402-preflight-key-history.json", "/.well-known/bazaar-snapshot.json", "/x402/preflight/pubkey", "/bazaar/snapshots"],
     routes: Object.fromEntries(Object.entries(ROUTES).map(([k, v]) => [k, { price_usdc: v[0] / 1e6, description: v[1] }])) };
 }
 export async function wellKnown(env: Deps["env"]) {
@@ -121,6 +144,7 @@ export async function handler(req: Request, d: Deps): Promise<Response> {
   const raw = req.url.slice(req.url.indexOf("/", 8)); const qi = raw.indexOf("?");
   const path = qi < 0 ? raw : raw.slice(0, qi), qs = qi < 0 ? "" : raw.slice(qi + 1); const q = pyQuery(qs);
   if (path === "/" || path === "/index.json") return send(200, root(env));
+  if (path === "/llms.txt") return new Response(llmsTxt(env), { status: 200, headers: { ...HDRS, "Content-Type": "text/plain; charset=utf-8", "Cache-Control": "public, max-age=3600" } });
   if (path === "/.well-known/x402-preflight") {
     try { return send(200, await wellKnown(env)); } catch (e) { if (e instanceof SigningUnavailable) return send(503, { error: "signing key unavailable" }); throw e; }
   }
@@ -192,7 +216,7 @@ async function paid(path: string, q: Record<string, string>, qs: string, sig: st
   const sale = (tx: string) => ({ success: true, transaction: tx, payer: who, network: N });
   const log = (tx: string, oc: any, served: boolean, times: [string, string, string]) => {
     bg((async () => {
-      try { await recordSale(path, r, sale(tx), times, oc, served, env); await recordObservation(path, (await sha256hex(qs)).slice(0, 16), served ? 200 : 402, null); }
+      try { await recordSale(path, r, sale(tx), times, oc, served, env, cleanRef(qs)); await recordObservation(path, (await sha256hex(stripRef(qs))).slice(0, 16), served ? 200 : 402, null); }
       catch (e) { console.log("sales log write failed:", (e as Error).name); }
     })());
   };

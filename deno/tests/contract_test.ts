@@ -502,3 +502,37 @@ Deno.test("L2 slot TTL covers worst case; release is versionstamp-checked and ne
   assertEquals(await SG.acquireSlots({ payer: "0xslot" }, { payer: 1, ip: 1 }), null);
   await k.delete(key); await resetGuards();
 });
+Deno.test("llms.txt identical to Python, text/plain; ref sanitizer identical", async () => {
+  const r = await handler(new Request("http://h.example/llms.txt"), { env });
+  assert(r.headers.get("Content-Type")!.startsWith("text/plain")); assertEquals(await r.clone().text(), C.llms_txt);
+  const { cleanRef } = await import("../main.ts");
+  for (const [q, want] of C.ref) assertEquals(cleanRef(q), want, q);
+  assertEquals([cleanRef("ref=abc%0A"), cleanRef("ref=first&ref=second")], [null, "first"]);
+  const { stripRef } = await import("../main.ts");
+  for (const [q, want] of C.strip_ref) assertEquals(stripRef(q), want, q);
+  assertEquals(r.headers.get("Cache-Control"), "public, max-age=3600");
+});
+Deno.test("?ref= never changes the 402 challenge, header or requirements; every paid route answers 402", async () => {
+  for (const [k, , ex] of Object.entries(ROUTES).map(([k, v]) => [k, v[0], v[2]] as const)) {
+    const qs = Object.entries(ex).map(([a, b]) => `${a}=${b}`).join("&"); const seen = new Set<string>();
+    for (const extra of ["", "ref=agent-7", "ref=" + "z".repeat(200), "ref=%3Cx%3E"]) {
+      const res = await handler(new Request(`http://h.example${k}?` + [qs, extra].filter(Boolean).join("&")), { env });
+      assertEquals(res.status, 402, k); seen.add(res.headers.get("PAYMENT-REQUIRED") + "|" + await res.text());
+    }
+    assertEquals(seen.size, 1, k);
+  }
+});
+Deno.test("ref is logged with the paid call and appears in the export", async () => {
+  const req = reqFor("/base/network", env); const tx = "0x" + "ef".repeat(32);
+  await recordSale("/base/network", req, { success: true, payer: "0x" + "02".repeat(20), transaction: tx }, ["a", "b", "c"], { settled: null }, true, env, "agent.x_1");
+  const x = await (await handler(new Request("http://h/internal/export", { headers: { Authorization: "Bearer " + TOKEN } }), { env })).json();
+  assertEquals(x.records.executions.find((e: any) => e.tx === tx).ref, "agent.x_1");
+  await recordSale("/base/network", req, { success: true, payer: "0x" + "02".repeat(20), transaction: "0x" + "ee".repeat(32) }, ["a", "b", "c"], { settled: null }, true, env, null);
+  assert(!("ref" in ((await rows("executions.jsonl")).at(-1) as any)));
+});
+Deno.test("observation inputHash is the same with and without ref", async () => {
+  const { stripRef } = await import("../main.ts");
+  const { sha256hex } = await import("../lib/util.ts");
+  const h = async (qs: string) => (await sha256hex(stripRef(qs))).slice(0, 16);
+  assertEquals(await h("address=0x1&ref=agent-7"), await h("address=0x1")); assertEquals(await h("ref=x&address=0x1"), await h("address=0x1"));
+});

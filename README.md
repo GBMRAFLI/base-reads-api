@@ -29,11 +29,14 @@ Invalid input or upstream errors are never settled, so you are not charged for t
 after the payment is settled **and** independently confirmed on Base (see [SECURITY.md](SECURITY.md)); if the chain
 has not shown the transfer yet you get `202` and the same request (same payment header) is served once it does.
 
+Optional `?ref=<tag>` (`A-Z a-z 0-9 . _ -`, max 64; first occurrence wins) is stored with the paid call for attribution. It is self-reported and unverified, and never changes the price, the 402 challenge or the payment requirements.
+
 ## Free routes (GET)
 
 | Route | Returns |
 |---|---|
 | `/` | service info, prices, facilitator in use |
+| `/llms.txt` | plain-text summary for agents: routes, prices, payment info, discovery links (cached 1 h) |
 | `/.well-known/x402-preflight` | public key, key_id, fingerprint, how to verify, facilitator, repo |
 | `/.well-known/x402-preflight-key-history.json` | current and retired signing keys with dates |
 | `/x402/preflight/pubkey` | `{alg, public_key_b64, key_id, fingerprint, fingerprint_short, created_at}` |

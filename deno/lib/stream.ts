@@ -41,13 +41,13 @@ function authUsed(rc: any, asset: string, frm: string, nonce: string) {
     return (lg.address ?? "").toLowerCase() === asset.toLowerCase() && t.length === 3 && t[0] === AUTH_USED && t[1].slice(-40) === frm.toLowerCase().slice(2) && t[2] === n; });
 }
 export async function recordSale(route: string, req: Record<string, any>, st: Record<string, any>, times: [string, string, string],
-  onchain: Record<string, any>, servedOk = true, env = (k: string) => Deno.env.get(k)) {
+  onchain: Record<string, any>, servedOk = true, env = (k: string) => Deno.env.get(k), ref: string | null = null) {
   const tx = st.transaction ?? null, payer = (st.payer || "").toLowerCase() || null;
   const cand = rid("cand", "v1", category(route), route);
   const ex = await append("executions.jsonl", { id: rid("exec", tx, route), candidateRef: cand, category: category(route), protocolType: "x402",
     role: "seller", adapter: "x402-seller", route, amount: req.amount, asset: req.asset, network: req.network,
     payTo: req.payTo, payer, tx, status: st.success ? "succeeded" : "failed",
-    startedAt: times[0], verifiedAt: times[1], settledAt: times[2], receipt: "payment_received" });
+    startedAt: times[0], verifiedAt: times[1], settledAt: times[2], receipt: "payment_received", ...(ref ? { ref } : {}) });
   const isSelf = payer ? selfWallets(req.payTo, env).has(payer) : null;
   let status: string, why: string | null;
   if (onchain.settled === true && isSelf === false && servedOk) { status = "verified_success"; why = null; }

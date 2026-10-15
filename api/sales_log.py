@@ -50,7 +50,7 @@ def _auth_used(rc, asset, frm, nonce):
         if lg.get("address", "").lower() == asset.lower() and len(t) == 3 and t[0] == AUTH_USED and t[1][-40:] == frm.lower()[2:] and t[2] == n: return True
     return False
 
-def record_sale(route, req, st, times, onchain, served_ok=True):
+def record_sale(route, req, st, times, onchain, served_ok=True, ref=None):
     """ExecutionRecord (receipt = payment received) + OutcomeRecord (outcome = resource delivered, on-chain verified,
     external payer) + CostEntry. verified_success ONLY if settled on Base AND payer is external AND resource delivered."""
     tx, payer = st.get("transaction"), (st.get("payer") or "").lower() or None
@@ -58,7 +58,7 @@ def record_sale(route, req, st, times, onchain, served_ok=True):
     ex = append("executions.jsonl", {"id": rid("exec", tx, route), "candidateRef": cand, "category": category(route), "protocolType": "x402",
         "role": "seller", "adapter": "x402-seller", "route": route, "amount": req["amount"], "asset": req["asset"], "network": req["network"],
         "payTo": req["payTo"], "payer": payer, "tx": tx, "status": "succeeded" if st.get("success") else "failed",
-        "startedAt": times[0], "verifiedAt": times[1], "settledAt": times[2], "receipt": "payment_received"})
+        "startedAt": times[0], "verifiedAt": times[1], "settledAt": times[2], "receipt": "payment_received", **({"ref": ref} if ref else {})})
     is_self = payer in self_wallets(req["payTo"]) if payer else None
     if onchain.get("settled") is True and is_self is False and served_ok: status, why = "verified_success", None
     elif onchain.get("settled") is None: status, why = "inconclusive", "deferred_onchain_check"
