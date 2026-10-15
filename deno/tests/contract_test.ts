@@ -649,10 +649,15 @@ Deno.test("snapshot follow-ups: freshness, tiers 30/365, legacy, orphan purge, c
   const missComplete = await bazaarFacts("https://missing.example/nope", [], 14, "2002-01-03");
   assertEquals([(missComplete as any).listed, (missComplete as any).listed_reason], [false, undefined]);
 
-  // M1: full snapshot older than 7 days -> snapshot_too_old with snapshot_date
+  // M1: full snapshot older than 3 days -> snapshot_too_old with age fields
   const aged = await bazaarFacts("https://missing.example/nope", [], 14, "2002-07-20"); // ~200 days later
-  assertEquals([(aged as any).available, (aged as any).reason, (aged as any).snapshot_date, (aged as any).listed],
-    [false, "snapshot_too_old", "2002-01-01", undefined]);
+  assertEquals(
+    [(aged as any).available, (aged as any).reason, (aged as any).snapshot_date, (aged as any).snapshot_age_days, (aged as any).max_age_days, (aged as any).listed],
+    [false, "snapshot_too_old", "2002-01-01", 200, 3, undefined],
+  );
+  // also just past the window (4 days)
+  const aged4 = await bazaarFacts("https://missing.example/nope", [], 14, "2002-01-05");
+  assertEquals([(aged4 as any).available, (aged4 as any).snapshot_age_days, (aged4 as any).max_age_days], [false, 4, 3]);
 
   // H1: only reduced -> snapshot_too_old
   await wipeSnaps(k);

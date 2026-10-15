@@ -96,7 +96,7 @@ facts (same encrypted key and pubkey, byte-identical signatures), `/internal/exp
 record format. Storage: Deno KV.
 
 ### Daily Bazaar snapshot
-`Deno.cron` at 00:15 UTC only (never at startup). At most one attempt per UTC calendar day: skip if today's `snapdate` or `snapfail` already exists (cold-start safe), else KV `["snapattempt", YYYY-MM-DD]` with `check(versionstamp: null)` and `expireIn` 3 days. Capped at `SNAPSHOT_MAX_PAGES` pages of 1000 listings (default 3, range 1–50 with clamp + warning; 15 s per page, 1 retry). Freshness: full snap must be ≤ 7 days old for preflight. Statuses: **complete** / **partial** (`partial: true` + `failed_pages`) / **failed** (error record only — never an empty snapshot). Status is included in signed `/.well-known/bazaar-snapshot.json` as `last_status`, `last_failed_pages`, `last_error`.
+`Deno.cron` at 00:15 UTC only (never at startup). At most one attempt per UTC calendar day: skip if today's `snapdate` or `snapfail` already exists (cold-start safe), else KV `["snapattempt", YYYY-MM-DD]` with `check(versionstamp: null)` and `expireIn` 3 days. Capped at `SNAPSHOT_MAX_PAGES` pages of 1000 listings (default 3, range 1–50 with clamp + warning; 15 s per page, 1 retry). Freshness: full snap must be ≤ 3 days old for preflight. Statuses: **complete** / **partial** (`partial: true` + `failed_pages`) / **failed** (error record only — never an empty snapshot). Status is included in signed `/.well-known/bazaar-snapshot.json` as `last_status`, `last_failed_pages`, `last_error`.
 
 ### Optional `prepay-check/v1` bazaar fields (Deno production)
 Schema stays `prepay-check/v1` (additive optional fields; no version bump). `bazaar.coverage` carries `pages_fetched`, `max_pages`, `items_indexed`, `bazaar_total`, `complete`, `status`, `partial`, `failed_pages`. **`listed: false` only when `coverage.complete === true`**. Otherwise if the resource is missing: `listed: null` + `listed_reason: "not_in_indexed_part"`, and `host_listing_count_is_min` / `payout_wallet_reuse_is_min` mark lower bounds.
@@ -105,7 +105,7 @@ Schema stays `prepay-check/v1` (additive optional fields; no version bump). `baz
 - 0–30 days: **full** index (gzip JSON generationed chunks)
 - 31–364 days: **reduced** counts only (`hosts: {host:n}`, `wallet_hosts: {wallet: hostCount}`; no per-URL resources)
 - 365+ days: **aggregate** (`listings` + host/wallet counts + status)
-- Preflight `bazaarFacts` uses a **full** snapshot at most **7 days** old; otherwise `{available:false, reason:"snapshot_too_old", snapshot_date}` (never `listed:false` / zero counts from a demoted or stale day). Reduced/aggregate days in `payer_trend` are marked with `tier`.
+- Preflight `bazaarFacts` uses a **full** snapshot at most **3 days** old; otherwise `{available:false, reason:"snapshot_too_old", snapshot_date, snapshot_age_days, max_age_days:3}` (never `listed:false` / zero counts from a demoted or stale day). Reduced/aggregate days in `payer_trend` are marked with `tier`.
 
 ### KV storage (measured from live Bazaar, Deno Free 1 GiB)
 Fetched 3 free public Bazaar pages (3000 listings, `bazaar_total≈38204`) and built the real index:

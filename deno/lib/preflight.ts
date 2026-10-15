@@ -203,7 +203,7 @@ export class IndexAssembler {
 }
 // KV values are capped at 64 KiB: store gzip(JSON) in 60 KB chunks under ["snap", date, gen, i]
 export const CHUNK = 60000;
-export const FULL_MAX_AGE_DAYS = 7;
+export const FULL_MAX_AGE_DAYS = 3;
 /** Test hooks for crash injection. */
 let _saveCrashAfterChunks: number | null = null;
 let _saveCrashAfterFlip = false;
@@ -338,7 +338,8 @@ export async function bazaarFacts(url: string, paytoList: string[], maxTrend = 1
   const full = [...metas].reverse().find((m) => (m.meta.tier ?? "full") === "full");
   if (!full) return { available: false, reason: "snapshot_too_old" };
   if (dayAge(full.date, today) > FULL_MAX_AGE_DAYS) {
-    return { available: false, reason: "snapshot_too_old", snapshot_date: full.date };
+    const snapshot_age_days = dayAge(full.date, today);
+    return { available: false, reason: "snapshot_too_old", snapshot_date: full.date, snapshot_age_days, max_age_days: FULL_MAX_AGE_DAYS };
   }
   const last = full.date; const idx = await loadIndex(last); const h = hostOf(url); const key = url.split("?")[0];
   const cur = idx.resources[key] ?? null; const listedPayTo = cur?.payTo ?? [];
