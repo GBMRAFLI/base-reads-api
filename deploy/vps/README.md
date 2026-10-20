@@ -56,7 +56,7 @@
 - Peak RSS by pages fetched (separate runs): 5 pages 150 MiB, 10 pages 198 MiB, 20 pages 217 MiB, 27 pages 225 MiB
   (process start ~43 MiB). Slope above 10 pages is ~1.6 MiB/page, so the 50-page default projects to roughly 260-300 MiB,
   well below systemd MemoryHigh 500M / MemoryMax 600M. Re-measure if Bazaar approaches 50k listings.
-- Bounds: `SNAPSHOT_MAX_PAGES` (default 50, hard cap 200) and a 10 minute total time budget. Hitting either ends the run as
+- Bounds: `SNAPSHOT_MAX_PAGES` (default 50, hard cap 100) and a 10 minute total time budget. Hitting either ends the run as
   `partial` (`coverage.stopped` = `page_cap` or `time_budget`). `complete` requires a short final page; the reported
   total alone is not trusted.
 - Stored: 860,713 bytes gzip in 15 chunks of at most 60,000 bytes (below the 64 KiB Deno KV value limit; each chunk is its

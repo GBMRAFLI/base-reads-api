@@ -1,5 +1,5 @@
 // Daily Bazaar snapshot (Deno.cron 00:15 UTC only; never at startup). Bounded to keep hosting usage small:
-// at most SNAPSHOT_MAX_PAGES pages (default 50, hard cap 200; 1000 items each), a 10 min total time budget, ending at the first short page,
+// at most SNAPSHOT_MAX_PAGES pages (default 50, hard cap 100; 1000 items each), a 10 min total time budget, ending at the first short page,
 // 15 s per page, 1 retry, and at most one attempt
 // (success or failure) per UTC calendar day. Status is complete | partial | failed; failed stores an error record
 // (never an empty snapshot). Tiered retention demotes old indexes (never the newest; no day deletion).
@@ -12,7 +12,7 @@ import { kv } from "./store.ts";
 const BAZAAR = Deno.env.get("BAZAAR_URL") ?? "https://api.cdp.coinbase.com/platform/v2/x402/discovery/resources";
 export const PAGE = 1000, PAGE_TIMEOUT_MS = 15000, RETRIES = 1;
 /** Default and hard cap for SNAPSHOT_MAX_PAGES (1000 items per page). */
-export const DEFAULT_MAX_PAGES = 50, HARD_MAX_PAGES = 200;
+export const DEFAULT_MAX_PAGES = 50, HARD_MAX_PAGES = 100;
 /** Total wall-clock budget for one crawl; when exceeded the run ends as partial. */
 export const TIME_BUDGET_MS = 10 * 60_000;
 export const SNAPATTEMPT_TTL_MS = 3 * 24 * 3600_000;

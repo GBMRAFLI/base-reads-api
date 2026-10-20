@@ -605,7 +605,7 @@ Deno.test("usage cut: snapshot capped at N pages, 1 retry, coverage recorded, on
   const idx = out.status === "failed" ? null : out.index;
   assertEquals([calls, idx!.listings, idx!.coverage?.complete, idx!.coverage?.status, idx!.coverage?.partial, out.status !== "failed" && out.meta.chunks >= 1], [3, 3000, false, "partial", true, true]);
   const warns: string[] = []; const w = (m: string) => warns.push(m);
-  assertEquals([S.maxPages(() => undefined), S.maxPages(() => "5"), S.maxPages(() => "0", w), S.maxPages(() => "99", w), S.maxPages(() => "999", w), S.maxPages(() => "x", w), S.PAGE_TIMEOUT_MS, S.RETRIES], [50, 5, 1, 99, 200, 50, 15000, 1]);
+  assertEquals([S.maxPages(() => undefined), S.maxPages(() => "5"), S.maxPages(() => "0", w), S.maxPages(() => "99", w), S.maxPages(() => "999", w), S.maxPages(() => "100", w), S.maxPages(() => "x", w), S.PAGE_TIMEOUT_MS, S.RETRIES], [50, 5, 1, 99, 100, 100, 50, 15000, 1]);
   assert(warns.length >= 3);
   let n = 0; const bad = (async () => { n++; throw new Error("down"); }) as typeof fetch;
   const failOut = await S.runSnapshot(bad, 3, "2001-01-02");
