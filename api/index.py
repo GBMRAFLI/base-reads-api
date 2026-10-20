@@ -160,10 +160,10 @@ def llms_txt():
          "- Responses are served only after the transfer is confirmed on-chain", "- Optional ?ref=<tag> (A-Z a-z 0-9 . _ -, max 64) is recorded for attribution and never changes price or challenge", "",
          "## Paid routes (GET, JSON)", ""]
     L += [f"- {k} ({v[0] / 1e6:.3f} USDC): {v[1]}" for k, v in ROUTES.items()]
-    L += ["", "## What the responses are", "", "- Verifiable facts only: every chain reading includes the Base block number it was read at, so it can be reproduced against any Base RPC node",
+    L += ["", "## What the responses are", "", "- Verifiable facts only: /base/network, /base/usdc-balance, /base/address-intel and /base/tx-status (once mined) include the Base block number they refer to, so those readings can be reproduced against any Base RPC node",
           "- No verdicts, opinions, scores or predictions, no buy/sell advice, and no language model in the response path",
           "- Compared with a free RPC endpoint: values are normalized (decimal and raw units, gwei, confirmations), pinned to a block number, and several reads are combined into one call",
-          "", "## Usage pattern", "", "- Call /x402/preflight?url=<endpoint> before every x402 payment to another endpoint; the response is Ed25519-signed and verifiable against /x402/preflight/pubkey",
+          "", "## Usage pattern", "", f"- To get signed facts about an x402 endpoint before paying it, you can call /x402/preflight?url=<endpoint> ({ROUTES['/x402/preflight'][0] / 1e6:.3f} USDC). Facts only, no guarantee.",
           "- /base/network and /base/usdc-balance responses list related_routes (path and price) for follow-up reads"]
     L += ["", "## Discovery (free)", "", "- / : service index with routes and prices", "- /openapi.json : OpenAPI 3.1 description of the paid routes with prices", "- /bazaar/snapshots : daily Bazaar snapshot summary",
           "- /.well-known/bazaar-snapshot.json : signed snapshot series metadata", "- /.well-known/x402-preflight : Pre-pay Check schema and signing key",
@@ -224,10 +224,10 @@ def snapshot_summary(limit=30):
     return {"source": "x402 Bazaar discovery API, crawled daily at 00:15 UTC", "latest": latest_of(out), "snapshots": out}
 def latest_of(out, now=None):
     """Freshness and completeness of the newest snapshot: date, status (complete | partial | failed | None), listing count, age in days."""
-    if not out: return {"date": None, "status": None, "listings": 0, "age_days": None}
+    if not out: return {"date": None, "status": None, "listings": 0, "age_days": None, "fresh": False}
     s = out[0]; now = time.time() if now is None else now
     age = int((now - calendar.timegm(time.strptime(s["date"], "%Y-%m-%d"))) // 86400)
-    return {"date": s["date"], "status": s.get("status"), "listings": s.get("resources", 0), "age_days": max(0, age)}
+    return {"date": s["date"], "status": s.get("status"), "listings": s.get("resources", 0), "age_days": max(0, age), "fresh": max(0, age) <= 3}
 REPLAY, FAILS, SLOTS = SG.Replay(), SG.FailLimiter(), SG.Slots()
 ONCHAIN_CHECK = os.environ.get("ONCHAIN_CHECK", "block")   # block: serve only after the nonce-bound USDC Transfer is confirmed on Base; log: serve on facilitator success (testnets only)
 MAINNET = "eip155:8453"

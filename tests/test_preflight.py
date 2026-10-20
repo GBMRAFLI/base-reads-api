@@ -531,15 +531,16 @@ class T8(unittest.TestCase):
         s = IX.snapshot_summary(); self.assertIn("snapshots", s)
         self.assertIn({"date": "2026-01-02", "status": None, "resources": 1, "hosts": 1, "payout_wallets": 1, "calls30d_total": 7, "payers30d_total": 2}, s["snapshots"])
         for x in s["snapshots"]: self.assertEqual(set(x), {"date", "status", "resources", "hosts", "payout_wallets", "calls30d_total", "payers30d_total"})
-        self.assertEqual(set(s["latest"]), {"date", "status", "listings", "age_days"}); self.assertEqual(s["latest"]["date"], s["snapshots"][0]["date"])
-        self.assertEqual(IX.latest_of([]), {"date": None, "status": None, "listings": 0, "age_days": None})
-        self.assertEqual(IX.latest_of([{"date": "2026-10-20", "status": "complete", "resources": 5}], now=1792454400 + 86400 + 3600), {"date": "2026-10-20", "status": "complete", "listings": 5, "age_days": 1})
+        self.assertEqual(set(s["latest"]), {"date", "status", "listings", "age_days", "fresh"}); self.assertEqual(s["latest"]["date"], s["snapshots"][0]["date"])
+        self.assertEqual(IX.latest_of([]), {"date": None, "status": None, "listings": 0, "age_days": None, "fresh": False})
+        self.assertEqual(IX.latest_of([{"date": "2026-10-20", "status": "complete", "resources": 5}], now=1792454400 + 86400 + 3600), {"date": "2026-10-20", "status": "complete", "listings": 5, "age_days": 1, "fresh": True})
+        self.assertFalse(IX.latest_of([{"date": "2026-10-16", "status": "complete", "resources": 5}], now=1792454400 + 86400 + 3600)["fresh"]); self.assertTrue(IX.latest_of([{"date": "2026-10-18", "resources": 1}], now=1792454400 + 86400 + 3600)["fresh"])
     def test_pricing_related_and_llms(self):
         self.assertEqual({k: v[0] for k, v in IX.ROUTES.items()}, {"/base/usdc-balance": 1000, "/base/tx-status": 2000, "/base/basename": 3000, "/base/address-intel": 10000, "/x402/preflight": 10000, "/base/network": 1000})
         self.assertEqual(IX.related("/base/network"), [{"path": "/base/tx-status", "price_usdc": "0.002"}, {"path": "/x402/preflight", "price_usdc": "0.010"}])
         self.assertEqual(IX.related("/base/usdc-balance"), [{"path": "/base/address-intel", "price_usdc": "0.010"}, {"path": "/x402/preflight", "price_usdc": "0.010"}])
-        t = IX.llms_txt(); self.assertIn("before every x402 payment", t); self.assertIn("no language model", t); self.assertIn("pinned to a block number", t)
-        for bad in ("buy now", "recommend", "best ", "guarantee"): self.assertNotIn(bad, t.lower())
+        t = IX.llms_txt(); self.assertIn("before paying it, you can call /x402/preflight?url=<endpoint> (0.010 USDC). Facts only, no guarantee.", t); self.assertNotIn("before every", t); self.assertNotIn("every chain reading", t); self.assertIn("no language model", t); self.assertIn("pinned to a block number", t)
+        for bad in ("buy now", "recommend", "best ", "guaranteed"): self.assertNotIn(bad, t.lower())
 class T9(unittest.TestCase):
     def test_pubkey_fingerprints_and_history(self):
         import hashlib

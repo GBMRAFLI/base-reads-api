@@ -24,14 +24,15 @@ Deno.test("related_routes on /base/network and /base/usdc-balance only, path and
   for (const r of [...n.related_routes, ...b.related_routes]) assertEquals(Object.keys(r).sort(), ["path", "price_usdc"]);
 });
 Deno.test("llms.txt: facts-only framing and preflight usage pattern, no advice wording", () => {
-  const t = llmsTxt(env); assert(t.includes("before every x402 payment")); assert(t.includes("no language model")); assert(t.includes("pinned to a block number"));
+  const t = llmsTxt(env); assert(t.includes("before paying it, you can call /x402/preflight?url=<endpoint> (0.010 USDC). Facts only, no guarantee.")); assert(!t.includes("before every")); assert(!t.includes("every chain reading")); assert(t.includes("no language model")); assert(t.includes("pinned to a block number"));
   assert(t.includes("/x402/preflight (0.010 USDC)")); assert(t.includes("/base/address-intel (0.010 USDC)"));
-  for (const bad of ["buy now", "recommend", "best ", "guarantee"]) assert(!t.toLowerCase().includes(bad), bad);
+  for (const bad of ["buy now", "recommend", "best ", "guaranteed"]) assert(!t.toLowerCase().includes(bad), bad);
 });
 Deno.test("/bazaar/snapshots publishes latest date, status, listing count and age", async () => {
-  const s: any = await snapshotSummary(); assertEquals(Object.keys(s.latest).sort(), ["age_days", "date", "listings", "status"]);
-  assertEquals(latestOf([]), { date: null, status: null, listings: 0, age_days: null });
+  const s: any = await snapshotSummary(); assertEquals(Object.keys(s.latest).sort(), ["age_days", "date", "fresh", "listings", "status"]);
+  assertEquals(latestOf([]), { date: null, status: null, listings: 0, age_days: null, fresh: false });
   const now = Date.parse("2026-10-21T01:00:00Z");
-  assertEquals(latestOf([{ date: "2026-10-20", status: "complete", resources: 26364 }], now), { date: "2026-10-20", status: "complete", listings: 26364, age_days: 1 });
+  assertEquals(latestOf([{ date: "2026-10-20", status: "complete", resources: 26364 }], now), { date: "2026-10-20", status: "complete", listings: 26364, age_days: 1, fresh: true });
+  assertEquals(latestOf([{ date: "2026-10-18", status: "complete", resources: 1 }], now).fresh, true); assertEquals(latestOf([{ date: "2026-10-18", status: "complete", resources: 1 }], now + 86400000).fresh, false);
   assertEquals(latestOf([{ date: "2026-10-21", status: "partial", resources: 3 }], now).age_days, 0);
 });
