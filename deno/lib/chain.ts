@@ -1,6 +1,7 @@
 // Port of the /base/* handlers (deterministic JSON-RPC reads only).
 import { keccak_256 } from "@noble/hashes/sha3";
 import { ADDR, HASH, hex } from "./util.ts";
+import { related } from "./routes.ts";
 export const REG = "0xb94704422c2a1e396835a571837aa5ae53285a95";
 export type Rpc = (m: string, p: unknown[]) => Promise<any>;
 export function makeRpc(url: string, f: typeof fetch = fetch): Rpc {
@@ -48,7 +49,7 @@ export class Chain {
     if (path === "/base/usdc-balance") {
       const a = q.address ?? ""; if (!ADDR.test(a)) return [400, { error: "address must be 0x + 40 hex" }];
       const [raw, eth] = await bal(a);
-      return [200, { chain: "base", address: a, usdc: Number(raw) / 1e6, usdc_raw: raw.toString(), eth: Number(eth) / 1e18, eth_wei: eth.toString(), block: Number(big(await rpc("eth_blockNumber", []))) }];
+      return [200, { chain: "base", address: a, usdc: Number(raw) / 1e6, usdc_raw: raw.toString(), eth: Number(eth) / 1e18, eth_wei: eth.toString(), block: Number(big(await rpc("eth_blockNumber", []))), related_routes: related(path) }];
     }
     if (path === "/base/tx-status") {
       const h = q.hash ?? ""; if (!HASH.test(h)) return [400, { error: "hash must be 0x + 64 hex" }];
@@ -73,7 +74,7 @@ export class Chain {
     if (path === "/base/network") {
       const b = await rpc("eth_getBlockByNumber", ["latest", false]);
       return [200, { chain: "base", chain_id: 8453, block: Number(big(b.number)), block_age_s: Math.max(0, Math.floor(Date.now() / 1000) - Number(big(b.timestamp))),
-        base_fee_gwei: Number(big(b.baseFeePerGas ?? "0x0")) / 1e9, gas_price_gwei: Number(big(await rpc("eth_gasPrice", []))) / 1e9 }];
+        base_fee_gwei: Number(big(b.baseFeePerGas ?? "0x0")) / 1e9, gas_price_gwei: Number(big(await rpc("eth_gasPrice", []))) / 1e9, related_routes: related(path) }];
     }
     throw new Error("unknown route");
   }

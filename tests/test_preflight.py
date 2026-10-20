@@ -52,7 +52,7 @@ class T1(unittest.TestCase):
         oc = MS.verify_onchain(rpc, tx, req["asset"], req["payTo"], "1000", W2, sleep=lambda x: None); self.assertTrue(oc["settled"])
         out = MS.record_sale("/x402/preflight", req, {"success": True, "payer": W2, "transaction": tx}, ("a", "b", "c"), oc)
         self.assertEqual((out["status"], out["category"], out["externalPayer"]), ("verified_success", "endpoint_check", True))
-        self.assertEqual(MS.rows("executions.jsonl")[-1]["receipt"], "payment_received"); self.assertEqual(MS.rows("costs.jsonl")[-1]["revenue"], 0.001)
+        self.assertEqual(MS.rows("executions.jsonl")[-1]["receipt"], "payment_received"); self.assertEqual(MS.rows("costs.jsonl")[-1]["revenue"], 0.01)
     def test_self_payer_excluded(self):
         MS = IX.MS; req = IX.req_for("/base/network"); me = "0x" + "77" * 20
         oc = MS.verify_onchain(lambda m, p: self._rc(me, req["payTo"], 1000), "0x" + "ee" * 32, req["asset"], req["payTo"], "1000", me)
@@ -72,9 +72,9 @@ class T1(unittest.TestCase):
             try: urllib.request.urlopen("http://127.0.0.1:18766/x402/preflight?url=https://a.example/x"); self.fail()
             except urllib.error.HTTPError as e:
                 self.assertEqual(e.code, 402); pr = json.loads(base64.b64decode(e.headers["PAYMENT-REQUIRED"]))
-                a = pr["accepts"][0]; self.assertEqual((a["amount"], a["network"], a["payTo"]), ("1000", "eip155:8453", IX.PAY_TO))
+                a = pr["accepts"][0]; self.assertEqual((a["amount"], a["network"], a["payTo"]), ("10000", "eip155:8453", IX.PAY_TO))
             pk = json.loads(urllib.request.urlopen("http://127.0.0.1:18766/x402/preflight/pubkey").read()); self.assertEqual(pk["alg"], "Ed25519")
-            idx = json.loads(urllib.request.urlopen("http://127.0.0.1:18766/").read()); self.assertEqual(idx["routes"]["/x402/preflight"]["price_usdc"], 0.001)
+            idx = json.loads(urllib.request.urlopen("http://127.0.0.1:18766/").read()); self.assertEqual(idx["routes"]["/x402/preflight"]["price_usdc"], 0.01)
         finally: srv.shutdown()
     def test_llms_txt_and_ref_never_changes_402(self):
         srv = IX.ThreadingHTTPServer(("127.0.0.1", 18767), IX.handler); threading.Thread(target=srv.serve_forever, daemon=True).start()
@@ -529,8 +529,17 @@ class T8(unittest.TestCase):
     def test_snapshot_summary(self):
         BS.write([{"resource": "https://a.example/x", "accepts": [{"payTo": "0x" + "ab" * 20}], "quality": {"l30DaysUniquePayers": 2, "l30DaysTotalCalls": 7}}], "2026-01-02")
         s = IX.snapshot_summary(); self.assertIn("snapshots", s)
-        self.assertIn({"date": "2026-01-02", "resources": 1, "hosts": 1, "payout_wallets": 1, "calls30d_total": 7, "payers30d_total": 2}, s["snapshots"])
-        for x in s["snapshots"]: self.assertEqual(set(x), {"date", "resources", "hosts", "payout_wallets", "calls30d_total", "payers30d_total"})
+        self.assertIn({"date": "2026-01-02", "status": None, "resources": 1, "hosts": 1, "payout_wallets": 1, "calls30d_total": 7, "payers30d_total": 2}, s["snapshots"])
+        for x in s["snapshots"]: self.assertEqual(set(x), {"date", "status", "resources", "hosts", "payout_wallets", "calls30d_total", "payers30d_total"})
+        self.assertEqual(set(s["latest"]), {"date", "status", "listings", "age_days"}); self.assertEqual(s["latest"]["date"], s["snapshots"][0]["date"])
+        self.assertEqual(IX.latest_of([]), {"date": None, "status": None, "listings": 0, "age_days": None})
+        self.assertEqual(IX.latest_of([{"date": "2026-10-20", "status": "complete", "resources": 5}], now=1792454400 + 86400 + 3600), {"date": "2026-10-20", "status": "complete", "listings": 5, "age_days": 1})
+    def test_pricing_related_and_llms(self):
+        self.assertEqual({k: v[0] for k, v in IX.ROUTES.items()}, {"/base/usdc-balance": 1000, "/base/tx-status": 2000, "/base/basename": 3000, "/base/address-intel": 10000, "/x402/preflight": 10000, "/base/network": 1000})
+        self.assertEqual(IX.related("/base/network"), [{"path": "/base/tx-status", "price_usdc": "0.002"}, {"path": "/x402/preflight", "price_usdc": "0.010"}])
+        self.assertEqual(IX.related("/base/usdc-balance"), [{"path": "/base/address-intel", "price_usdc": "0.010"}, {"path": "/x402/preflight", "price_usdc": "0.010"}])
+        t = IX.llms_txt(); self.assertIn("before every x402 payment", t); self.assertIn("no language model", t); self.assertIn("pinned to a block number", t)
+        for bad in ("buy now", "recommend", "best ", "guarantee"): self.assertNotIn(bad, t.lower())
 class T9(unittest.TestCase):
     def test_pubkey_fingerprints_and_history(self):
         import hashlib

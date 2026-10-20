@@ -90,6 +90,11 @@ export function llmsTxt(env: Deps["env"]) {
     "- Responses are served only after the transfer is confirmed on-chain", "- Optional ?ref=<tag> (A-Z a-z 0-9 . _ -, max 64) is recorded for attribution and never changes price or challenge", "",
     "## Paid routes (GET, JSON)", "",
     ...Object.entries(ROUTES).map(([k, v]) => `- ${k} (${(v[0] / 1e6).toFixed(3)} USDC): ${v[1]}`),
+    "", "## What the responses are", "", "- Verifiable facts only: every chain reading includes the Base block number it was read at, so it can be reproduced against any Base RPC node",
+    "- No verdicts, opinions, scores or predictions, no buy/sell advice, and no language model in the response path",
+    "- Compared with a free RPC endpoint: values are normalized (decimal and raw units, gwei, confirmations), pinned to a block number, and several reads are combined into one call",
+    "", "## Usage pattern", "", "- Call /x402/preflight?url=<endpoint> before every x402 payment to another endpoint; the response is Ed25519-signed and verifiable against /x402/preflight/pubkey",
+    "- /base/network and /base/usdc-balance responses list related_routes (path and price) for follow-up reads",
     "", "## Discovery (free)", "", "- / : service index with routes and prices", "- /openapi.json : OpenAPI 3.1 description of the paid routes with prices", "- /bazaar/snapshots : daily Bazaar snapshot summary",
     "- /.well-known/bazaar-snapshot.json : signed snapshot series metadata", "- /.well-known/x402-preflight : Pre-pay Check schema and signing key",
     "- /.well-known/x402-preflight-key-history.json : signing key history", "- /x402/preflight/pubkey : Ed25519 public key for verifying signed facts",
@@ -149,12 +154,18 @@ export async function snapshotSummary(limit = 30) {
       const vals = Object.values(res);
       const hosts = idx.tier === "aggregate" ? (idx.aggregate?.hosts ?? 0) : Object.keys(idx.hosts ?? {}).length;
       const wallets = idx.tier === "aggregate" ? (idx.aggregate?.payout_wallets ?? 0) : Object.keys(idx.wallet_hosts ?? {}).length;
-      SNAP_SUM.set(d, { date: d, resources: idx.tier === "full" ? vals.length : (idx.listings ?? 0), hosts, payout_wallets: wallets,
+      const status = (await latestSnapStatus(d)).status ?? idx.status ?? idx.coverage?.status ?? null;
+      SNAP_SUM.set(d, { date: d, status, resources: idx.tier === "full" ? vals.length : (idx.listings ?? 0), hosts, payout_wallets: wallets,
         calls30d_total: vals.reduce((a: number, r: any) => a + (r.calls30d || 0), 0), payers30d_total: vals.reduce((a: number, r: any) => a + (r.payers30d || 0), 0) });
     }
     out.push(SNAP_SUM.get(d)!);
   }
-  return { source: "x402 Bazaar discovery API, crawled daily at 00:15 UTC", snapshots: out };
+  return { source: "x402 Bazaar discovery API, crawled daily at 00:15 UTC", latest: latestOf(out), snapshots: out };
+}
+/** Freshness and completeness of the newest snapshot: date, status (complete | partial | failed | null), listing count, age in days. */
+export function latestOf(out: Record<string, any>[], now = Date.now()) {
+  const s = out[0]; if (!s) return { date: null, status: null, listings: 0, age_days: null };
+  return { date: s.date, status: s.status ?? null, listings: s.resources ?? 0, age_days: Math.max(0, Math.floor((now - Date.parse(s.date + "T00:00:00Z")) / 86400000)) };
 }
 /** On Base mainnet (including empty NETWORK=) paid routes need PUBLIC_URL: resource URLs never come from the Host header.
  * Missing PUBLIC_URL is a startup warning, not a refusal, so free routes stay up on any host; paid routes answer 503. */
