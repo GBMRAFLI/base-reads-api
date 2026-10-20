@@ -156,16 +156,57 @@ export async function snapshotSummary(limit = 30) {
   }
   return { source: "x402 Bazaar discovery API, crawled daily at 00:15 UTC", snapshots: out };
 }
+/** On Base mainnet (including empty NETWORK=) paid routes need PUBLIC_URL: resource URLs never come from the Host header.
+ * Missing PUBLIC_URL is a startup warning, not a refusal, so free routes stay up on any host; paid routes answer 503. */
+export function publicUrlError(env: Deps["env"]): string | null {
+  return cfg(env).NETWORK === MAINNET && !cfg(env).PUBLIC ? "PUBLIC_URL is required on Base mainnet (resource URLs are never derived from the Host header)" : null;
+}
+export function resourceOrigin(host: string, env: Deps["env"]): string {
+  const c = cfg(env); if (c.PUBLIC) return c.PUBLIC;
+  const e = publicUrlError(env); if (e) throw new Error(e);
+  return "https://" + safeHost(host); // testnet / local only
+}
 export function required(path: string, host: string, env: Deps["env"]) {
-  const [, desc] = ROUTES[path]; const c = cfg(env);
-  return { x402Version: 2, error: "PAYMENT-SIGNATURE header is required", resource: { url: (c.PUBLIC || ("https://" + safeHost(host))) + path, description: desc, mimeType: "application/json" },
+  const [, desc] = ROUTES[path];
+  return { x402Version: 2, error: "PAYMENT-SIGNATURE header is required", resource: { url: resourceOrigin(host, env) + path, description: desc, mimeType: "application/json" },
     accepts: [reqFor(path, env)], extensions: { bazaar: bazaar(path) } };
 }
 export function facClient(base: string, env: Deps["env"], f: typeof fetch = fetch) {
   return async (p: string, body: unknown) => {
     const r = await f(base + p, { method: "POST", headers: { "Content-Type": "application/json", "User-Agent": "base-reads/1.0", ...(await cdpHeaders(base, p, env)) }, body: pyDumps(body), signal: AbortSignal.timeout(40000) });
-    try { return await r.json(); } catch { return {}; }
+    let out: any; try { out = await r.json(); } catch { out = {}; }
+    if (!out || typeof out !== "object" || Array.isArray(out)) out = {};
+    const er = extensionStatus(r.headers.get("EXTENSION-RESPONSES"));
+    if (er) Object.defineProperty(out, "extensionResponses", { value: er, enumerable: false });
+    return out;
   };
+}
+/** Decode the facilitator EXTENSION-RESPONSES header (base64 JSON keyed by extension name); null when absent or malformed. */
+export function extensionStatus(h: string | null): Record<string, any> | null {
+  if (!h || h.length > 16384) return null;
+  try { const o = JSON.parse(new TextDecoder().decode(Uint8Array.from(atob(h.trim()), (ch) => ch.charCodeAt(0))));
+    return o && typeof o === "object" && !Array.isArray(o) ? o : null; } catch { return null; }
+}
+/** One log line with the bazaar extension outcome only (status and short reason); never logs payloads or keys. */
+export function logBazaar(stage: string, path: string, res: any) {
+  const b = res?.extensionResponses?.bazaar; if (!b || typeof b !== "object") return;
+  const status = typeof b.status === "string" ? b.status.replace(/[^\x20-\x7e]/g, " ").slice(0, 32) : "unknown";
+  const why = typeof b.rejectedReason === "string" ? " reason=" + b.rejectedReason.replace(/[^\x20-\x7e]/g, " ").replace(/0x[0-9a-fA-F]{16,}/g, "0x…").slice(0, 200) : "";
+  console.log(`bazaar extension ${stage} ${path}: ${status}${why}`);
+}
+/** Max size of client-sent paymentPayload.extensions, measured on the re-serialized JSON (JSON.stringify of the parsed value,
+ * UTF-8 bytes), not on the raw header; the whole header is already capped at MAX_HEADER (16 KB). Larger values are refused before any claim. */
+export const MAX_EXTENSIONS_BYTES = 8192;
+export function extensionsTooLarge(payload: Record<string, any>): boolean {
+  if (payload.extensions === undefined) return false;
+  try { return new TextEncoder().encode(JSON.stringify(payload.extensions) ?? "").length > MAX_EXTENSIONS_BYTES; } catch { return true; }
+}
+/** Facilitator-bound copy of the payment payload: resource and extensions are always the server's own values from the
+ * 402 challenge (client-sent extensions are dropped, never forwarded). Both keys sit outside the EIP-3009 signature;
+ * the signed accepted/payload blocks are passed through unchanged and the input object is not mutated. */
+export function withDiscovery(payload: Record<string, any>, path: string, host: string, env: Deps["env"]): Record<string, any> {
+  const pr = required(path, host, env);
+  return { ...payload, resource: pr.resource, extensions: { bazaar: pr.extensions.bazaar } };
 }
 function timingSafeEq(a: string, b: string) {
   const x = new TextEncoder().encode(a), y = new TextEncoder().encode(b); let d = x.length ^ y.length;
@@ -233,8 +274,9 @@ async function handleGet(req: Request, d: Deps): Promise<Response> {
   if (path === "/x402/preflight" && !ADDR.test(c.PAY_TO)) return send(503, { error: "payee not configured" });
   const tReq = iso();
   const sig = req.headers.get("PAYMENT-SIGNATURE") ?? req.headers.get("X-PAYMENT");
+  if (publicUrlError(env)) return send(503, { error: "public origin not configured" }); // mainnet without PUBLIC_URL: never use Host
   if (!sig) { const pr = required(path, req.headers.get("Host") ?? "", env); return send(402, pr, { "PAYMENT-REQUIRED": b64(pr) }); }
-  const [code, out, hd] = await paid(path, q, qs, sig, tReq, d, c, rpc, fac);
+  const [code, out, hd] = await paid(path, q, qs, sig, tReq, d, c, rpc, fac, req.headers.get("Host") ?? "");
   return send(code, out, hd);
 }
 
@@ -255,6 +297,7 @@ export function onchainMode(env: Deps["env"]): "block" | "log" {
 /** Non-fatal configuration problems, logged once at startup. */
 export function startupWarnings(env: Deps["env"]): string[] {
   const w: string[] = []; const ca = env("SIGNING_KEY_CREATED_AT");
+  if (publicUrlError(env)) w.push("PUBLIC_URL is not set on Base mainnet: paid routes answer 503 until it is set (free routes stay up)");
   if (ca && !isoOrNull(ca)) w.push("SIGNING_KEY_CREATED_AT is not strict ISO-8601 UTC (YYYY-MM-DDTHH:MM:SSZ); published as null");
   try { const h = JSON.parse(env("SIGNING_KEY_HISTORY") || "[]");
     if (!Array.isArray(h)) w.push("SIGNING_KEY_HISTORY is not a JSON list; ignored");
@@ -281,11 +324,12 @@ type Cfg = ReturnType<typeof cfg>;
  * Serve ONLY when Base shows the USDC Transfer(payer -> payTo, >= amount) and AuthorizationUsed(payer, nonce) in the same receipt.
  * The payer is always the signed authorization's `from`, never the facilitator's word. An unconfirmed receipt parks the payment (202). */
 async function paid(path: string, q: Record<string, string>, qs: string, sig: string, tReq: string, d: Deps, c: Cfg, rpc: Rpc,
-  fac: (p: string, body: unknown) => Promise<any>): Promise<[number, unknown, Record<string, string>]> {
+  fac: (p: string, body: unknown) => Promise<any>, host = ""): Promise<[number, unknown, Record<string, string>]> {
   const env = d.env; const mode = onchainMode(env); const N = c.NETWORK;
   const [payload, err] = SG.parsePayment(sig);
   if (err || !payload) return [400, { error: err }, {}];
   const r = reqFor(path, env);
+  if (extensionsTooLarge(payload)) return [400, { error: "payment payload extensions too large" }, {}];
   const bad = SG.precheck(payload, r); // before the claim: malformed/foreign payloads never consume a nonce slot
   if (bad) return [402, { error: bad }, noPay(bad, N)];
   const who = SG.payerOf(payload)!; const nonce = SG.nonceOf(payload)!; const ids = { ip: d.ip ?? null, payer: who };
@@ -333,8 +377,8 @@ async function paid(path: string, q: Record<string, string>, qs: string, sig: st
   // KV claim is only an in-flight lock; the append-only ledger is the source of truth for spent authorizations,
   // so a rolled-back or restored KV can never let a spent authorization through again.
   if (await SG.authUsed(key)) return [402, { error: "payment authorization already used", hint: REUSE_HINT }, noPay("replay", N)];
-  const body = { x402Version: 2, paymentPayload: payload, paymentRequirements: r };
-  const v = await fac("/verify", body); const tVer = iso();
+  const body = { x402Version: 2, paymentPayload: withDiscovery(payload!, path, host, env), paymentRequirements: r };
+  const v = await fac("/verify", body); const tVer = iso(); logBazaar("verify", path, v);
   if (!v.isValid) { const why = facErr(v.invalidReason); await FAILS.fail({ ip: ids.ip }, "verify"); return [402, { error: why }, noPay(why, N)]; }
   held.payer = await SG.acquireSlots({ payer: who }); // L1: a forged `from` never reaches this line
   if (!held.payer) { await SG.unclaim(key); return busy; } // not settled: the same authorization may be retried
@@ -347,7 +391,7 @@ async function paid(path: string, q: Record<string, string>, qs: string, sig: st
   if (code !== 200) return [code, out, {}]; // bad input: not settled, not charged
   // point of no return: record the authorization as consumed (fsync'ed) before asking for settlement
   if (!await SG.consumeAuth(key, { path, payload_sha256: await SG.payloadHash(payload!) })) return [402, { error: "payment authorization already used", hint: REUSE_HINT }, noPay("replay", N)];
-  const st = await fac("/settle", body); const tSet = iso(); const times: [string, string, string] = [tReq, tVer, tSet];
+  const st = await fac("/settle", body); const tSet = iso(); logBazaar("settle", path, st); const times: [string, string, string] = [tReq, tVer, tSet];
   const tx: string | null = typeof st.transaction === "string" && SG.TX_RE.test(st.transaction) ? st.transaction.toLowerCase() : null;
   if (typeof st.payer === "string" && st.payer.toLowerCase() !== who) mismatch("facilitator_payer_differs_from_signed_from");
   if (!st.success) {

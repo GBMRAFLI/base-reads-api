@@ -9,7 +9,7 @@
    certificates count against a shared Let's Encrypt rate limit, so use your own domain for production.
    Real values (`API_DOMAIN`, `PUBLIC_URL`) live only in `/etc/base-reads/env`; the repo keeps placeholders.
    `setup.sh` and `deploy.sh` render the Caddyfile from `API_DOMAIN`; `deploy/gen_listings.ts` reads `PUBLIC_URL`.
-   `PUBLIC_URL` sets the 402 resource URLs, `llms.txt` and `openapi.json`.
+   `PUBLIC_URL` sets the 402 resource URLs, `llms.txt` and `openapi.json`; it is required on Base mainnet (without it paid routes return 503; free routes stay up and a startup warning is logged).
 4. From a checkout: `deploy/vps/deploy.sh [--restore-kv] root@<server> <git-ref>`. Each deploy gets a fresh release dir
    and saved unit files; the switch is an atomic symlink move; `/healthz` (signing key loads + KV round-trip, booleans only,
    answered to loopback peers only; Caddy returns 404 for it) must pass within 30 s, otherwise the units and the previous

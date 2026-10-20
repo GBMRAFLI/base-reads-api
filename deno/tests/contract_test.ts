@@ -17,7 +17,7 @@ const C = JSON.parse(Deno.readTextFileSync(new URL("./fixtures/contract.json", i
 const P = JSON.parse(Deno.readTextFileSync(new URL("./fixtures/py_signed.json", import.meta.url)));
 useKv(await Deno.openKv(":memory:"));
 const TOKEN = "t".repeat(40);
-const ENV: Record<string, string> = { SIGNING_KEY_PASSPHRASE: P.passphrase, SIGNING_KEY_ENC_B64: P.enc_b64, EXPORT_TOKEN: TOKEN, SELF_WALLETS: "0x" + "77".repeat(20) };
+const ENV: Record<string, string> = { SIGNING_KEY_PASSPHRASE: P.passphrase, SIGNING_KEY_ENC_B64: P.enc_b64, EXPORT_TOKEN: TOKEN, PUBLIC_URL: "https://h.example", SELF_WALLETS: "0x" + "77".repeat(20) };
 const env = (k: string) => ENV[k];
 for (const [k, v] of Object.entries(ENV)) Deno.env.set(k, v);
 Deno.env.delete("PAY_TO_ADDRESS");
@@ -255,7 +255,7 @@ Deno.test("on-chain check binds the EIP-3009 nonce (AuthorizationUsed in the sam
   assertEquals((await f(rcpt(null), null)).settled, true);
 });
 Deno.test("Host header cannot inject the challenge resource URL", () => {
-  const e = (k: string) => k === "PUBLIC_URL" ? undefined : env(k);
+  const e = (k: string) => k === "PUBLIC_URL" ? undefined : k === "NETWORK" ? "eip155:84532" : env(k); // Host fallback exists only off mainnet
   assertEquals(required("/base/network", "evil.example/x?y", e).resource.url, "https://invalid-host/base/network");
   assertEquals(required("/base/network", "h.example:8443", e).resource.url, "https://h.example:8443/base/network");
 });
@@ -465,7 +465,7 @@ Deno.test("used settlement tx hashes are stored durably in KV (atomic, no expiry
 });
 Deno.test("A10 startup warnings for invalid CREATED_AT / HISTORY dates", async () => {
   const { startupWarnings } = await import("../main.ts");
-  const w = (o: Record<string, string>) => startupWarnings((k) => o[k]);
+  const w = (o: Record<string, string>) => startupWarnings((k) => ({ PUBLIC_URL: "https://h.example", ...o })[k]);
   assertEquals(w({ SIGNING_KEY_CREATED_AT: "2026-10-14T12:00:21Z" }), []); assertEquals(w({}), []);
   assertEquals(w({ SIGNING_KEY_CREATED_AT: "2026-10-14" }).length, 1);
   assertEquals(w({ SIGNING_KEY_HISTORY: JSON.stringify([{ created_at: "yesterday", retired_at: "2026-10-01T00:00:00Z" }]) }), ["SIGNING_KEY_HISTORY[0].created_at is not strict ISO-8601 UTC; published as null"]);
