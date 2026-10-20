@@ -64,6 +64,15 @@ install -m 644 "$R/deploy/vps/kv-backup.service" /etc/systemd/system/base-reads-
 install -m 644 "$R/deploy/vps/kv-backup.timer" /etc/systemd/system/base-reads-kv-backup.timer
 install -m 755 "$R/deploy/vps/kv-backup.sh" /usr/local/sbin/base-reads-kv-backup.new && mv /usr/local/sbin/base-reads-kv-backup.new /usr/local/sbin/base-reads-kv-backup
 ln -sfn "$R" "$APP.new" && mv -T "$APP.new" "$APP"
+# Caddyfile is rendered from API_DOMAIN in /etc/base-reads/env; installed only if it changed and validates
+DOM=$(sed -n 's/^API_DOMAIN=//p' /etc/base-reads/env | tail -1)
+if [ -n "$DOM" ] && printf '%s' "$DOM" | grep -Eq '^[a-z0-9.-]+$'; then
+  sed "s/API_DOMAIN_PLACEHOLDER/$DOM/" "$R/deploy/vps/Caddyfile" > /etc/caddy/Caddyfile.new
+  if cmp -s /etc/caddy/Caddyfile.new /etc/caddy/Caddyfile; then rm -f /etc/caddy/Caddyfile.new
+  elif caddy validate --config /etc/caddy/Caddyfile.new --adapter caddyfile >/dev/null 2>&1; then
+    mv /etc/caddy/Caddyfile.new /etc/caddy/Caddyfile && systemctl restart caddy
+  else rm -f /etc/caddy/Caddyfile.new; echo "rendered Caddyfile invalid; kept the current one" >&2; fi
+fi
 systemctl daemon-reload
 systemctl enable base-reads >/dev/null && systemctl restart base-reads
 ok=0

@@ -5,8 +5,10 @@
    enabled when root or the sudo user already has an authorized key; root must log in with a key afterwards.
 2. Put secrets in `/etc/base-reads/env` (root, mode 600) using the names in `env.example`. Never commit values.
 3. Hostname: to change it, edit the site line in `/etc/caddy/Caddyfile` and `PUBLIC_URL` in `/etc/base-reads/env`,
-   then `systemctl restart caddy base-reads`. A wildcard-IP name (`<a-b-c-d>.sslip.io`) works for testing, but its
+   then `systemctl restart caddy base-reads`. A wildcard-DNS name that maps to the server IP works for testing, but its
    certificates count against a shared Let's Encrypt rate limit, so use your own domain for production.
+   Real values (`API_DOMAIN`, `PUBLIC_URL`) live only in `/etc/base-reads/env`; the repo keeps placeholders.
+   `setup.sh` and `deploy.sh` render the Caddyfile from `API_DOMAIN`; `deploy/gen_listings.ts` reads `PUBLIC_URL`.
    `PUBLIC_URL` sets the 402 resource URLs, `llms.txt` and `openapi.json`.
 4. From a checkout: `deploy/vps/deploy.sh [--restore-kv] root@<server> <git-ref>`. Each deploy gets a fresh release dir
    and saved unit files; the switch is an atomic symlink move; `/healthz` (signing key loads + KV round-trip, booleans only,
@@ -31,3 +33,41 @@
    `base-reads-kv-backup.timer` makes a daily consistent copy of both (14 daily + 8 weekly each).
    Backups are local to the server only and are lost with it. For an offsite copy, add an executable
    `/etc/base-reads/backup-offsite.sh`; it receives the backup path and must encrypt (e.g. age or gpg) before uploading.
+
+## Payment ledger rules
+
+- **Spent on submission.** An authorization is recorded as spent right before it is sent for settlement. If settlement
+  then fails, or the process crashes mid-request, that authorization stays spent: the client must sign a new one with a
+  new nonce. Such responses are 402 with a `hint` field saying so.
+- **Trigger limits.** UPDATE/DELETE triggers stop the app and normal SQL from changing rows, not someone with file
+  access: `DROP TRIGGER`, editing the file, or replacing it are still possible. Protect it with file permissions
+  (service user only) and backups. Optional hardening (not built in): ship an append-only export offsite, e.g. a daily
+  file of new rows where each line carries `sha256(previous_line_hash + row)`, so later tampering is detectable.
+- **Never restore the ledger by replacing the file.** A replaced file can lose entries written after the backup and
+  re-open spent authorizations. Only merge rows back with INSERT OR IGNORE:
+  `deno run --allow-read --allow-write deploy/vps/ledger-merge.ts <live-ledger> <backup-ledger>` (adds missing rows, never
+  changes existing ones; gunzip the backup first).
+- **Finality.** `MIN_CONFIRMATIONS` (1..64, clamped; default 1 = receipt is enough). Consider 2-3 for higher-priced routes.
+- `NETWORK=` empty is treated as Base mainnet, so the in-memory ledger is refused.
+
+## Snapshot size and memory (measured 2026-10-20, real Bazaar data)
+
+- Full crawl: 26,130 listings in 27 pages, ~11 s, status `complete`.
+- Peak RSS by pages fetched (separate runs): 5 pages 150 MiB, 10 pages 198 MiB, 20 pages 217 MiB, 27 pages 225 MiB
+  (process start ~43 MiB). Slope above 10 pages is ~1.6 MiB/page, so the 50-page default projects to roughly 260-300 MiB,
+  well below systemd MemoryHigh 500M / MemoryMax 600M. Re-measure if Bazaar approaches 50k listings.
+- Bounds: `SNAPSHOT_MAX_PAGES` (default 50, hard cap 100) and a 10 minute total time budget. Hitting either ends the run as
+  `partial` (`coverage.stopped` = `page_cap` or `time_budget`). `complete` requires a short final page; the reported
+  total alone is not trusted.
+- Stored: 860,713 bytes gzip in 15 chunks of at most 60,000 bytes (below the 64 KiB Deno KV value limit; each chunk is its
+  own write and the switch to the new generation is one small atomic commit). Reduced day: 81,343 bytes; aggregate: 218 bytes.
+- Retention estimate: 31 full days + 334 reduced days = ~51 MiB per year of KV data.
+- A loaded full index takes ~10 MiB of heap; the in-process cache keeps at most 3.
+
+## Backup disk use
+
+- A KV backup is roughly the KV file size: snapshot chunks are already gzip, so gzip saves little
+  (measured: 925,696-byte KV file -> 865,250 bytes gzip).
+- At the steady state above (~51 MiB KV) each daily copy is ~50 MiB; 14 daily + 8 weekly = 22 copies, about 1.1 GiB.
+  Ledger copies are a few KB. `--restore-kv` deploys add one uncompressed KV copy each (newest 5 kept).
+- The server has ~50 GB free, so this is under 3% of disk; lower the retention in `kv-backup.sh` if disk is tighter.

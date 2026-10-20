@@ -1,5 +1,6 @@
 // Daily Bazaar snapshot (Deno.cron 00:15 UTC only; never at startup). Bounded to keep hosting usage small:
-// at most SNAPSHOT_MAX_PAGES pages (default 3, 1000 items each), 15 s per page, 1 retry, and at most one attempt
+// at most SNAPSHOT_MAX_PAGES pages (default 50, hard cap 100; 1000 items each), a 10 min total time budget, ending at the first short page,
+// 15 s per page, 1 retry, and at most one attempt
 // (success or failure) per UTC calendar day. Status is complete | partial | failed; failed stores an error record
 // (never an empty snapshot). Tiered retention demotes old indexes (never the newest; no day deletion).
 import {
@@ -10,6 +11,10 @@ import { kv } from "./store.ts";
 
 const BAZAAR = Deno.env.get("BAZAAR_URL") ?? "https://api.cdp.coinbase.com/platform/v2/x402/discovery/resources";
 export const PAGE = 1000, PAGE_TIMEOUT_MS = 15000, RETRIES = 1;
+/** Default and hard cap for SNAPSHOT_MAX_PAGES (1000 items per page). */
+export const DEFAULT_MAX_PAGES = 50, HARD_MAX_PAGES = 100;
+/** Total wall-clock budget for one crawl; when exceeded the run ends as partial. */
+export const TIME_BUDGET_MS = 10 * 60_000;
 export const SNAPATTEMPT_TTL_MS = 3 * 24 * 3600_000;
 /** 0–30 full; 31–364 reduced (counts only); 365+ aggregate. Newest day is never demoted. */
 export const TIER_FULL_DAYS = 30, TIER_AGGREGATE_FROM = 365;
@@ -31,31 +36,35 @@ export function mapErrorCode(err: string): string {
 
 export function maxPages(env: (k: string) => string | undefined = (k) => Deno.env.get(k), warn: (m: string) => void = console.warn) {
   const raw = env("SNAPSHOT_MAX_PAGES");
-  if (raw === undefined || raw === "") return 3;
+  if (raw === undefined || raw === "") return DEFAULT_MAX_PAGES;
   const n = Number(raw);
-  if (!Number.isInteger(n)) { warn(`SNAPSHOT_MAX_PAGES=${JSON.stringify(raw)} invalid; using 3`); return 3; }
-  if (n < 1 || n > 50) { const c = Math.min(50, Math.max(1, n)); warn(`SNAPSHOT_MAX_PAGES=${n} out of range; clamped to ${c}`); return c; }
+  if (!Number.isInteger(n)) { warn(`SNAPSHOT_MAX_PAGES=${JSON.stringify(raw)} invalid; using ${DEFAULT_MAX_PAGES}`); return DEFAULT_MAX_PAGES; }
+  if (n < 1 || n > HARD_MAX_PAGES) { const c = Math.min(HARD_MAX_PAGES, Math.max(1, n)); warn(`SNAPSHOT_MAX_PAGES=${n} out of range; clamped to ${c}`); return c; }
   return n;
 }
 
 export function utcDay(now = Date.now()) { return new Date(now).toISOString().slice(0, 10); }
 
-function attachStatus(idx: Index, pages: number, fetched: number, total: number | null, reachedEnd: boolean, failedPages: number[]): Index {
-  const complete = (reachedEnd || (total !== null && idx.listings >= total)) && failedPages.length === 0;
+export type StopReason = "short_page" | "page_cap" | "time_budget";
+function attachStatus(idx: Index, pages: number, fetched: number, total: number | null, reachedEnd: boolean, failedPages: number[], stopped: StopReason): Index {
+  // complete only when a short (final) page was actually seen; the reported total alone is not trusted
+  const complete = reachedEnd && failedPages.length === 0;
   const status: SnapStatus = complete ? "complete" : "partial";
   idx.coverage = {
     pages_fetched: fetched, max_pages: pages, items_indexed: idx.listings, bazaar_total: total,
-    complete, status, partial: status === "partial", failed_pages: failedPages,
-  };
+    complete, status, partial: status === "partial", failed_pages: failedPages, stopped,
+  } as Index["coverage"];
   idx.status = status; idx.tier = "full";
   return idx;
 }
 
 /** Fetch up to `pages` Bazaar pages. Page failures are recorded; if nothing was indexed the result is failed (no empty snap). */
-export async function runSnapshot(f: typeof fetch = fetch, pages = maxPages(), date = new Date().toISOString().slice(0, 10)): Promise<RunResult> {
+export async function runSnapshot(f: typeof fetch = fetch, pages = maxPages(), date = new Date().toISOString().slice(0, 10),
+  budgetMs = TIME_BUDGET_MS, now: () => number = Date.now): Promise<RunResult> {
   const b = new IndexAssembler(); let off = 0, fetched = 0, total: number | null = null, reachedEnd = false;
-  const failedPages: number[] = [];
+  const failedPages: number[] = []; const t0 = now(); let stopped: StopReason = "page_cap";
   for (let page = 0; page < pages; page++) {
+    if (now() - t0 > budgetMs) { stopped = "time_budget"; break; }
     let d: any = null;
     for (let attempt = 0; attempt <= RETRIES && !d; attempt++) {
       try {
@@ -66,13 +75,13 @@ export async function runSnapshot(f: typeof fetch = fetch, pages = maxPages(), d
     if (!d) { failedPages.push(page); off += PAGE; continue; }
     const items = d.items ?? []; b.add(items); fetched++;
     if (typeof d.pagination?.total === "number") total = d.pagination.total;
-    if (items.length < PAGE) { reachedEnd = true; break; }
+    if (items.length < PAGE) { reachedEnd = true; stopped = "short_page"; break; }
     off += items.length;
   }
   if (fetched === 0) {
     return { status: "failed", fail: { status: "failed", date, error: "bazaar fetch failed", error_code: "bazaar_fetch_failed", at: new Date().toISOString(), failed_pages: failedPages } };
   }
-  const idx = attachStatus(b.build(date), pages, fetched, total, reachedEnd, failedPages);
+  const idx = attachStatus(b.build(date), pages, fetched, total, reachedEnd, failedPages, stopped);
   const meta = await saveIndex(idx);
   await applyTierRetention(date);
   return { status: idx.status!, index: idx, meta: { gzip_bytes: meta.gzip_bytes, chunks: meta.chunks } };
@@ -102,7 +111,7 @@ function targetTier(age: number): SnapTier {
   return "full";
 }
 
-function toReduced(idx: Index): Index {
+export function toReduced(idx: Index): Index {
   const walletCounts: Record<string, number> = {};
   for (const [w, v] of Object.entries(idx.wallet_hosts ?? {})) {
     walletCounts[w] = typeof v === "number" ? v : v.length;
@@ -113,7 +122,7 @@ function toReduced(idx: Index): Index {
   };
 }
 
-function toAggregate(idx: Index): Index {
+export function toAggregate(idx: Index): Index {
   const hostN = Object.keys(idx.hosts ?? {}).length || (idx.aggregate?.hosts ?? 0);
   let walletN = idx.aggregate?.payout_wallets ?? 0;
   if (!walletN) walletN = Object.keys(idx.wallet_hosts ?? {}).length;

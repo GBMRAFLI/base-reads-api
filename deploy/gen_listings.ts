@@ -1,5 +1,5 @@
 // Regenerates deploy/listings.json from the code (routes, prices, descriptions) while keeping the
-// hand-maintained fields (base_url, directories, ref values). Run: deno run -A deploy/gen_listings.ts [base_url]
+// hand-maintained fields (base_url, directories, ref values). Run: deno run -A deploy/gen_listings.ts [base_url]  (default: $PUBLIC_URL). Do not commit a filled-in base_url.
 import { ROUTES } from "../deno/lib/routes.ts";
 import DISCOVERY from "../deno/lib/discovery.json" with { type: "json" };
 
@@ -13,8 +13,9 @@ export function buildRoutes() {
 }
 if (import.meta.main) {
   const cur = JSON.parse(await Deno.readTextFile(FILE));
-  if (Deno.args[0]) {
-    const u = Deno.args[0].replace(/\/+$/, "");
+  const arg = Deno.args[0] ?? Deno.env.get("PUBLIC_URL"); // real value comes from the server env, never the repo
+  if (arg) {
+    const u = arg.replace(/\/+$/, "");
     if (!/^https:\/\/[a-z0-9.-]+$/.test(u)) { console.error("base_url must be https://<hostname>"); Deno.exit(2); }
     cur.base_url = u;
   }

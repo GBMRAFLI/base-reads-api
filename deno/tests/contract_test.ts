@@ -81,9 +81,11 @@ Deno.test("SSRF guard rejects non-public answers", async () => {
 });
 Deno.test("preflight end-to-end: signed facts, bazaar facts from KV snapshot", async () => {
   clearIndexCache(); const b = new IndexAssembler();
+  // dates relative to today: snapshots older than FULL_MAX_AGE_DAYS are not served
+  const D0 = new Date(Date.now() - 86400_000).toISOString().slice(0, 10), D1 = new Date().toISOString().slice(0, 10);
   b.add([{ resource: "https://a.example/x", accepts: [{ payTo: "0x" + "22".repeat(20) }], quality: { l30DaysUniquePayers: 4, l30DaysTotalCalls: 8, lastCalledAt: "2026-10-13T00:00:00Z" } },
     { resource: "https://c.example/z", accepts: [{ payTo: "0x" + "22".repeat(20) }], quality: {} }]);
-  await saveIndex(b.build("2026-10-13"));
+  await saveIndex(b.build(D0));
   const ch = { x402Version: 2, accepts: [{ scheme: "exact", network: "eip155:8453", amount: "1000", asset: "0x" + "11".repeat(20), payTo: "0x" + "22".repeat(20), maxTimeoutSeconds: 60 }] };
   const fetcher = async () => new Response("{}", { status: 402, headers: { "PAYMENT-REQUIRED": btoa(JSON.stringify(ch)) } });
   const [code, envl]: any = await preflight("https://a.example/x?q=1", { resolver: async () => ["93.184.216.34"], fetcher });
@@ -91,11 +93,11 @@ Deno.test("preflight end-to-end: signed facts, bazaar facts from KV snapshot", a
   const f = envl.facts; assertEquals(Object.keys(f).sort(), ["bazaar", "challenge", "checked_at", "disclaimer", "reachability", "schema", "target"]);
   assert(f.challenge.valid); assertEquals(f.reachability.http_status, 402);
   assertEquals(f.bazaar.host_listing_count, 1); assertEquals(f.bazaar.payout_wallet_reuse["0x" + "22".repeat(20)].hosts_using_wallet, 2);
-  assertEquals(f.bazaar.payer_trend, [{ snapshot: "2026-10-13", tier: "full", payers30d: 4, calls30d: 8 }]);
+  assertEquals(f.bazaar.payer_trend, [{ snapshot: D0, tier: "full", payers30d: 4, calls30d: 8 }]);
   assertEquals(f.bazaar.last_called_at, "2026-10-13T00:00:00Z");
-  const big = { ...b.build("2026-10-14"), resources: Object.fromEntries(Array.from({ length: 5000 }, (_, i) => [`https://h${i}.example/r`, { payers30d: i, calls30d: i, lastCalledAt: null, payTo: [] }])) };
+  const big = { ...b.build(D1), resources: Object.fromEntries(Array.from({ length: 5000 }, (_, i) => [`https://h${i}.example/r`, { payers30d: i, calls30d: i, lastCalledAt: null, payTo: [] }])) };
   await saveIndex(big); clearIndexCache(); // multi-chunk round trip (> 64 KiB KV value limit)
-  assertEquals(((await bazaarFacts("https://h4999.example/r", [])) as any).payer_trend.at(-1), { snapshot: "2026-10-14", tier: "full", payers30d: 4999, calls30d: 4999 });
+  assertEquals(((await bazaarFacts("https://h4999.example/r", [])) as any).payer_trend.at(-1), { snapshot: D1, tier: "full", payers30d: 4999, calls30d: 4999 });
 });
 
 const pad = (a: string) => "0x" + "0".repeat(24) + a.slice(2);
@@ -593,7 +595,7 @@ async function wipeSnaps(k: Deno.Kv) {
 
 Deno.test("usage cut: snapshot capped at N pages, 1 retry, coverage recorded, one attempt per UTC day, listed:null when incomplete", async () => {
   const S = await import("../lib/snapshot.ts"); const { kv } = await import("../lib/store.ts"); const k = await kv();
-  await wipeSnaps(k);
+  await wipeSnaps(k); Deno.env.set("SNAPSHOT_MAX_PAGES", "3"); // this test exercises a capped (partial) run
   const mk = (i: number) => ({ resource: `https://h${i % 7}.example/r${i}`, accepts: [{ payTo: "0x" + (i % 3).toString(16).padStart(40, "0") }], quality: {} });
   let calls = 0;
   const f = (async (u: string) => { calls++; const off = Number(new URL(u).searchParams.get("offset"));
@@ -603,7 +605,7 @@ Deno.test("usage cut: snapshot capped at N pages, 1 retry, coverage recorded, on
   const idx = out.status === "failed" ? null : out.index;
   assertEquals([calls, idx!.listings, idx!.coverage?.complete, idx!.coverage?.status, idx!.coverage?.partial, out.status !== "failed" && out.meta.chunks >= 1], [3, 3000, false, "partial", true, true]);
   const warns: string[] = []; const w = (m: string) => warns.push(m);
-  assertEquals([S.maxPages(() => undefined), S.maxPages(() => "5"), S.maxPages(() => "0", w), S.maxPages(() => "99", w), S.maxPages(() => "x", w), S.PAGE_TIMEOUT_MS, S.RETRIES], [3, 5, 1, 50, 3, 15000, 1]);
+  assertEquals([S.maxPages(() => undefined), S.maxPages(() => "5"), S.maxPages(() => "0", w), S.maxPages(() => "99", w), S.maxPages(() => "999", w), S.maxPages(() => "100", w), S.maxPages(() => "x", w), S.PAGE_TIMEOUT_MS, S.RETRIES], [50, 5, 1, 99, 100, 100, 50, 15000, 1]);
   assert(warns.length >= 3);
   let n = 0; const bad = (async () => { n++; throw new Error("down"); }) as typeof fetch;
   const failOut = await S.runSnapshot(bad, 3, "2001-01-02");
@@ -632,6 +634,7 @@ Deno.test("usage cut: snapshot capped at N pages, 1 retry, coverage recorded, on
   const hit = await bazaarFacts("https://h1.example/r1", [], 14, "2001-01-04");
   assertEquals([(hit as any).listed, (hit as any).host_listing_count_is_min], [true, true]);
   await wipeSnaps(k);
+  Deno.env.delete("SNAPSHOT_MAX_PAGES");
 });
 
 Deno.test("snapshot follow-ups: freshness, tiers 30/365, legacy, orphan purge, crash after flip, real size", async () => {
@@ -1011,4 +1014,91 @@ Deno.test("startup refuses an in-memory ledger on mainnet; testnet needs explici
     clearEnv: true, env: { PATH: Deno.env.get("PATH") ?? "", HOME: Deno.env.get("HOME") ?? "", PORT: "0", SNAPSHOT_SCHEDULER: "0" }, stdout: "piped", stderr: "piped" });
   const out = await p.output(); const err = new TextDecoder().decode(out.stderr);
   assert(!out.success); assert(err.includes("payment ledger needs a file"), err.slice(0, 300));
+});
+
+Deno.test("MIN_CONFIRMATIONS is clamped to 1..64", async () => {
+  const { minConfirmations } = await import("../main.ts");
+  const m = (v: string | undefined) => minConfirmations((k: string) => k === "MIN_CONFIRMATIONS" ? v : undefined);
+  assertEquals([m(undefined), m(""), m("0"), m("-5"), m("1"), m("3"), m("2.9"), m("64"), m("65"), m("1e9"), m("abc")], [1, 1, 1, 1, 1, 3, 2, 64, 64, 64, 1]);
+});
+
+Deno.test("empty NETWORK= counts as mainnet for the ledger guard and on-chain mode", async () => {
+  const { onchainMode } = await import("../main.ts");
+  const e = (m: Record<string, string>) => (k: string) => m[k];
+  assert(LG.ledgerConfigError(e({ NETWORK: "" }))?.includes("mainnet"));
+  assert(LG.ledgerConfigError(e({ NETWORK: "", LEDGER_MEMORY_OK: "1" }))?.includes("mainnet"));
+  assertEquals(onchainMode(e({ NETWORK: "", ONCHAIN_CHECK: "log" })), "block");
+});
+
+Deno.test("reused authorization 402 carries the re-sign hint", async () => {
+  await resetGuards(); const t = rig({ v: { settled: true } }); const n = rnd();
+  const key = "auth:" + PAYER.toLowerCase() + ":" + n.toLowerCase(); LG.consume("auth", key);
+  const [c, b] = await t.call(pay("/base/network", {}, n));
+  assertEquals(c, 402); assert(String(b.hint).includes("sign a new authorization"));
+});
+
+Deno.test("ledger-merge: INSERT OR IGNORE from a backup only adds rows", async () => {
+  const { mergeLedger } = await import("../../deploy/vps/ledger-merge.ts");
+  const dir = await Deno.makeTempDir(); const live = dir + "/ledger.sqlite3"; const bak = dir + "/backup.sqlite3";
+  LG.openLedger(bak); LG.consume("auth", "a1"); LG.consume("tx", "t1"); LG.closeLedger();
+  LG.openLedger(live); LG.consume("auth", "a1", { live: true }); LG.consume("auth", "a2"); LG.closeLedger();
+  assertEquals(mergeLedger(live, bak), { added: 1, total: 3 });
+  assertEquals(mergeLedger(live, bak), { added: 0, total: 3 });
+  const db = LG.openLedger(live);
+  assertEquals((db.prepare("SELECT meta FROM consumed WHERE kind='auth' AND id='a1'").get() as any).meta, '{"live":true}'); // live row kept
+  LG.closeLedger(); await Deno.remove(dir, { recursive: true });
+});
+
+Deno.test("rollback integration on real files: KV restored via kv-merge, ledger untouched, reuse still rejected", async () => {
+  const { mergeProtected } = await import("../../deploy/vps/kv-merge.ts");
+  const dir = await Deno.makeTempDir(); const kvf = dir + "/kv.sqlite3"; const lgf = dir + "/ledger.sqlite3";
+  // state before the deploy
+  let k = await Deno.openKv(kvf); await k.set(["rec", "sales", "1"], { n: 1 }); await k.set(["snap", "d"], "old"); k.close();
+  LG.openLedger(lgf); LG.consume("auth", "auth:0xp:0xold"); LG.closeLedger();
+  await Deno.copyFile(kvf, dir + "/predeploy.sqlite3"); // service stopped: plain copy is consistent
+  // new release runs: a sale, a spent authorization, a migrated snapshot
+  k = await Deno.openKv(kvf);
+  await k.set(["rec", "sales", "2"], { n: 2 }); await k.set(["authused", "auth:0xp:0xnew"], 1); await k.set(["txused", "0xtnew"], 1);
+  await k.set(["snap", "d"], "migrated"); k.close();
+  LG.openLedger(lgf); LG.consume("auth", "auth:0xp:0xnew"); LG.consume("tx", "0xtnew"); LG.closeLedger();
+  // rollback with --restore-kv: copy -> merge from live -> replace the KV file (ledger file is not touched)
+  await Deno.copyFile(dir + "/predeploy.sqlite3", kvf + ".restore");
+  const counts = await mergeProtected(kvf, kvf + ".restore");
+  for (const f of ["-wal", "-shm"]) await Deno.remove(kvf + f).catch(() => {});
+  await Deno.rename(kvf + ".restore", kvf);
+  assertEquals(counts.rec, 1);
+  k = await Deno.openKv(kvf);
+  assertEquals((await k.get(["snap", "d"])).value, "old"); // recoverable data rolled back
+  assert((await k.get(["rec", "sales", "2"])).versionstamp !== null); // sale kept
+  k.close();
+  LG.openLedger(lgf);
+  assert(LG.isConsumed("auth", "auth:0xp:0xnew")); assert(LG.isConsumed("tx", "0xtnew")); // replay state intact
+  assert(!LG.consume("auth", "auth:0xp:0xnew")); // reuse rejected
+  LG.closeLedger(); await Deno.remove(dir, { recursive: true });
+});
+
+Deno.test("full snapshot: complete only on a short page; page cap and time budget -> partial", async () => {
+  const S = await import("../lib/snapshot.ts"); let calls = 0;
+  const feed = (TOTAL: number, liar = false) => (async (u: string) => {
+    calls++; const off = Number(new URL(u).searchParams.get("offset")); const n = Math.max(0, Math.min(S.PAGE, TOTAL - off));
+    const items = Array.from({ length: n }, (_, i) => ({ resource: `https://h${(off + i) % 50}.example/r${off + i}`, accepts: [{ payTo: "0x" + "33".repeat(20) }], quality: {} }));
+    return new Response(JSON.stringify({ items, pagination: { total: liar ? 1000 : TOTAL } }));
+  }) as typeof fetch;
+  assertEquals(S.maxPages(() => undefined), 50);
+  const r: any = await S.runSnapshot(feed(4500), 50, "2031-01-01");
+  assertEquals([r.status, r.index.listings, calls, r.index.coverage.stopped], ["complete", 4500, 5, "short_page"]);
+  // exact multiple of the page size: the empty final page is what proves the end
+  calls = 0; const r2: any = await S.runSnapshot(feed(2000), 50, "2031-01-02");
+  assertEquals([r2.status, r2.index.listings, calls], ["complete", 2000, 3]);
+  // a total that claims "done" is not trusted while full pages keep coming
+  calls = 0; const r3: any = await S.runSnapshot(feed(3000, true), 2, "2031-01-03");
+  assertEquals([r3.status, r3.index.listings, r3.index.coverage.stopped], ["partial", 2000, "page_cap"]);
+  // page cap hit -> partial
+  calls = 0; const r4: any = await S.runSnapshot(feed(9000), 3, "2031-01-04");
+  assertEquals([r4.status, r4.index.listings, r4.index.coverage.stopped, calls], ["partial", 3000, "page_cap", 3]);
+  // time budget: fake clock advances 4 min per check, budget 10 min -> 3 pages then stop
+  let t = 0; calls = 0; const clock = () => (t += 4 * 60_000);
+  const r5: any = await S.runSnapshot(feed(9000), 50, "2031-01-05", S.TIME_BUDGET_MS, clock);
+  assertEquals([r5.status, r5.index.coverage.stopped, calls], ["partial", "time_budget", 2]);
+  const PF = await import("../lib/preflight.ts"); assertEquals(PF.IDX_CACHE_MAX, 3);
 });

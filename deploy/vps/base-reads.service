@@ -15,9 +15,9 @@ ExecStart=/usr/local/bin/deno run --unstable-kv --unstable-cron --cached-only \
   --allow-write=/var/lib/base-reads main.ts
 Restart=always
 RestartSec=3
-# Measured: idle ~50 MiB, snapshot peak ~150 MiB RSS. Host has 913 MB.
-MemoryHigh=350M
-MemoryMax=450M
+# Measured (full Bazaar, 26,127 listings): snapshot peak ~231 MiB RSS; ~10 MiB heap per cached full index (cache max 3). Host has 913 MB + 2 GB swap.
+MemoryHigh=500M
+MemoryMax=600M
 Environment=DENO_DIR=/opt/base-reads/deno-cache
 Environment=DENO_NO_UPDATE_CHECK=1
 StateDirectory=base-reads

@@ -1,7 +1,10 @@
 #!/usr/bin/env bash
 # One-time server setup for Ubuntu 24.04 (incl. Minimal image). Run as root on the server. Idempotent.
 set -euo pipefail
-API_DOMAIN="${API_DOMAIN:?set API_DOMAIN (hostname only, e.g. api.example.com)}"
+# API_DOMAIN: from the environment, else from /etc/base-reads/env (the only place real values live)
+[ -z "${API_DOMAIN:-}" ] && [ -f /etc/base-reads/env ] && API_DOMAIN=$(sed -n 's/^API_DOMAIN=//p' /etc/base-reads/env | tail -1)
+API_DOMAIN="${API_DOMAIN:?set API_DOMAIN (hostname only) in /etc/base-reads/env or the environment}"
+case "$API_DOMAIN" in *[!a-z0-9.-]*|"") echo "API_DOMAIN must be a plain hostname" >&2; exit 1;; esac
 DENO_VERSION="v2.9.7"
 # sha256 of deno-x86_64-unknown-linux-gnu.zip for DENO_VERSION (matches the release's .sha256sum file)
 DENO_SHA256="c6527f24f4b16031d3ae4fa9f658d5f11534c8d84ce7dc8502420280919c3490"

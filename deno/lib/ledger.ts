@@ -22,7 +22,7 @@ export function ledgerPath(env: (k: string) => string | undefined = (k) => Deno.
  * The ledger needs a local filesystem (node:sqlite); serverless hosts without one are not supported. */
 export function ledgerConfigError(env: (k: string) => string | undefined): string | null {
   if (ledgerPath(env) !== ":memory:") return null;
-  const net = env("NETWORK") ?? "eip155:8453";
+  const net = env("NETWORK") || "eip155:8453"; // empty NETWORK= is treated as mainnet
   if (net === "eip155:8453") return "payment ledger needs a file: set LEDGER_PATH or KV_PATH (in-memory is never allowed on Base mainnet)";
   if (env("LEDGER_MEMORY_OK") !== "1") return "payment ledger needs a file: set LEDGER_PATH or KV_PATH (or LEDGER_MEMORY_OK=1 on testnet)";
   return null;
