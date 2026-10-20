@@ -20,7 +20,7 @@ export type Deps = { env: (k: string) => string | undefined; rpc?: Rpc; fac?: (p
   resolver?: Resolver; fetcher?: Fetcher; background?: (p: Promise<unknown>) => void;
   check?: (tx: string, r: any, payer: string | undefined) => Promise<any>; ip?: string };
 const cfg = (env: Deps["env"]) => {
-  const NETWORK = env("NETWORK") ?? "eip155:8453";
+  const NETWORK = env("NETWORK") || "eip155:8453"; // empty NETWORK= means mainnet
   return { FAC: env("FACILITATOR") ?? "https://facilitator.payai.network", RPC: env("RPC") ?? "https://mainnet.base.org",
     PAY_TO: env("PAY_TO_ADDRESS") || PAY_TO_DEFAULT, PUBLIC: env("PUBLIC_URL") ?? "", NETWORK, USDC: USDCS[NETWORK] };
 };
@@ -241,10 +241,16 @@ async function handleGet(req: Request, d: Deps): Promise<Response> {
 const FAILS = new SG.FailLimiter();
 export async function resetGuards() { await FAILS.clear(); }
 export const MAINNET = "eip155:8453";
+/** MIN_CONFIRMATIONS clamped to 1..64 (non-numeric or empty -> 1). */
+export function minConfirmations(env: Deps["env"]): number {
+  const n = Math.floor(Number(env("MIN_CONFIRMATIONS") || 1)); return Number.isFinite(n) ? Math.min(64, Math.max(1, n)) : 1;
+}
+/** Sent with every "authorization already used" 402: a submitted authorization is spent even if settlement failed. */
+export const REUSE_HINT = "this authorization was already submitted for settlement and cannot be reused, even if that attempt failed; sign a new authorization with a new nonce";
 /** ONCHAIN_CHECK=log (serve on facilitator success) is refused on Base mainnet: block is forced there. */
 export function onchainMode(env: Deps["env"]): "block" | "log" {
   const m = env("ONCHAIN_CHECK") ?? "block";
-  return m === "log" && (env("NETWORK") ?? MAINNET) !== MAINNET ? "log" : "block";
+  return m === "log" && (env("NETWORK") || MAINNET) !== MAINNET ? "log" : "block";
 }
 /** Non-fatal configuration problems, logged once at startup. */
 export function startupWarnings(env: Deps["env"]): string[] {
@@ -257,7 +263,7 @@ export function startupWarnings(env: Deps["env"]): string[] {
   return w;
 }
 export function assertOnchainMode(env: Deps["env"]) {
-  if (env("ONCHAIN_CHECK") === "log" && (env("NETWORK") ?? MAINNET) === MAINNET) throw new Error("ONCHAIN_CHECK=log is not allowed on Base mainnet");
+  if (env("ONCHAIN_CHECK") === "log" && (env("NETWORK") || MAINNET) === MAINNET) throw new Error("ONCHAIN_CHECK=log is not allowed on Base mainnet");
 }
 /** Facilitator error codes we pass through to clients (x402 spec); anything else becomes "facilitator_error". */
 export const FAC_ERRORS = new Set(["insufficient_funds", "invalid_exact_evm_payload_authorization_valid_after",
@@ -283,7 +289,7 @@ async function paid(path: string, q: Record<string, string>, qs: string, sig: st
   const bad = SG.precheck(payload, r); // before the claim: malformed/foreign payloads never consume a nonce slot
   if (bad) return [402, { error: bad }, noPay(bad, N)];
   const who = SG.payerOf(payload)!; const nonce = SG.nonceOf(payload)!; const ids = { ip: d.ip ?? null, payer: who };
-  const minConf = Math.max(1, Number(env("MIN_CONFIRMATIONS") ?? 1) || 1);
+  const minConf = minConfirmations(env);
   const check = d.check ?? ((tx: string, rq: any, payer: string | undefined) => verifyOnchain(rpc, tx, rq.asset, rq.payTo, rq.amount, payer, N, 3, 1000, undefined, nonce, minConf));
   const bg = d.background ?? (() => {});
   const sale = (tx: string) => ({ success: true, transaction: tx, payer: who, network: N });
@@ -326,7 +332,7 @@ async function paid(path: string, q: Record<string, string>, qs: string, sig: st
   }
   // KV claim is only an in-flight lock; the append-only ledger is the source of truth for spent authorizations,
   // so a rolled-back or restored KV can never let a spent authorization through again.
-  if (await SG.authUsed(key)) return [402, { error: "payment authorization already used" }, noPay("replay", N)];
+  if (await SG.authUsed(key)) return [402, { error: "payment authorization already used", hint: REUSE_HINT }, noPay("replay", N)];
   const body = { x402Version: 2, paymentPayload: payload, paymentRequirements: r };
   const v = await fac("/verify", body); const tVer = iso();
   if (!v.isValid) { const why = facErr(v.invalidReason); await FAILS.fail({ ip: ids.ip }, "verify"); return [402, { error: why }, noPay(why, N)]; }
@@ -340,7 +346,7 @@ async function paid(path: string, q: Record<string, string>, qs: string, sig: st
   }
   if (code !== 200) return [code, out, {}]; // bad input: not settled, not charged
   // point of no return: record the authorization as consumed (fsync'ed) before asking for settlement
-  if (!await SG.consumeAuth(key, { path, payload_sha256: await SG.payloadHash(payload!) })) return [402, { error: "payment authorization already used" }, noPay("replay", N)];
+  if (!await SG.consumeAuth(key, { path, payload_sha256: await SG.payloadHash(payload!) })) return [402, { error: "payment authorization already used", hint: REUSE_HINT }, noPay("replay", N)];
   const st = await fac("/settle", body); const tSet = iso(); const times: [string, string, string] = [tReq, tVer, tSet];
   const tx: string | null = typeof st.transaction === "string" && SG.TX_RE.test(st.transaction) ? st.transaction.toLowerCase() : null;
   if (typeof st.payer === "string" && st.payer.toLowerCase() !== who) mismatch("facilitator_payer_differs_from_signed_from");
@@ -351,7 +357,7 @@ async function paid(path: string, q: Record<string, string>, qs: string, sig: st
       return [200, out, payResp(N, true, tx, who)];
     }
     const why = facErr(st.errorReason); await FAILS.fail(ids, "settle");
-    return [402, { error: why }, payResp(N, false, tx, who, why)];
+    return [402, { error: why, hint: REUSE_HINT }, payResp(N, false, tx, who, why)]; // the authorization is spent
   }
   if (!tx) { mismatch("settle_success_without_valid_tx_hash"); return [502, { error: "settlement response invalid, contact support with your payment" }, {}]; }
   if (!await SG.claimTx(tx)) { mismatch("settlement_tx_reused"); return [409, { error: "settlement transaction already used" }, noPay("replay", N)]; }
