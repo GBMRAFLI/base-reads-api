@@ -605,7 +605,7 @@ Deno.test("usage cut: snapshot capped at N pages, 1 retry, coverage recorded, on
   const idx = out.status === "failed" ? null : out.index;
   assertEquals([calls, idx!.listings, idx!.coverage?.complete, idx!.coverage?.status, idx!.coverage?.partial, out.status !== "failed" && out.meta.chunks >= 1], [3, 3000, false, "partial", true, true]);
   const warns: string[] = []; const w = (m: string) => warns.push(m);
-  assertEquals([S.maxPages(() => undefined), S.maxPages(() => "5"), S.maxPages(() => "0", w), S.maxPages(() => "99", w), S.maxPages(() => "999", w), S.maxPages(() => "x", w), S.PAGE_TIMEOUT_MS, S.RETRIES], [100, 5, 1, 99, 200, 100, 15000, 1]);
+  assertEquals([S.maxPages(() => undefined), S.maxPages(() => "5"), S.maxPages(() => "0", w), S.maxPages(() => "99", w), S.maxPages(() => "999", w), S.maxPages(() => "x", w), S.PAGE_TIMEOUT_MS, S.RETRIES], [50, 5, 1, 99, 200, 50, 15000, 1]);
   assert(warns.length >= 3);
   let n = 0; const bad = (async () => { n++; throw new Error("down"); }) as typeof fetch;
   const failOut = await S.runSnapshot(bad, 3, "2001-01-02");
@@ -1077,19 +1077,28 @@ Deno.test("rollback integration on real files: KV restored via kv-merge, ledger 
   LG.closeLedger(); await Deno.remove(dir, { recursive: true });
 });
 
-Deno.test("full snapshot: walks all pages until the listing total, status complete", async () => {
-  const S = await import("../lib/snapshot.ts"); const TOTAL = 4500; let calls = 0;
-  const f = (async (u: string) => {
+Deno.test("full snapshot: complete only on a short page; page cap and time budget -> partial", async () => {
+  const S = await import("../lib/snapshot.ts"); let calls = 0;
+  const feed = (TOTAL: number, liar = false) => (async (u: string) => {
     calls++; const off = Number(new URL(u).searchParams.get("offset")); const n = Math.max(0, Math.min(S.PAGE, TOTAL - off));
     const items = Array.from({ length: n }, (_, i) => ({ resource: `https://h${(off + i) % 50}.example/r${off + i}`, accepts: [{ payTo: "0x" + "33".repeat(20) }], quality: {} }));
-    return new Response(JSON.stringify({ items, pagination: { total: TOTAL } }));
+    return new Response(JSON.stringify({ items, pagination: { total: liar ? 1000 : TOTAL } }));
   }) as typeof fetch;
-  const r: any = await S.runSnapshot(f, S.maxPages(() => undefined), "2031-01-01");
-  assertEquals([r.status, r.index.listings, r.index.coverage.pages_fetched, r.index.coverage.max_pages, calls], ["complete", 4500, 5, 100, 5]);
-  // exact multiple of the page size: ends on the total, no extra empty page
-  calls = 0; const g = (async (u: string) => { calls++; const off = Number(new URL(u).searchParams.get("offset"));
-    const n = off < 2000 ? S.PAGE : 0; return new Response(JSON.stringify({ items: Array.from({ length: n }, (_, i) => ({ resource: `https://e.example/${off + i}`, accepts: [], quality: {} })), pagination: { total: 2000 } })); }) as typeof fetch;
-  const r2: any = await S.runSnapshot(g, 100, "2031-01-02");
-  assertEquals([r2.status, r2.index.listings, calls], ["complete", 2000, 2]);
+  assertEquals(S.maxPages(() => undefined), 50);
+  const r: any = await S.runSnapshot(feed(4500), 50, "2031-01-01");
+  assertEquals([r.status, r.index.listings, calls, r.index.coverage.stopped], ["complete", 4500, 5, "short_page"]);
+  // exact multiple of the page size: the empty final page is what proves the end
+  calls = 0; const r2: any = await S.runSnapshot(feed(2000), 50, "2031-01-02");
+  assertEquals([r2.status, r2.index.listings, calls], ["complete", 2000, 3]);
+  // a total that claims "done" is not trusted while full pages keep coming
+  calls = 0; const r3: any = await S.runSnapshot(feed(3000, true), 2, "2031-01-03");
+  assertEquals([r3.status, r3.index.listings, r3.index.coverage.stopped], ["partial", 2000, "page_cap"]);
+  // page cap hit -> partial
+  calls = 0; const r4: any = await S.runSnapshot(feed(9000), 3, "2031-01-04");
+  assertEquals([r4.status, r4.index.listings, r4.index.coverage.stopped, calls], ["partial", 3000, "page_cap", 3]);
+  // time budget: fake clock advances 4 min per check, budget 10 min -> 3 pages then stop
+  let t = 0; calls = 0; const clock = () => (t += 4 * 60_000);
+  const r5: any = await S.runSnapshot(feed(9000), 50, "2031-01-05", S.TIME_BUDGET_MS, clock);
+  assertEquals([r5.status, r5.index.coverage.stopped, calls], ["partial", "time_budget", 2]);
   const PF = await import("../lib/preflight.ts"); assertEquals(PF.IDX_CACHE_MAX, 3);
 });

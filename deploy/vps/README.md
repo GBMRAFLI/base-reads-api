@@ -52,9 +52,22 @@
 
 ## Snapshot size and memory (measured 2026-10-20, real Bazaar data)
 
-- Full crawl: 26,127 listings in 27 pages, 11.4 s, status `complete`; peak RSS ~231 MiB (systemd MemoryHigh 500M, MemoryMax 600M).
-- Stored: 860,713 bytes gzip in 15 chunks of at most 60,000 bytes (below the 64 KiB Deno KV value limit; each chunk is its own
-  write and the switch to the new generation is one small atomic commit). Reduced day: 81,343 bytes; aggregate day: 218 bytes.
+- Full crawl: 26,130 listings in 27 pages, ~11 s, status `complete`.
+- Peak RSS by pages fetched (separate runs): 5 pages 150 MiB, 10 pages 198 MiB, 20 pages 217 MiB, 27 pages 225 MiB
+  (process start ~43 MiB). Slope above 10 pages is ~1.6 MiB/page, so the 50-page default projects to roughly 260-300 MiB,
+  well below systemd MemoryHigh 500M / MemoryMax 600M. Re-measure if Bazaar approaches 50k listings.
+- Bounds: `SNAPSHOT_MAX_PAGES` (default 50, hard cap 200) and a 10 minute total time budget. Hitting either ends the run as
+  `partial` (`coverage.stopped` = `page_cap` or `time_budget`). `complete` requires a short final page; the reported
+  total alone is not trusted.
+- Stored: 860,713 bytes gzip in 15 chunks of at most 60,000 bytes (below the 64 KiB Deno KV value limit; each chunk is its
+  own write and the switch to the new generation is one small atomic commit). Reduced day: 81,343 bytes; aggregate: 218 bytes.
 - Retention estimate: 31 full days + 334 reduced days = ~51 MiB per year of KV data.
 - A loaded full index takes ~10 MiB of heap; the in-process cache keeps at most 3.
-- `SNAPSHOT_MAX_PAGES` (default 100, hard cap 200) bounds the crawl; it ends when the listing total is reached.
+
+## Backup disk use
+
+- A KV backup is roughly the KV file size: snapshot chunks are already gzip, so gzip saves little
+  (measured: 925,696-byte KV file -> 865,250 bytes gzip).
+- At the steady state above (~51 MiB KV) each daily copy is ~50 MiB; 14 daily + 8 weekly = 22 copies, about 1.1 GiB.
+  Ledger copies are a few KB. `--restore-kv` deploys add one uncompressed KV copy each (newest 5 kept).
+- The server has ~50 GB free, so this is under 3% of disk; lower the retention in `kv-backup.sh` if disk is tighter.
