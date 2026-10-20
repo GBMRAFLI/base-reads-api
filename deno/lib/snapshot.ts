@@ -1,5 +1,6 @@
 // Daily Bazaar snapshot (Deno.cron 00:15 UTC only; never at startup). Bounded to keep hosting usage small:
-// at most SNAPSHOT_MAX_PAGES pages (default 3, 1000 items each), 15 s per page, 1 retry, and at most one attempt
+// at most SNAPSHOT_MAX_PAGES pages (default 100, hard cap 200; 1000 items each), ending at the end of the listing,
+// 15 s per page, 1 retry, and at most one attempt
 // (success or failure) per UTC calendar day. Status is complete | partial | failed; failed stores an error record
 // (never an empty snapshot). Tiered retention demotes old indexes (never the newest; no day deletion).
 import {
@@ -10,6 +11,8 @@ import { kv } from "./store.ts";
 
 const BAZAAR = Deno.env.get("BAZAAR_URL") ?? "https://api.cdp.coinbase.com/platform/v2/x402/discovery/resources";
 export const PAGE = 1000, PAGE_TIMEOUT_MS = 15000, RETRIES = 1;
+/** Default and hard cap for SNAPSHOT_MAX_PAGES (1000 items per page). */
+export const DEFAULT_MAX_PAGES = 100, HARD_MAX_PAGES = 200;
 export const SNAPATTEMPT_TTL_MS = 3 * 24 * 3600_000;
 /** 0–30 full; 31–364 reduced (counts only); 365+ aggregate. Newest day is never demoted. */
 export const TIER_FULL_DAYS = 30, TIER_AGGREGATE_FROM = 365;
@@ -31,10 +34,10 @@ export function mapErrorCode(err: string): string {
 
 export function maxPages(env: (k: string) => string | undefined = (k) => Deno.env.get(k), warn: (m: string) => void = console.warn) {
   const raw = env("SNAPSHOT_MAX_PAGES");
-  if (raw === undefined || raw === "") return 3;
+  if (raw === undefined || raw === "") return DEFAULT_MAX_PAGES;
   const n = Number(raw);
-  if (!Number.isInteger(n)) { warn(`SNAPSHOT_MAX_PAGES=${JSON.stringify(raw)} invalid; using 3`); return 3; }
-  if (n < 1 || n > 50) { const c = Math.min(50, Math.max(1, n)); warn(`SNAPSHOT_MAX_PAGES=${n} out of range; clamped to ${c}`); return c; }
+  if (!Number.isInteger(n)) { warn(`SNAPSHOT_MAX_PAGES=${JSON.stringify(raw)} invalid; using ${DEFAULT_MAX_PAGES}`); return DEFAULT_MAX_PAGES; }
+  if (n < 1 || n > HARD_MAX_PAGES) { const c = Math.min(HARD_MAX_PAGES, Math.max(1, n)); warn(`SNAPSHOT_MAX_PAGES=${n} out of range; clamped to ${c}`); return c; }
   return n;
 }
 
@@ -68,6 +71,7 @@ export async function runSnapshot(f: typeof fetch = fetch, pages = maxPages(), d
     if (typeof d.pagination?.total === "number") total = d.pagination.total;
     if (items.length < PAGE) { reachedEnd = true; break; }
     off += items.length;
+    if (total !== null && off >= total) { reachedEnd = true; break; } // listing exhausted
   }
   if (fetched === 0) {
     return { status: "failed", fail: { status: "failed", date, error: "bazaar fetch failed", error_code: "bazaar_fetch_failed", at: new Date().toISOString(), failed_pages: failedPages } };
@@ -102,7 +106,7 @@ function targetTier(age: number): SnapTier {
   return "full";
 }
 
-function toReduced(idx: Index): Index {
+export function toReduced(idx: Index): Index {
   const walletCounts: Record<string, number> = {};
   for (const [w, v] of Object.entries(idx.wallet_hosts ?? {})) {
     walletCounts[w] = typeof v === "number" ? v : v.length;
@@ -113,7 +117,7 @@ function toReduced(idx: Index): Index {
   };
 }
 
-function toAggregate(idx: Index): Index {
+export function toAggregate(idx: Index): Index {
   const hostN = Object.keys(idx.hosts ?? {}).length || (idx.aggregate?.hosts ?? 0);
   let walletN = idx.aggregate?.payout_wallets ?? 0;
   if (!walletN) walletN = Object.keys(idx.wallet_hosts ?? {}).length;

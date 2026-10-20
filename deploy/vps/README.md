@@ -49,3 +49,12 @@
   changes existing ones; gunzip the backup first).
 - **Finality.** `MIN_CONFIRMATIONS` (1..64, clamped; default 1 = receipt is enough). Consider 2-3 for higher-priced routes.
 - `NETWORK=` empty is treated as Base mainnet, so the in-memory ledger is refused.
+
+## Snapshot size and memory (measured 2026-10-20, real Bazaar data)
+
+- Full crawl: 26,127 listings in 27 pages, 11.4 s, status `complete`; peak RSS ~231 MiB (systemd MemoryHigh 500M, MemoryMax 600M).
+- Stored: 860,713 bytes gzip in 15 chunks of at most 60,000 bytes (below the 64 KiB Deno KV value limit; each chunk is its own
+  write and the switch to the new generation is one small atomic commit). Reduced day: 81,343 bytes; aggregate day: 218 bytes.
+- Retention estimate: 31 full days + 334 reduced days = ~51 MiB per year of KV data.
+- A loaded full index takes ~10 MiB of heap; the in-process cache keeps at most 3.
+- `SNAPSHOT_MAX_PAGES` (default 100, hard cap 200) bounds the crawl; it ends when the listing total is reached.

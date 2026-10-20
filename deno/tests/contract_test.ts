@@ -595,7 +595,7 @@ async function wipeSnaps(k: Deno.Kv) {
 
 Deno.test("usage cut: snapshot capped at N pages, 1 retry, coverage recorded, one attempt per UTC day, listed:null when incomplete", async () => {
   const S = await import("../lib/snapshot.ts"); const { kv } = await import("../lib/store.ts"); const k = await kv();
-  await wipeSnaps(k);
+  await wipeSnaps(k); Deno.env.set("SNAPSHOT_MAX_PAGES", "3"); // this test exercises a capped (partial) run
   const mk = (i: number) => ({ resource: `https://h${i % 7}.example/r${i}`, accepts: [{ payTo: "0x" + (i % 3).toString(16).padStart(40, "0") }], quality: {} });
   let calls = 0;
   const f = (async (u: string) => { calls++; const off = Number(new URL(u).searchParams.get("offset"));
@@ -605,7 +605,7 @@ Deno.test("usage cut: snapshot capped at N pages, 1 retry, coverage recorded, on
   const idx = out.status === "failed" ? null : out.index;
   assertEquals([calls, idx!.listings, idx!.coverage?.complete, idx!.coverage?.status, idx!.coverage?.partial, out.status !== "failed" && out.meta.chunks >= 1], [3, 3000, false, "partial", true, true]);
   const warns: string[] = []; const w = (m: string) => warns.push(m);
-  assertEquals([S.maxPages(() => undefined), S.maxPages(() => "5"), S.maxPages(() => "0", w), S.maxPages(() => "99", w), S.maxPages(() => "x", w), S.PAGE_TIMEOUT_MS, S.RETRIES], [3, 5, 1, 50, 3, 15000, 1]);
+  assertEquals([S.maxPages(() => undefined), S.maxPages(() => "5"), S.maxPages(() => "0", w), S.maxPages(() => "99", w), S.maxPages(() => "999", w), S.maxPages(() => "x", w), S.PAGE_TIMEOUT_MS, S.RETRIES], [100, 5, 1, 99, 200, 100, 15000, 1]);
   assert(warns.length >= 3);
   let n = 0; const bad = (async () => { n++; throw new Error("down"); }) as typeof fetch;
   const failOut = await S.runSnapshot(bad, 3, "2001-01-02");
@@ -634,6 +634,7 @@ Deno.test("usage cut: snapshot capped at N pages, 1 retry, coverage recorded, on
   const hit = await bazaarFacts("https://h1.example/r1", [], 14, "2001-01-04");
   assertEquals([(hit as any).listed, (hit as any).host_listing_count_is_min], [true, true]);
   await wipeSnaps(k);
+  Deno.env.delete("SNAPSHOT_MAX_PAGES");
 });
 
 Deno.test("snapshot follow-ups: freshness, tiers 30/365, legacy, orphan purge, crash after flip, real size", async () => {
@@ -1074,4 +1075,21 @@ Deno.test("rollback integration on real files: KV restored via kv-merge, ledger 
   assert(LG.isConsumed("auth", "auth:0xp:0xnew")); assert(LG.isConsumed("tx", "0xtnew")); // replay state intact
   assert(!LG.consume("auth", "auth:0xp:0xnew")); // reuse rejected
   LG.closeLedger(); await Deno.remove(dir, { recursive: true });
+});
+
+Deno.test("full snapshot: walks all pages until the listing total, status complete", async () => {
+  const S = await import("../lib/snapshot.ts"); const TOTAL = 4500; let calls = 0;
+  const f = (async (u: string) => {
+    calls++; const off = Number(new URL(u).searchParams.get("offset")); const n = Math.max(0, Math.min(S.PAGE, TOTAL - off));
+    const items = Array.from({ length: n }, (_, i) => ({ resource: `https://h${(off + i) % 50}.example/r${off + i}`, accepts: [{ payTo: "0x" + "33".repeat(20) }], quality: {} }));
+    return new Response(JSON.stringify({ items, pagination: { total: TOTAL } }));
+  }) as typeof fetch;
+  const r: any = await S.runSnapshot(f, S.maxPages(() => undefined), "2031-01-01");
+  assertEquals([r.status, r.index.listings, r.index.coverage.pages_fetched, r.index.coverage.max_pages, calls], ["complete", 4500, 5, 100, 5]);
+  // exact multiple of the page size: ends on the total, no extra empty page
+  calls = 0; const g = (async (u: string) => { calls++; const off = Number(new URL(u).searchParams.get("offset"));
+    const n = off < 2000 ? S.PAGE : 0; return new Response(JSON.stringify({ items: Array.from({ length: n }, (_, i) => ({ resource: `https://e.example/${off + i}`, accepts: [], quality: {} })), pagination: { total: 2000 } })); }) as typeof fetch;
+  const r2: any = await S.runSnapshot(g, 100, "2031-01-02");
+  assertEquals([r2.status, r2.index.listings, calls], ["complete", 2000, 2]);
+  const PF = await import("../lib/preflight.ts"); assertEquals(PF.IDX_CACHE_MAX, 3);
 });
