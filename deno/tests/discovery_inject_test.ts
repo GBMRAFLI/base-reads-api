@@ -83,8 +83,8 @@ Deno.test("bazaar log line carries only status and a truncated, scrubbed reason"
   assert(l.startsWith("bazaar extension verify /base/network: rejected reason=bad sig 0x…"), l);
   assert(!l.includes("abab") && !l.includes("nonce") && !l.includes("\n") && l.length < 280, l);
 });
-Deno.test("L2 mainnet (incl. empty NETWORK=) never derives resource.url from Host; startup check refuses without PUBLIC_URL", async () => {
-  const { publicUrlError } = await import("../main.ts");
+Deno.test("mainnet (incl. empty NETWORK=) without PUBLIC_URL: paid routes 503, free routes up, no Host fallback, one startup warning", async () => {
+  const { publicUrlError, startupWarnings } = await import("../main.ts");
   for (const net of [undefined, "", "eip155:8453"]) {
     const e = (k: string) => k === "PUBLIC_URL" ? undefined : k === "NETWORK" ? net : env(k);
     assert(publicUrlError(e)); let threw = false;
@@ -92,7 +92,10 @@ Deno.test("L2 mainnet (incl. empty NETWORK=) never derives resource.url from Hos
     assert(threw, "required() must not fall back to Host on mainnet");
     const r = await handler(new Request("https://evil.example/base/network"), { env: e });
     assertEquals(r.status, 503); assert(!(await r.text()).includes("evil.example"));
+    for (const free of ["/", "/llms.txt", "/openapi.json"]) { const f = await handler(new Request("https://evil.example" + free), { env: e }); await f.body?.cancel(); assertEquals(f.status, 200, free); }
+    const w = startupWarnings(e).filter((x) => x.includes("PUBLIC_URL")); assertEquals(w.length, 1); assert(!w[0].includes("evil"));
   }
+  assertEquals(startupWarnings(env).filter((x) => x.includes("PUBLIC_URL")).length, 0);
   assertEquals(publicUrlError(env), null);
   assertEquals(required("/base/network", "evil.example", env).resource.url, "https://api.example/base/network");
   const t = (k: string) => k === "PUBLIC_URL" ? undefined : k === "NETWORK" ? "eip155:84532" : env(k);

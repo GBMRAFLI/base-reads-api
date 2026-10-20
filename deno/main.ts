@@ -156,7 +156,8 @@ export async function snapshotSummary(limit = 30) {
   }
   return { source: "x402 Bazaar discovery API, crawled daily at 00:15 UTC", snapshots: out };
 }
-/** On Base mainnet (including empty NETWORK=) the public origin must be configured: resource URLs never come from the Host header. */
+/** On Base mainnet (including empty NETWORK=) paid routes need PUBLIC_URL: resource URLs never come from the Host header.
+ * Missing PUBLIC_URL is a startup warning, not a refusal, so free routes stay up on any host; paid routes answer 503. */
 export function publicUrlError(env: Deps["env"]): string | null {
   return cfg(env).NETWORK === MAINNET && !cfg(env).PUBLIC ? "PUBLIC_URL is required on Base mainnet (resource URLs are never derived from the Host header)" : null;
 }
@@ -296,6 +297,7 @@ export function onchainMode(env: Deps["env"]): "block" | "log" {
 /** Non-fatal configuration problems, logged once at startup. */
 export function startupWarnings(env: Deps["env"]): string[] {
   const w: string[] = []; const ca = env("SIGNING_KEY_CREATED_AT");
+  if (publicUrlError(env)) w.push("PUBLIC_URL is not set on Base mainnet: paid routes answer 503 until it is set (free routes stay up)");
   if (ca && !isoOrNull(ca)) w.push("SIGNING_KEY_CREATED_AT is not strict ISO-8601 UTC (YYYY-MM-DDTHH:MM:SSZ); published as null");
   try { const h = JSON.parse(env("SIGNING_KEY_HISTORY") || "[]");
     if (!Array.isArray(h)) w.push("SIGNING_KEY_HISTORY is not a JSON list; ignored");
@@ -448,7 +450,6 @@ if (import.meta.main) {
   const mig = await LG.migrateFromKv(await kv()); // one-time import of replay keys kept in KV by older releases
   if (mig.auth || mig.tx) console.log("ledger: imported", JSON.stringify(mig));
   assertOnchainMode(env); // refuse to start with ONCHAIN_CHECK=log on Base mainnet
-  const perr = publicUrlError(env); if (perr) throw new Error(perr); // refuse to start without PUBLIC_URL on mainnet
   Deno.serve({ hostname: bindHost(env), port: Number(env("PORT") ?? 8000) },
     (req, info) => handler(req, { env, ip: clientIp(req, (info.remoteAddr as Deno.NetAddr).hostname, env) }));
 }

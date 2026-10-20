@@ -465,7 +465,7 @@ Deno.test("used settlement tx hashes are stored durably in KV (atomic, no expiry
 });
 Deno.test("A10 startup warnings for invalid CREATED_AT / HISTORY dates", async () => {
   const { startupWarnings } = await import("../main.ts");
-  const w = (o: Record<string, string>) => startupWarnings((k) => o[k]);
+  const w = (o: Record<string, string>) => startupWarnings((k) => ({ PUBLIC_URL: "https://h.example", ...o })[k]);
   assertEquals(w({ SIGNING_KEY_CREATED_AT: "2026-10-14T12:00:21Z" }), []); assertEquals(w({}), []);
   assertEquals(w({ SIGNING_KEY_CREATED_AT: "2026-10-14" }).length, 1);
   assertEquals(w({ SIGNING_KEY_HISTORY: JSON.stringify([{ created_at: "yesterday", retired_at: "2026-10-01T00:00:00Z" }]) }), ["SIGNING_KEY_HISTORY[0].created_at is not strict ISO-8601 UTC; published as null"]);

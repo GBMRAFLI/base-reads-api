@@ -89,7 +89,7 @@ Transfer logs into the payee on Base, matched to the settlement tx hashes from P
 
 ## Hosting on Hugging Face Spaces (Docker)
 `Dockerfile` listens on port 7860; storage is ephemeral (`/tmp`). Set Space secrets `SIGNING_KEY_PASSPHRASE`,
-`SIGNING_KEY_ENC_B64`, `EXPORT_TOKEN` (and optionally the variable `PUBLIC_URL=https://<owner>-<space>.hf.space`).
+`SIGNING_KEY_ENC_B64`, `EXPORT_TOKEN` and the variable `PUBLIC_URL=https://<owner>-<space>.hf.space` (set it on Base mainnet; the Deno server below requires it there: without it paid routes return 503, free routes stay up).
 ## Deno Deploy port (`deno/`)
 TypeScript port with the same routes, 402 challenges (byte-identical body and `PAYMENT-REQUIRED` header), Ed25519 signed
 facts (same encrypted key and pubkey, byte-identical signatures), `/internal/export` with the same bearer auth, and the same
