@@ -156,9 +156,18 @@ export async function snapshotSummary(limit = 30) {
   }
   return { source: "x402 Bazaar discovery API, crawled daily at 00:15 UTC", snapshots: out };
 }
+/** On Base mainnet (including empty NETWORK=) the public origin must be configured: resource URLs never come from the Host header. */
+export function publicUrlError(env: Deps["env"]): string | null {
+  return cfg(env).NETWORK === MAINNET && !cfg(env).PUBLIC ? "PUBLIC_URL is required on Base mainnet (resource URLs are never derived from the Host header)" : null;
+}
+export function resourceOrigin(host: string, env: Deps["env"]): string {
+  const c = cfg(env); if (c.PUBLIC) return c.PUBLIC;
+  const e = publicUrlError(env); if (e) throw new Error(e);
+  return "https://" + safeHost(host); // testnet / local only
+}
 export function required(path: string, host: string, env: Deps["env"]) {
-  const [, desc] = ROUTES[path]; const c = cfg(env);
-  return { x402Version: 2, error: "PAYMENT-SIGNATURE header is required", resource: { url: (c.PUBLIC || ("https://" + safeHost(host))) + path, description: desc, mimeType: "application/json" },
+  const [, desc] = ROUTES[path];
+  return { x402Version: 2, error: "PAYMENT-SIGNATURE header is required", resource: { url: resourceOrigin(host, env) + path, description: desc, mimeType: "application/json" },
     accepts: [reqFor(path, env)], extensions: { bazaar: bazaar(path) } };
 }
 export function facClient(base: string, env: Deps["env"], f: typeof fetch = fetch) {
@@ -180,11 +189,12 @@ export function extensionStatus(h: string | null): Record<string, any> | null {
 /** One log line with the bazaar extension outcome only (status and short reason); never logs payloads or keys. */
 export function logBazaar(stage: string, path: string, res: any) {
   const b = res?.extensionResponses?.bazaar; if (!b || typeof b !== "object") return;
-  const status = typeof b.status === "string" ? b.status.slice(0, 32) : "unknown";
+  const status = typeof b.status === "string" ? b.status.replace(/[^\x20-\x7e]/g, " ").slice(0, 32) : "unknown";
   const why = typeof b.rejectedReason === "string" ? " reason=" + b.rejectedReason.replace(/[^\x20-\x7e]/g, " ").replace(/0x[0-9a-fA-F]{16,}/g, "0x…").slice(0, 200) : "";
   console.log(`bazaar extension ${stage} ${path}: ${status}${why}`);
 }
-/** Max serialized size of client-sent paymentPayload.extensions; larger payloads are refused before any claim. */
+/** Max size of client-sent paymentPayload.extensions, measured on the re-serialized JSON (JSON.stringify of the parsed value,
+ * UTF-8 bytes), not on the raw header; the whole header is already capped at MAX_HEADER (16 KB). Larger values are refused before any claim. */
 export const MAX_EXTENSIONS_BYTES = 8192;
 export function extensionsTooLarge(payload: Record<string, any>): boolean {
   if (payload.extensions === undefined) return false;
@@ -263,6 +273,7 @@ async function handleGet(req: Request, d: Deps): Promise<Response> {
   if (path === "/x402/preflight" && !ADDR.test(c.PAY_TO)) return send(503, { error: "payee not configured" });
   const tReq = iso();
   const sig = req.headers.get("PAYMENT-SIGNATURE") ?? req.headers.get("X-PAYMENT");
+  if (publicUrlError(env)) return send(503, { error: "public origin not configured" }); // mainnet without PUBLIC_URL: never use Host
   if (!sig) { const pr = required(path, req.headers.get("Host") ?? "", env); return send(402, pr, { "PAYMENT-REQUIRED": b64(pr) }); }
   const [code, out, hd] = await paid(path, q, qs, sig, tReq, d, c, rpc, fac, req.headers.get("Host") ?? "");
   return send(code, out, hd);
@@ -437,6 +448,7 @@ if (import.meta.main) {
   const mig = await LG.migrateFromKv(await kv()); // one-time import of replay keys kept in KV by older releases
   if (mig.auth || mig.tx) console.log("ledger: imported", JSON.stringify(mig));
   assertOnchainMode(env); // refuse to start with ONCHAIN_CHECK=log on Base mainnet
+  const perr = publicUrlError(env); if (perr) throw new Error(perr); // refuse to start without PUBLIC_URL on mainnet
   Deno.serve({ hostname: bindHost(env), port: Number(env("PORT") ?? 8000) },
     (req, info) => handler(req, { env, ip: clientIp(req, (info.remoteAddr as Deno.NetAddr).hostname, env) }));
 }

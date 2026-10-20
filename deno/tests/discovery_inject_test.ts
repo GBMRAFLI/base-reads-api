@@ -83,3 +83,25 @@ Deno.test("bazaar log line carries only status and a truncated, scrubbed reason"
   assert(l.startsWith("bazaar extension verify /base/network: rejected reason=bad sig 0x…"), l);
   assert(!l.includes("abab") && !l.includes("nonce") && !l.includes("\n") && l.length < 280, l);
 });
+Deno.test("L2 mainnet (incl. empty NETWORK=) never derives resource.url from Host; startup check refuses without PUBLIC_URL", async () => {
+  const { publicUrlError } = await import("../main.ts");
+  for (const net of [undefined, "", "eip155:8453"]) {
+    const e = (k: string) => k === "PUBLIC_URL" ? undefined : k === "NETWORK" ? net : env(k);
+    assert(publicUrlError(e)); let threw = false;
+    try { required("/base/network", "evil.example", e); } catch { threw = true; }
+    assert(threw, "required() must not fall back to Host on mainnet");
+    const r = await handler(new Request("https://evil.example/base/network"), { env: e });
+    assertEquals(r.status, 503); assert(!(await r.text()).includes("evil.example"));
+  }
+  assertEquals(publicUrlError(env), null);
+  assertEquals(required("/base/network", "evil.example", env).resource.url, "https://api.example/base/network");
+  const t = (k: string) => k === "PUBLIC_URL" ? undefined : k === "NETWORK" ? "eip155:84532" : env(k);
+  assertEquals(publicUrlError(t), null);
+});
+Deno.test("L1 bazaar status is scrubbed to printable ASCII and truncated", () => {
+  const lines: string[] = []; const orig = console.log; console.log = (m: string) => lines.push(m);
+  try { const res: any = {}; Object.defineProperty(res, "extensionResponses", { value: { bazaar: { status: "ok\n\u001b[31mFAKE LINE " + "z".repeat(100) } } }); logBazaar("settle", "/base/network", res); }
+  finally { console.log = orig; }
+  assertEquals(lines.length, 1); const l = lines[0];
+  assert(!/[^\x20-\x7e]/.test(l), l); assert(l.length <= "bazaar extension settle /base/network: ".length + 32, l);
+});
