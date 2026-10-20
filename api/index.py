@@ -1,6 +1,6 @@
 """Base Reads: receive-only x402 v2 seller on Base mainnet. Never signs or sends funds.
 Zero-LLM: every route is 100% deterministic code (JSON-RPC reads only)."""
-import json, os, re, base64, time, urllib.request, urllib.parse, sys
+import calendar, json, os, re, base64, time, urllib.request, urllib.parse, sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import preflight as PF
 import sales_log as MS, cdp_auth, settle_guard as SG
@@ -22,8 +22,8 @@ ROUTES = {
  "/base/usdc-balance": (1000, "Live Base mainnet USDC and ETH balance for one address, read with eth_call at the latest block; returns decimal and raw values plus the block number. Use it to check a wallet can cover a payment or that funds arrived before acting. Simpler than running an RPC client and decoding ERC-20 calls yourself, and the block number makes each reading reproducible. Query: ?address=0x...", {"address": "0x4200000000000000000000000000000000000016"}),
  "/base/tx-status": (2000, "Base mainnet transaction status: success, failed or pending, with block, confirmations, gas used, effective gas price, from/to and log count. Use it after sending or receiving a payment to confirm it landed and how deep it is. One normalized JSON answer instead of combining receipt and block calls and computing confirmations yourself. Query: ?hash=0x...", {"hash": "0x" + "0"*64}),
  "/base/basename": (3000, "Resolve a Basename (name.base.eth) to its Base address, or an address to its primary Basename, checked both ways so a reverse name is only returned when it resolves back. Use it to turn a human name into a payout address or to label an address. Avoids hand-written ENS-style namehash and resolver calls. Query: ?name=jesse.base.eth or ?address=0x...", {"name": "jesse.base.eth"}),
- "/base/address-intel": (5000, "One call for an address on Base: USDC balance, ETH balance, verified primary Basename, transaction count (nonce) and whether it is a contract. Use it to profile a counterparty or payout wallet before interacting. Replaces four or five separate reads with a single priced request. Query: ?address=0x...", {"address": "0x2211d1d0020daea8039e46cf1367962070d77da9"}),
- "/x402/preflight": (1000, "Pre-pay Check: Ed25519-signed, deterministic facts about another x402 endpoint before you pay it: challenge validity, reachability and latency, host listing count, payout wallet reuse across hosts, last-called and payer trend from daily Bazaar snapshots. Use it when choosing between paid endpoints. Signed facts you can verify against the published key, not ratings; facts only, no advice. Query: ?url=https://...", {"url": "https://x402.org/protected"}),
+ "/base/address-intel": (10000, "One call for an address on Base: USDC balance, ETH balance, verified primary Basename, transaction count (nonce) and whether it is a contract. Use it to profile a counterparty or payout wallet before interacting. Replaces four or five separate reads with a single priced request. Query: ?address=0x...", {"address": "0x2211d1d0020daea8039e46cf1367962070d77da9"}),
+ "/x402/preflight": (10000, "Pre-pay Check: Ed25519-signed, deterministic facts about another x402 endpoint before you pay it: challenge validity, reachability and latency, host listing count, payout wallet reuse across hosts, last-called and payer trend from daily Bazaar snapshots. Use it when choosing between paid endpoints. Signed facts you can verify against the published key, not ratings; facts only, no advice. Query: ?url=https://...", {"url": "https://x402.org/protected"}),
  "/base/network": (1000, "Base mainnet head: latest block number, block age in seconds, base fee and gas price in gwei. Use it to check the chain is advancing and to estimate fees before sending a transaction. One small JSON read instead of several raw RPC calls and unit conversions.", {}),
 }
 def rpc(m, p):
@@ -63,7 +63,7 @@ def handle(path, q):
         a = q.get("address", "")
         if not ADDR.match(a): return 400, {"error": "address must be 0x + 40 hex"}
         raw = int(call(USDC, "0x70a08231" + a[2:].lower().rjust(64, "0")), 16); eth = int(rpc("eth_getBalance", [a, "latest"]), 16)
-        return 200, {"chain": "base", "address": a, "usdc": raw / 1e6, "usdc_raw": str(raw), "eth": eth / 1e18, "eth_wei": str(eth), "block": int(rpc("eth_blockNumber", []), 16)}
+        return 200, {"chain": "base", "address": a, "usdc": raw / 1e6, "usdc_raw": str(raw), "eth": eth / 1e18, "eth_wei": str(eth), "block": int(rpc("eth_blockNumber", []), 16), "related_routes": related(path)}
     if path == "/base/tx-status":
         h = q.get("hash", "")
         if not HASH.match(h): return 400, {"error": "hash must be 0x + 64 hex"}
@@ -91,7 +91,11 @@ def handle(path, q):
         return 200, {"address": a, "primary_basename": nm}
     if path == "/base/network":
         b = rpc("eth_getBlockByNumber", ["latest", False])
-        return 200, {"chain": "base", "chain_id": 8453, "block": int(b["number"], 16), "block_age_s": max(0, int(time.time()) - int(b["timestamp"], 16)), "base_fee_gwei": int(b.get("baseFeePerGas", "0x0"), 16) / 1e9, "gas_price_gwei": int(rpc("eth_gasPrice", []), 16) / 1e9}
+        return 200, {"chain": "base", "chain_id": 8453, "block": int(b["number"], 16), "block_age_s": max(0, int(time.time()) - int(b["timestamp"], 16)), "base_fee_gwei": int(b.get("baseFeePerGas", "0x0"), 16) / 1e9, "gas_price_gwei": int(rpc("eth_gasPrice", []), 16) / 1e9, "related_routes": related(path)}
+RELATED = {"/base/network": ["/base/tx-status", "/x402/preflight"], "/base/usdc-balance": ["/base/address-intel", "/x402/preflight"]}
+def related(path):
+    """Neutral follow-up list (path and price only) for a response."""
+    return [{"path": p, "price_usdc": f"{ROUTES[p][0] / 1e6:.3f}"} for p in RELATED[path]]
 def req_for(path):
     return {"scheme": "exact", "network": NETWORK, "amount": str(ROUTES[path][0]), "asset": USDC, "payTo": PAY_TO, "maxTimeoutSeconds": 120, "extra": {"name": "USD Coin" if NETWORK == "eip155:8453" else "USDC", "version": "2"}}
 DISCOVERY = json.load(open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "discovery.json")))
@@ -156,6 +160,11 @@ def llms_txt():
          "- Responses are served only after the transfer is confirmed on-chain", "- Optional ?ref=<tag> (A-Z a-z 0-9 . _ -, max 64) is recorded for attribution and never changes price or challenge", "",
          "## Paid routes (GET, JSON)", ""]
     L += [f"- {k} ({v[0] / 1e6:.3f} USDC): {v[1]}" for k, v in ROUTES.items()]
+    L += ["", "## What the responses are", "", "- Verifiable facts only: /base/network, /base/usdc-balance, /base/address-intel and /base/tx-status (once mined) include the Base block number they refer to, so those readings can be reproduced against any Base RPC node",
+          "- No verdicts, opinions, scores or predictions, no buy/sell advice, and no language model in the response path",
+          "- Compared with a free RPC endpoint: values are normalized (decimal and raw units, gwei, confirmations), pinned to a block number, and several reads are combined into one call",
+          "", "## Usage pattern", "", f"- To get signed facts about an x402 endpoint before paying it, you can call /x402/preflight?url=<endpoint> ({ROUTES['/x402/preflight'][0] / 1e6:.3f} USDC). Facts only, no guarantee.",
+          "- /base/network and /base/usdc-balance responses list related_routes (path and price) for follow-up reads"]
     L += ["", "## Discovery (free)", "", "- / : service index with routes and prices", "- /openapi.json : OpenAPI 3.1 description of the paid routes with prices", "- /bazaar/snapshots : daily Bazaar snapshot summary",
           "- /.well-known/bazaar-snapshot.json : signed snapshot series metadata", "- /.well-known/x402-preflight : Pre-pay Check schema and signing key",
           "- /.well-known/x402-preflight-key-history.json : signing key history", "- /x402/preflight/pubkey : Ed25519 public key for verifying signed facts",
@@ -209,10 +218,16 @@ def snapshot_summary(limit=30):
     for d in reversed(PF.snapshot_dates()[-limit:]):
         if d not in _SNAP_SUM:
             idx = PF.load_index(d); res = idx.get("resources", {})
-            _SNAP_SUM[d] = {"date": d, "resources": len(res), "hosts": len(idx.get("hosts", {})), "payout_wallets": len(idx.get("wallet_hosts", {})),
+            _SNAP_SUM[d] = {"date": d, "status": idx.get("status") or (idx.get("coverage") or {}).get("status"), "resources": len(res), "hosts": len(idx.get("hosts", {})), "payout_wallets": len(idx.get("wallet_hosts", {})),
                             "calls30d_total": sum((r.get("calls30d") or 0) for r in res.values()), "payers30d_total": sum((r.get("payers30d") or 0) for r in res.values())}
         out.append(_SNAP_SUM[d])
-    return {"source": "x402 Bazaar discovery API, crawled daily at 00:15 UTC", "snapshots": out}
+    return {"source": "x402 Bazaar discovery API, crawled daily at 00:15 UTC", "latest": latest_of(out), "snapshots": out}
+def latest_of(out, now=None):
+    """Freshness and completeness of the newest snapshot: date, status (complete | partial | failed | None), listing count, age in days."""
+    if not out: return {"date": None, "status": None, "listings": 0, "age_days": None, "fresh": False}
+    s = out[0]; now = time.time() if now is None else now
+    age = int((now - calendar.timegm(time.strptime(s["date"], "%Y-%m-%d"))) // 86400)
+    return {"date": s["date"], "status": s.get("status"), "listings": s.get("resources", 0), "age_days": max(0, age), "fresh": max(0, age) <= 3}
 REPLAY, FAILS, SLOTS = SG.Replay(), SG.FailLimiter(), SG.Slots()
 ONCHAIN_CHECK = os.environ.get("ONCHAIN_CHECK", "block")   # block: serve only after the nonce-bound USDC Transfer is confirmed on Base; log: serve on facilitator success (testnets only)
 MAINNET = "eip155:8453"

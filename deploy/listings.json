@@ -85,8 +85,8 @@
     {
       "path": "/base/address-intel",
       "method": "GET",
-      "price_usdc": "0.005",
-      "amount_atomic": "5000",
+      "price_usdc": "0.010",
+      "amount_atomic": "10000",
       "query_params": [
         "address"
       ],
@@ -95,8 +95,8 @@
     {
       "path": "/x402/preflight",
       "method": "GET",
-      "price_usdc": "0.001",
-      "amount_atomic": "1000",
+      "price_usdc": "0.010",
+      "amount_atomic": "10000",
       "query_params": [
         "url"
       ],
