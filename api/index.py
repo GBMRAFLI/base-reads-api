@@ -178,7 +178,16 @@ def verify_token():
     """402index ownership token: INDEX_VERIFY_TOKEN if set, else the built-in constant. Served with no trailing newline."""
     return os.environ.get("INDEX_VERIFY_TOKEN") or VERIFY_402INDEX_DEFAULT
 FAVICON_B64 = "AAABAAEAEBAAAAEAIABoBAAAFgAAACgAAAAQAAAAIAAAAAEAIAAAAAAAQAQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA0lIA/9JSAP8AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAANJSAP/SUgD/0lIA/9JSAP/SUgD/0lIA/9JSAP/SUgD/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAANJSAP/SUgD/0lIA/9JSAP/SUgD/0lIA/9JSAP/SUgD/0lIA/9JSAP8AAAAAAAAAAAAAAAAAAAAAAAAAANJSAP/SUgD/0lIA/9JSAP/SUgD/0lIA/9JSAP/SUgD/0lIA/9JSAP/SUgD/0lIA/wAAAAAAAAAAAAAAANJSAP/SUgD/0lIA/9JSAP/SUgD/0lIA/9JSAP/SUgD/0lIA/9JSAP/SUgD/0lIA/9JSAP/SUgD/AAAAAAAAAADSUgD/0lIA/9JSAP/SUgD/0lIA///////////////////////SUgD/0lIA/9JSAP/SUgD/0lIA/wAAAAAAAAAA0lIA/9JSAP/SUgD/0lIA/9JSAP//////0lIA/9JSAP/SUgD//////9JSAP/SUgD/0lIA/9JSAP8AAAAA0lIA/9JSAP/SUgD/0lIA/9JSAP/SUgD//////9JSAP/SUgD/0lIA///////SUgD/0lIA/9JSAP/SUgD/0lIA/9JSAP/SUgD/0lIA/9JSAP/SUgD/0lIA///////////////////////SUgD/0lIA/9JSAP/SUgD/0lIA/9JSAP8AAAAA0lIA/9JSAP/SUgD/0lIA/9JSAP//////0lIA/9JSAP/SUgD//////9JSAP/SUgD/0lIA/9JSAP8AAAAAAAAAANJSAP/SUgD/0lIA/9JSAP/SUgD//////9JSAP/SUgD/0lIA///////SUgD/0lIA/9JSAP/SUgD/AAAAAAAAAADSUgD/0lIA/9JSAP/SUgD/0lIA///////////////////////SUgD/0lIA/9JSAP/SUgD/0lIA/wAAAAAAAAAAAAAAANJSAP/SUgD/0lIA/9JSAP/SUgD/0lIA/9JSAP/SUgD/0lIA/9JSAP/SUgD/0lIA/wAAAAAAAAAAAAAAAAAAAAAAAAAA0lIA/9JSAP/SUgD/0lIA/9JSAP/SUgD/0lIA/9JSAP/SUgD/0lIA/wAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAADSUgD/0lIA/9JSAP/SUgD/0lIA/9JSAP/SUgD/0lIA/wAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA0lIA/9JSAP8AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=="  # 16x16 ICO from scripts/gen_favicon.py
-FREE_PATHS = ("/", "/index.json", "/favicon.ico", "/llms.txt", "/openapi.json", "/.well-known/402index-verify.txt", "/.well-known/x402-preflight", "/.well-known/x402-preflight-key-history.json", "/.well-known/issuer.json", "/.well-known/prepay-check-attestation-v1.schema.json", "/.well-known/bazaar-snapshot.json", "/x402/preflight/pubkey", "/bazaar/snapshots")
+REPORT_FILES = {  # free static report files: exact-path whitelist only (no filesystem lookups from the URL)
+    "/reports/state-of-x402-2026-10": ("state-of-x402-2026-10.html", "text/html; charset=utf-8"),
+    "/reports/state-of-x402-2026-10.md": ("state-of-x402-2026-10.md", "text/markdown; charset=utf-8"),
+    "/reports/data/aggregate_stats.csv": ("data/aggregate_stats.csv", "text/csv; charset=utf-8"),
+    "/reports/data/liveness_sample_200.csv": ("data/liveness_sample_200.csv", "text/csv; charset=utf-8"),
+}
+_REPORT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "static", "reports")
+REPORT_BYTES = {p: open(os.path.join(_REPORT_DIR, f), "rb").read() for p, (f, _) in REPORT_FILES.items()}
+REPORT_CSP = "default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'"
+FREE_PATHS = tuple(REPORT_FILES) + ("/", "/index.json", "/favicon.ico", "/llms.txt", "/openapi.json", "/.well-known/402index-verify.txt", "/.well-known/x402-preflight", "/.well-known/x402-preflight-key-history.json", "/.well-known/issuer.json", "/.well-known/prepay-check-attestation-v1.schema.json", "/.well-known/bazaar-snapshot.json", "/x402/preflight/pubkey", "/bazaar/snapshots")
 def openapi():
     """OpenAPI 3.1 for the paid routes, generated from ROUTES + discovery.json so prices cannot drift from the 402 challenge."""
     paths = {}
@@ -398,6 +407,7 @@ class handler(BaseHTTPRequestHandler):
         path, _, qs = s.path.partition("?"); q = dict(x.split("=", 1) for x in qs.split("&") if "=" in x)
         if path in ("/", "/index.json"):
             return s._send(200, root())
+        if path in REPORT_BYTES: return s._send(200, REPORT_BYTES[path], {"Cache-Control": "public, max-age=3600", "Content-Security-Policy": REPORT_CSP}, ctype=REPORT_FILES[path][1])
         if path == "/llms.txt": return s._send(200, llms_txt(), {"Cache-Control": "public, max-age=3600"}, ctype="text/plain; charset=utf-8")
         if path == "/openapi.json": return s._send(200, openapi(), {"Cache-Control": "public, max-age=3600"})
         if path == "/.well-known/402index-verify.txt": return s._send(200, verify_token(), ctype="text/plain; charset=utf-8")

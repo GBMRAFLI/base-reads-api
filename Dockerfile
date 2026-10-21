@@ -8,6 +8,7 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir --require-hashes -r requirements.txt
 COPY --chown=user api ./api
 COPY --chown=user scripts ./scripts
+COPY --chown=user static ./static
 USER user
 ENV HOST=0.0.0.0 PORT=7860 PYTHONUNBUFFERED=1 \
     SNAPSHOT_DIR=/tmp/snapshots DATA_STORE=/tmp/records SIGNING_KEY_PATH=/tmp/signing_key.enc.pem SNAPSHOT_SCHEDULER=1
