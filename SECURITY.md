@@ -96,4 +96,6 @@ The Python code in `api/` is a reference implementation used for test vectors an
 - One slot is kept for retries of already-settled checks, so new buyers cannot starve them.
 - Cache hit: a cached result for the same payer and target is still a paid result. It settles without taking a slot, since no outbound probe runs.
 - Settlement fails: the slot is released immediately and the answer is 402. Abandoned request: the slot expires after its TTL, nothing is charged. Slot expired during settlement: the payment is kept and the answer is 502 with `retry_free: true`; repeating the same request is served from the pending path without a second charge. All slots taken: 503 with `Retry-After`, nothing charged.
-- Failed settlements are also limited per network (IPv4 /24, IPv6 /48; `FAILED_SETTLE_PER_NET_PER_MIN`, default 10); over the limit the request is refused before verification.
+- Failed settlements are counted per network (IPv4 /24, IPv6 /48; `FAILED_SETTLE_PER_NET_PER_MIN`, default 10). While a network is over that count, only the IPs and payers in it that themselves failed a settlement in the last minute are refused (429, before verification); other buyers on the same network are never affected.
+- The slot is extended to 20 seconds when the probe starts, covering the probe timeout and the attestation RPC, so it cannot lapse mid-probe.
+- If a cached result expired between the pre-check and delivery, the free retry takes a target budget unit before probing; without one it is re-parked (503, no new charge).

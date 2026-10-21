@@ -336,14 +336,14 @@ async function handleGet(req: Request, d: Deps): Promise<Response> {
 }
 
 const FAILS = new SG.FailLimiter();
-type Abuse = { unpaid: WindowLimiter; unpaid48: WindowLimiter; hostPayer: WindowLimiter; perHost: WindowLimiter; failNet: WindowLimiter; cache: ResultCache<unknown>; slots: SlotTable };
+type Abuse = { unpaid: WindowLimiter; unpaid48: WindowLimiter; hostPayer: WindowLimiter; perHost: WindowLimiter; failNet: WindowLimiter; failedWho: WindowLimiter; cache: ResultCache<unknown>; slots: SlotTable };
 let ABUSE: Abuse | null = null;
 /** Per-process abuse guards (A6 unpaid limit, per-target outbound limit, A7 payer+target cache, outbound concurrency). */
 export function abuse(env: Deps["env"]): Abuse {
   if (!ABUSE) {
     const g = guardConfig(env); configureOutbound(g.outboundConcurrency);
     ABUSE = { unpaid: new WindowLimiter(g.unpaidPerMin), unpaid48: new WindowLimiter(g.unpaidPer48PerMin), hostPayer: new WindowLimiter(g.hostPayerPerMin),
-      perHost: new WindowLimiter(g.perHostPerMin), failNet: new WindowLimiter(g.failedSettlePerNetPerMin), cache: new ResultCache(g.cacheTtlMs), slots: new SlotTable(g.outboundConcurrency, g.slotTtlMs) };
+      perHost: new WindowLimiter(g.perHostPerMin), failNet: new WindowLimiter(g.failedSettlePerNetPerMin), failedWho: new WindowLimiter(1), cache: new ResultCache(g.cacheTtlMs), slots: new SlotTable(g.outboundConcurrency, g.slotTtlMs) };
   }
   return ABUSE;
 }
@@ -446,6 +446,8 @@ async function paid(path: string, q: Record<string, string>, qs: string, sig: st
   };
   /** Probe slot: one synchronous reservation bound to payer + payment nonce + target, 15 s TTL, one per payer. */
   const reserve = (u: string, pending = false): { id: string } | "payer_busy" | "full" => G.slots.reserve(who, nonce, hostOf(u), clock.now(), pending);
+  // Probe (5 s timeout) + attestation RPC (eth_getCode, up to 3 x 1 s with backoff) + signing, with margin.
+  const SLOT_PROBE_MS = 20_000;
   const PAYER429: [number, unknown, Record<string, string>] = [429, { error: "this wallet already has a check in progress", scope: "payer", charged: false }, { "Retry-After": "5" }];
   const CAP503 = (): [number, unknown, Record<string, string>] => [503, { error: "target check capacity is full for this minute, retry later", scope: "target", charged: false }, { "Retry-After": "60" }];
   const BUSY503: [number, unknown, Record<string, string>] = [503, { error: "probe capacity busy, retry shortly", charged: false }, { "Retry-After": "5" }];
@@ -468,9 +470,15 @@ async function paid(path: string, q: Record<string, string>, qs: string, sig: st
     const rv = cached ? null : reserve(u, true);
     if (rv === "payer_busy") { await SG.setPending(key, pend); return [429, { error: "this wallet already has a check in progress", scope: "payer", transaction: pend.tx }, { "Retry-After": "5" }]; }
     if (rv === "full") { await SG.setPending(key, pend); return [503, { error: "probe capacity busy, retry shortly (no new charge)", transaction: pend.tx }, { "Retry-After": "5" }]; }
+    let rec = pend;
+    if (rv && pend.noBudget) { // L2: no budget unit was taken for this payment: take one now, or re-park
+      if (!G.perHost.allow(hostOf(u))) { G.slots.release(rv.id); await SG.setPending(key, pend); return [503, { error: "target check capacity is full, retry later (no new charge)", transaction: pend.tx }, { "Retry-After": "60" }]; }
+      const { noBudget: _nb, ...rest } = pend; rec = rest;
+    }
+    if (rv) G.slots.extend(rv.id, SLOT_PROBE_MS);
     let code = 0, out: unknown = null;
     try { [code, out] = await runPreflight(u); } catch { code = 0; } finally { if (rv) G.slots.release(rv.id); }
-    if (code !== 200) { await SG.setPending(key, { ...pend, tries: tries + 1 }); return [502, { error: "upstream error, retry the same request", transaction: pend.tx, attempts_left: MAX_TRIES - tries - 1 }, {}]; }
+    if (code !== 200) { await SG.setPending(key, { ...rec, tries: tries + 1 }); return [502, { error: "upstream error, retry the same request", transaction: pend.tx, attempts_left: MAX_TRIES - tries - 1 }, {}]; }
     log(pend.tx, oc, true, pend.times); return [200, out, payResp(N, true, pend.tx, who)];
   };
   const busy: [number, unknown, Record<string, string>] = [429, { error: "too many concurrent payments, retry shortly", scope: "concurrency" }, {}];
@@ -508,8 +516,11 @@ async function paid(path: string, q: Record<string, string>, qs: string, sig: st
     // Rule: never charge without a result. Target capacity full -> 503 before any facilitator call (not charged).
     const u0 = unquote(q.url ?? ""); let h0 = ""; try { h0 = new URL(u0).hostname.toLowerCase(); } catch { /* checked below */ }
     if (h0 && !G.cache.get(cacheKey(u0)) && (!G.perHost.peek(hostOf(u0)) || !G.slots.free())) { await SG.unclaim(key); return CAP503(); }
-    // L1 (optional): a network with many failed settles in the last minute is refused before verify (slots stay free).
-    const nk = netKey(ids.ip); if (nk && !G.failNet.peek(nk)) { await SG.unclaim(key); return [429, { error: "too many failed payments from this network, retry later", scope: "network", charged: false }, { "Retry-After": "60" }]; }
+    // Failed-settle limit: only an IP or payer that itself failed a settle in the last minute is refused, and only while its
+    // network (/24, /48) is over the failed-settle threshold. The network count never blocks other IPs/payers in it.
+    const nk = netKey(ids.ip);
+    const failedHere = (ids.ip && !G.failedWho.peek("ip:" + (SG.ipKey(ids.ip) ?? ids.ip))) || !G.failedWho.peek("payer:" + who);
+    if (nk && failedHere && !G.failNet.peek(nk)) { await SG.unclaim(key); return [429, { error: "too many failed payments, retry later", scope: "failed_settle", charged: false }, { "Retry-After": "60" }]; }
   }
   const v = await fac("/verify", body); const tVer = iso(); logBazaar("verify", path, v);
   if (!v.isValid) { const why = facErr(v.invalidReason); await FAILS.fail({ ip: ids.ip }, "verify"); return [402, { error: why }, noPay(why, N)]; }
@@ -560,10 +571,12 @@ async function paid(path: string, q: Record<string, string>, qs: string, sig: st
       // Slot expired during settlement (TTL), or the cache entry expired since the check: the payment is kept (no second
       // charge) and the same request is served free on retry via the pending path.
       if ((held.slot && !G.slots.valid(held.slot)) || (!held.slot && !hit)) {
-        freeSlot(); await SG.setPending(key, { path, tx, times, url: u, tries: 0 });
+        // noBudget: the cache-hit path reserved no budget unit; the retry must take one before probing (L2).
+        const noBudget = !held.slot; freeSlot(); await SG.setPending(key, { path, tx, times, url: u, tries: 0, ...(noBudget ? { noBudget: true } : {}) });
         return [502, { error: "the probe slot expired during settlement; repeat the same request to receive the result (no new charge)", transaction: tx, retry_free: true }, { ...payResp(N, true, tx, who), "Retry-After": "2" }];
       }
       let ok = false;
+      if (held.slot) G.slots.extend(held.slot, SLOT_PROBE_MS); // L1: slot covers probe timeout + attestation RPC
       try { [code, out] = await runPreflight(u); ok = code === 200; } catch { ok = false; } finally { freeSlot(); }
       if (!ok) {
         await SG.setPending(key, { path, tx, times, url: u, tries: 1 });
@@ -584,7 +597,7 @@ async function paid(path: string, q: Record<string, string>, qs: string, sig: st
       return await deliver(tx, { ...oc, note: "settle_reported_failure_but_confirmed_onchain" }, times);
     }
     freeSlot(); // settle failed: release the slot now (the budget unit is returned in finally)
-    { const nk = netKey(ids.ip); if (nk) G.failNet.allow(nk); }
+    { const nk = netKey(ids.ip); if (nk) G.failNet.allow(nk); if (ids.ip) G.failedWho.allow("ip:" + (SG.ipKey(ids.ip) ?? ids.ip)); G.failedWho.allow("payer:" + who); }
     const why = facErr(st.errorReason); await FAILS.fail(ids, "settle");
     return [402, { error: why, hint: REUSE_HINT }, payResp(N, false, tx, who, why)]; // the authorization is spent
   }

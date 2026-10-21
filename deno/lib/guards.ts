@@ -107,6 +107,8 @@ export class SlotTable {
     if (this.m.size >= (pending || this.max < 2 ? this.max : this.max - 1)) return "full";
     const id = payer + "|" + nonce + "|" + host; this.m.set(id, { payer, exp: now + this.ttlMs }); return { id };
   }
+  /** Extend a live slot so it covers the probe (timeout) plus the attestation RPC; the slot then cannot lapse mid-probe. */
+  extend(id: string, ms: number, now = clock.now()) { const s = this.m.get(id); if (s && s.exp > now) s.exp = Math.max(s.exp, now + ms); return !!s && s.exp > now; }
   valid(id: string, now = clock.now()) { const s = this.m.get(id); return !!s && s.exp > now; }
   release(id: string) { this.m.delete(id); }
   free(now = clock.now()) { this.purge(now); return this.m.size < (this.max < 2 ? this.max : this.max - 1); }
