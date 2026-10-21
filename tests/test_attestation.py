@@ -56,6 +56,9 @@ class TA(unittest.TestCase):
         def boom(m, p): raise OSError("x")
         self.assertEqual(AT.payto_code(["0x" + "22" * 20, "0x" + "22" * 20, "bad"], boom), [{"address": "0x" + "22" * 20, "kind": None, "code_bytes": None}])
         self.assertEqual(len(AT.payto_code(["0x%040x" % i for i in range(1, 9)], lambda m, p: "0x")), 4)
+        d = "0x" + "ab" * 20
+        self.assertEqual(AT.payto_code([ACC["payTo"]], lambda m, p: "0xef0100" + d[2:]), [{"address": ACC["payTo"], "kind": "eip7702_delegated", "code_bytes": 23, "delegate": d}])
+        self.assertEqual(st(facts(), [{"address": ACC["payTo"], "kind": "eip7702_delegated", "code_bytes": 23, "delegate": d}])["payto_is_eoa"], "pass")
     def test_python_signed_verifies_with_deno_script(self):
         s, pub, iss = ephemeral(); e = AT.attest(facts(), s, rpc=lambda m, p: "0x")
         d = tempfile.mkdtemp(); json.dump({"attestation": e}, open(d + "/a.json", "w")); json.dump(iss, open(d + "/i.json", "w"))

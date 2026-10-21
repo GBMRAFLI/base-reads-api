@@ -34,7 +34,7 @@
         "payto_code": {
           "type": "array", "maxItems": 4,
           "items": { "type": "object", "required": ["address", "kind", "code_bytes"], "additionalProperties": false,
-            "properties": { "address": { "type": "string", "pattern": "^0x[0-9a-f]{40}$" }, "kind": { "enum": ["eoa", "contract", null] }, "code_bytes": { "type": ["integer", "null"], "minimum": 0 } } }
+            "properties": { "address": { "type": "string", "pattern": "^0x[0-9a-f]{40}$" }, "kind": { "enum": ["eoa", "eip7702_delegated", "contract", null] }, "code_bytes": { "type": ["integer", "null"], "minimum": 0 }, "delegate": { "type": "string", "pattern": "^0x[0-9a-f]{40}$" } } }
         },
         "checks": {
           "type": "array",

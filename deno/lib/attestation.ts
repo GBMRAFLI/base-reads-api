@@ -31,16 +31,23 @@ export const signingBytes = (envelope: Record<string, unknown>) => {
 };
 const isoSec = (ms: number) => new Date(Math.floor(ms / 1000) * 1000).toISOString().replace(".000Z", "Z");
 
-/** eth_getCode for each distinct payTo (capped). kind: "eoa" | "contract" | null (lookup failed). */
-export async function paytoCode(payTos: string[], rpc?: Rpc): Promise<{ address: string; kind: "eoa" | "contract" | null; code_bytes: number | null }[]> {
+export type PaytoCode = { address: string; kind: "eoa" | "eip7702_delegated" | "contract" | null; code_bytes: number | null; delegate?: string };
+/** eth_getCode for each distinct payTo (capped). kind: "eoa" (no code), "eip7702_delegated" (EOA whose code is the
+ * EIP-7702 designator 0xef0100 || delegate address), "contract", or null (lookup failed). */
+export function classifyCode(address: string, code: string): PaytoCode {
+  const n = Math.floor((code.length - 2) / 2);
+  if (n === 0) return { address, kind: "eoa", code_bytes: 0 };
+  if (n === 23 && code.toLowerCase().startsWith("0xef0100")) return { address, kind: "eip7702_delegated", code_bytes: 23, delegate: "0x" + code.slice(8).toLowerCase() };
+  return { address, kind: "contract", code_bytes: n };
+}
+export async function paytoCode(payTos: string[], rpc?: Rpc): Promise<PaytoCode[]> {
   const uniq = [...new Set(payTos.filter((a) => /^0x[0-9a-fA-F]{40}$/.test(a)).map((a) => a.toLowerCase()))].slice(0, MAX_PAYTO_CODE_LOOKUPS);
   return await Promise.all(uniq.map(async (address) => {
     if (!rpc) return { address, kind: null, code_bytes: null };
     try {
       const code = await rpc("eth_getCode", [address, "latest"]);
       if (typeof code !== "string" || !/^0x[0-9a-fA-F]*$/.test(code)) return { address, kind: null, code_bytes: null };
-      const n = Math.floor((code.length - 2) / 2);
-      return { address, kind: n > 0 ? "contract" as const : "eoa" as const, code_bytes: n };
+      return classifyCode(address, code);
     } catch { return { address, kind: null, code_bytes: null }; }
   }));
 }
@@ -57,7 +64,7 @@ export function buildChecks(facts: any, code: Awaited<ReturnType<typeof paytoCod
   const assets = acc.map((a) => typeof a.asset === "string" ? a.asset.toLowerCase() : null);
   out.push({ id: "asset_is_base_usdc", status: !acc.length ? "not_applicable" : assets.every((x) => x === BASE_USDC) ? "pass" : "fail", observed: assets, expected: BASE_USDC });
   const known = code.filter((c) => c.kind !== null);
-  out.push({ id: "payto_is_eoa", status: !code.length || known.length < code.length ? "not_applicable" : known.every((c) => c.kind === "eoa") ? "pass" : "fail",
+  out.push({ id: "payto_is_eoa", status: !code.length || known.length < code.length ? "not_applicable" : known.every((c) => c.kind === "eoa" || c.kind === "eip7702_delegated") ? "pass" : "fail",
     observed: code.map((c) => ({ address: c.address, kind: c.kind })) });
   out.push({ id: "bazaar_snapshot_available", status: bz.available ? "pass" : "fail", observed: bz.available ? (bz.snapshot_date ?? null) : (bz.reason ?? null) });
   out.push({ id: "listed_in_bazaar", status: !bz.available || bz.listed === null || bz.listed === undefined ? "not_applicable" : bz.listed ? "pass" : "fail", observed: bz.available ? (bz.listed ?? null) : null });

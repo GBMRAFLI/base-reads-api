@@ -74,6 +74,10 @@ Deno.test("payTo eth_getCode: dedup, cap 4, rpc errors -> null, no rpc -> null",
   const r = await paytoCode(addrs, rpc);
   assertEquals(r.map((x) => x.kind), ["eoa", null, "contract", "eoa"]); assertEquals(calls.length, 4); assertEquals(r[2].code_bytes, 1);
   assertEquals((await paytoCode([ACC.payTo]))[0].kind, null);
+  const d = "0x" + "ab".repeat(20);
+  assertEquals((await paytoCode([ACC.payTo], async () => "0xef0100" + d.slice(2)))[0], { address: ACC.payTo, kind: "eip7702_delegated", code_bytes: 23, delegate: d });
+  assertEquals((await paytoCode([ACC.payTo], async () => "0xef0101" + d.slice(2)))[0].kind, "contract");
+  assertEquals(buildChecks(facts(), [{ address: ACC.payTo, kind: "eip7702_delegated", code_bytes: 23, delegate: d }]).find((c) => c.id === "payto_is_eoa")!.status, "pass");
 });
 Deno.test("Deno-signed attestation verifies with the official Python script", async () => {
   const k = await ephemeral(); const e = await attest(facts(), { signer: k.signer, rpc: async () => "0x", now: Date.now() });

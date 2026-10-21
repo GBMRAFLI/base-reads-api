@@ -16,19 +16,24 @@ def jcs(o): return rfc8785.dumps(o)
 def signing_bytes(env): return jcs({k: v for k, v in env.items() if k != "signature"})
 def iso(t): return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(int(t)))
 
+def classify_code(address, code):
+    """eoa (no code) | eip7702_delegated (code = 0xef0100 || delegate) | contract."""
+    n = (len(code) - 2) // 2
+    if n == 0: return {"address": address, "kind": "eoa", "code_bytes": 0}
+    if n == 23 and code.lower().startswith("0xef0100"): return {"address": address, "kind": "eip7702_delegated", "code_bytes": 23, "delegate": "0x" + code[8:].lower()}
+    return {"address": address, "kind": "contract", "code_bytes": n}
 def payto_code(pay_tos, rpc=None):
     seen, out = [], []
     for a in pay_tos:
         if isinstance(a, str) and ADDR.match(a) and a.lower() not in seen: seen.append(a.lower())
     for a in seen[:MAX_PAYTO_CODE_LOOKUPS]:
-        kind = n = None
+        rec = {"address": a, "kind": None, "code_bytes": None}
         if rpc:
             try:
                 code = rpc("eth_getCode", [a, "latest"])
-                if isinstance(code, str) and re.fullmatch(r"0x[0-9a-fA-F]*", code):
-                    n = (len(code) - 2) // 2; kind = "contract" if n > 0 else "eoa"
+                if isinstance(code, str) and re.fullmatch(r"0x[0-9a-fA-F]*", code): rec = classify_code(a, code)
             except Exception: pass
-        out.append({"address": a, "kind": kind, "code_bytes": n})
+        out.append(rec)
     return out
 
 def build_checks(facts, code):
@@ -46,7 +51,7 @@ def build_checks(facts, code):
     out.append({"id": "asset_is_base_usdc", "status": "not_applicable" if not acc else "pass" if all(x == BASE_USDC for x in assets) else "fail",
                 "observed": assets, "expected": BASE_USDC})
     known = [c for c in code if c["kind"] is not None]
-    out.append({"id": "payto_is_eoa", "status": "not_applicable" if not code or len(known) < len(code) else "pass" if all(c["kind"] == "eoa" for c in known) else "fail",
+    out.append({"id": "payto_is_eoa", "status": "not_applicable" if not code or len(known) < len(code) else "pass" if all(c["kind"] in ("eoa", "eip7702_delegated") for c in known) else "fail",
                 "observed": [{"address": c["address"], "kind": c["kind"]} for c in code]})
     out.append({"id": "bazaar_snapshot_available", "status": "pass" if bz.get("available") else "fail",
                 "observed": bz.get("snapshot_date") if bz.get("available") else bz.get("reason")})

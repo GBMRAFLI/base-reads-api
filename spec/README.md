@@ -32,13 +32,14 @@ The paid route `GET /x402/preflight?url=<endpoint>` (0.010 USDC, x402 v2, `PAYME
 | `issuer` | `{name, key_id, issuer_url, contact}` |
 | `subject` | `{type: "x402_endpoint", url}` |
 | `claims.facts` | the Pre-pay Check facts (schema `prepay-check/v1`): reachability, 402 challenge, Bazaar snapshot facts |
-| `claims.payto_code` | for each distinct payTo (at most 4): `eth_getCode` at latest Base block, `kind` = `eoa`, `contract` or `null` if the lookup failed |
+| `claims.payto_code` | for each distinct payTo (at most 4): `eth_getCode` at latest Base block, `kind` = `eoa` (no code), `eip7702_delegated` (code is the EIP-7702 designator `0xef0100` + delegate address, given in `delegate`), `contract`, or `null` if the lookup failed |
 | `claims.checks` | `[{id, status: pass / fail / not_applicable, observed, expected?}]` |
 | `claims.checks_passed`, `claims.checks_failed` | the check ids with that status |
 | `signature` | `{alg: "Ed25519", key_id, value_b64}` |
 
 Check ids in v1.0: `endpoint_reachable`, `http_402_returned`, `challenge_well_formed`, `network_is_base` (expected `eip155:8453`),
 `asset_is_base_usdc` (expected `0x833589fcd6edb6e08f4c7c32d4f71b54bda02913`), `payto_is_eoa`, `bazaar_snapshot_available`, `listed_in_bazaar`.
+`payto_is_eoa` passes for `eoa` and `eip7702_delegated` (an externally owned account with delegated code; see `claims.payto_code` for the delegate) and fails for `contract`.
 `not_applicable` means the input needed for the check was not observed (for example no 402 challenge, or an RPC lookup failed).
 
 ## Signing
