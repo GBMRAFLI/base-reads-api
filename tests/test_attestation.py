@@ -191,31 +191,50 @@ class TIssuerDocDrift(unittest.TestCase):
         k = PF.load_or_create_key(); kid = PF.public_key_info()["key_id"]
         e = json.loads(json.dumps(AT.attest(facts(), (kid, lambda m: eddsa.new(k, "rfc8032").sign(m)), rpc=lambda m, p: "0x", now=NOW)))
         V = lambda att=e, i=iss, **kw: self._verify(i, att, kw.pop("now", NOW), **kw)
-        self.assertEqual(V(pinned=kid), "valid")
-        self.assertEqual(V(dict(e, signature=dict(e["signature"], public_key_b64="AAAA"))), "valid")  # informational only
-        self.assertEqual(V(dict(e, version="2.0")), "spec_version_canonicalization")
-        self.assertEqual(V(dict(e, signature=dict(e["signature"], alg="RS256"))), "signature_block")
-        self.assertEqual(V(pinned="0" * 16), "pinned_key_id")
-        self.assertEqual(V(dict(e, issuer=dict(e["issuer"], key_id="0" * 16))), "issuer_key_id_match")
-        self.assertEqual(V(i=dict(iss, keys=[])), "key_lookup")
-        self.assertEqual(V(i=dict(iss, keys=[dict(iss["keys"][0], public_key_b64=base64.b64encode(b"x" * 32).decode())])), "key_integrity")
-        self.assertEqual(V(dict(e, expires_at="2026-10-23T05:00:00Z")), "validity_window")
+        with self.subTest("01 expect valid"): self.assertEqual(V(pinned=kid), "valid")
+        with self.subTest("02 expect valid"): self.assertEqual(V(dict(e, signature=dict(e["signature"], public_key_b64="AAAA"))), "valid")  # informational only
+        with self.subTest("03 expect spec_version_canonicalization"): self.assertEqual(V(dict(e, version="2.0")), "spec_version_canonicalization")
+        with self.subTest("04 expect signature_block"): self.assertEqual(V(dict(e, signature=dict(e["signature"], alg="RS256"))), "signature_block")
+        with self.subTest("05 expect pinned_key_id"): self.assertEqual(V(pinned="0" * 16), "pinned_key_id")
+        with self.subTest("06 expect issuer_key_id_match"): self.assertEqual(V(dict(e, issuer=dict(e["issuer"], key_id="0" * 16))), "issuer_key_id_match")
+        with self.subTest("07 expect key_lookup"): self.assertEqual(V(i=dict(iss, keys=[])), "key_lookup")
+        with self.subTest("08 expect key_integrity"): self.assertEqual(V(i=dict(iss, keys=[dict(iss["keys"][0], public_key_b64=base64.b64encode(b"x" * 32).decode())])), "key_integrity")
+        with self.subTest("09 expect validity_window"): self.assertEqual(V(dict(e, expires_at="2026-10-23T05:00:00Z")), "validity_window")
         def ret(at):
             kk = dict(iss["keys"][0], status="retired")
             if at is not None: kk["retired_at"] = at
             return dict(iss, keys=[kk])
-        self.assertEqual(V(i=ret("2026-10-21T04:59:59Z")), "key_not_retired")
-        self.assertEqual(V(i=ret(None)), "key_not_retired")
-        self.assertEqual(V(i=ret(e["issued_at"])), "valid")  # issued_at == retired_at is accepted
-        self.assertEqual(V(prefix=False), "signature")  # no prefix -> fail
-        self.assertEqual(V(dict(e, subject=dict(e["subject"], url="https://evil.example/"))), "signature")
-        self.assertEqual(V(now=NOW - 120), "not_future")
-        self.assertEqual(V(now=NOW + 901), "not_expired")
+        with self.subTest("10 expect key_not_retired"): self.assertEqual(V(i=ret("2026-10-21T04:59:59Z")), "key_not_retired")
+        with self.subTest("11 expect key_not_retired"): self.assertEqual(V(i=ret(None)), "key_not_retired")
+        with self.subTest("12 expect valid"): self.assertEqual(V(i=ret(e["issued_at"])), "valid")  # issued_at == retired_at is accepted
+        with self.subTest("13 expect signature"): self.assertEqual(V(prefix=False), "signature")  # no prefix -> fail
+        with self.subTest("14 expect signature"): self.assertEqual(V(dict(e, subject=dict(e["subject"], url="https://evil.example/"))), "signature")
+        with self.subTest("15 expect not_future"): self.assertEqual(V(now=NOW - 120), "not_future")
+        with self.subTest("16 expect not_expired"): self.assertEqual(V(now=NOW + 901), "not_expired")
         # official verifier agrees on the retired boundary and the key_id mismatch
         self.assertTrue(VA.verify(e, ret(e["issued_at"]), now=NOW)[0])
         self.assertFalse(VA.verify(e, ret("2026-10-21T04:59:59Z"), now=NOW)[0])
         self.assertFalse(VA.verify(dict(e, issuer=dict(e["issuer"], key_id="0" * 16)), iss, now=NOW)[0])
         m = json.loads(json.dumps(IX.snapshot_meta()))
         self.assertTrue(self._meta(iss, m)); self.assertFalse(self._meta(iss, m, prefix=False))
+
+    def test_l1_official_verifier_key_status(self):
+        k = PF.load_or_create_key(); cur = PF.key_history()["current"]
+        e = json.loads(json.dumps(AT.attest(facts(), (cur["key_id"], lambda m: eddsa.new(k, "rfc8032").sign(m)), rpc=lambda m, p: "0x", now=NOW)))
+        self.assertTrue(VA.verify(e, {"keys": [cur]}, now=NOW)[0])
+        self.assertEqual(VA.verify(e, {"keys": [dict(cur, status="revoked")]}, now=NOW), (False, "unknown key status"))
+        self.assertEqual(VA.verify(e, {"keys": [dict(cur, retired_at="2026-10-22T00:00:00Z")]}, now=NOW), (False, "active key must not carry retired_at"))
+    def test_l2_key_timestamps_second_precision(self):
+        self.assertEqual(PF.iso_or_none("2026-10-14T12:00:21.251Z"), "2026-10-14T12:00:21Z")
+        k = PF.load_or_create_key(); cur = PF.key_history()["current"]
+        old = os.environ.get("SIGNING_KEY_HISTORY")
+        os.environ["SIGNING_KEY_HISTORY"] = json.dumps([{"public_key_b64": cur["public_key_b64"], "created_at": "2026-01-01T00:00:00.5Z", "retired_at": "2026-10-21T05:00:00.999Z"}])
+        try: r = PF.key_history()["retired"][0]
+        finally:
+            if old is None: os.environ.pop("SIGNING_KEY_HISTORY")
+            else: os.environ["SIGNING_KEY_HISTORY"] = old
+        self.assertEqual((r["created_at"], r["retired_at"]), ("2026-01-01T00:00:00Z", "2026-10-21T05:00:00Z"))
+        e = json.loads(json.dumps(AT.attest(facts(), (cur["key_id"], lambda m: eddsa.new(k, "rfc8032").sign(m)), rpc=lambda m, p: "0x", now=NOW)))
+        self.assertTrue(VA.verify(e, {"keys": [r]}, now=NOW)[0])  # issued_at == normalized retired_at
 
 if __name__ == "__main__": unittest.main()

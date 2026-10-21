@@ -50,7 +50,9 @@ export async function verify(att: any, issuer: any, now = Date.now(), checkExpir
   const iat = ts(att.issued_at), exp = ts(att.expires_at);
   if (iat === null || exp === null) return [false, "issued_at/expires_at unparseable"];
   if (exp < iat || exp - iat > 86400_000) return [false, "validity window must be 0..86400 s"];
-  if (k.status === "retired") { const r = ts(k.retired_at); if (r === null || iat > r) return [false, "issued after key was retired"]; }
+  if (k.status === "active") { if ("retired_at" in k) return [false, "active key must not carry retired_at"]; }
+  else if (k.status === "retired") { const r = ts(k.retired_at); if (r === null || iat > r) return [false, "issued after key was retired"]; }
+  else return [false, "unknown key status"];
   const { signature: _s, ...rest } = att;
   let ok = false;
   try {

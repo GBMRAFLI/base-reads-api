@@ -212,7 +212,7 @@ async function verifyMetaByIssuerDoc(iss: any, m: any, prefix = true) {
   const pk = await crypto.subtle.importKey("raw", b64d(key.public_key_b64), { name: s.algorithm }, false, ["verify"]);
   return crypto.subtle.verify(s.algorithm, pk, b64d(m.signature.value_b64), new TextEncoder().encode((prefix ? s.domains.snapshot_meta.signing_prefix : "") + jcs(m.metadata)));
 }
-Deno.test("issuer.json rules alone verify real attestations; every documented check rejects its negative case", async () => {
+Deno.test("issuer.json rules alone verify real attestations; every documented check rejects its negative case", async (t) => {
   useKv(await Deno.openKv(":memory:"));
   const iss = await (await handler(new Request("http://h.example/.well-known/issuer.json"), { env })).json();
   assertEquals({ signing: iss.signing, verify: iss.verify }, C.issuer_rules, "Deno issuer rules identical to Python");
@@ -226,29 +226,48 @@ Deno.test("issuer.json rules alone verify real attestations; every documented ch
   const { envSigner } = await import("../lib/sign.ts");
   const e: any = await attest(facts(), { signer: await envSigner(env), now: NOW });
   const now = NOW / 1000; const kid = e.signature.key_id;
-  assertEquals(await verifyByIssuerDoc(iss, e, { now, pinned: kid }), "valid");
+  await t.step("01 expect valid", async () => { assertEquals(await verifyByIssuerDoc(iss, e, { now, pinned: kid }), "valid"); });
   // signature.public_key_b64 is informational: a wrong value there does not matter, keys[] is used.
-  assertEquals(await verifyByIssuerDoc(iss, { ...e, signature: { ...e.signature, public_key_b64: "AAAA" } }, { now }), "valid");
+  await t.step("02 expect valid", async () => { assertEquals(await verifyByIssuerDoc(iss, { ...e, signature: { ...e.signature, public_key_b64: "AAAA" } }, { now }), "valid"); });
   // negatives, one per check
-  assertEquals(await verifyByIssuerDoc(iss, { ...e, version: "2.0" }, { now }), "spec_version_canonicalization");
-  assertEquals(await verifyByIssuerDoc(iss, { ...e, signature: { ...e.signature, alg: "RS256" } }, { now }), "signature_block");
-  assertEquals(await verifyByIssuerDoc(iss, e, { now, pinned: "0".repeat(16) }), "pinned_key_id");
-  assertEquals(await verifyByIssuerDoc(iss, { ...e, issuer: { ...e.issuer, key_id: "0".repeat(16) } }, { now }), "issuer_key_id_match");
-  assertEquals(await verifyByIssuerDoc({ ...iss, keys: [] }, e, { now }), "key_lookup");
-  assertEquals(await verifyByIssuerDoc({ ...iss, keys: [{ ...iss.keys[0], public_key_b64: btoa("x".repeat(32)) }] }, e, { now }), "key_integrity");
-  assertEquals(await verifyByIssuerDoc(iss, { ...e, expires_at: "2026-10-23T05:00:00Z" }, { now }), "validity_window");
+  await t.step("03 expect spec_version_canonicalization", async () => { assertEquals(await verifyByIssuerDoc(iss, { ...e, version: "2.0" }, { now }), "spec_version_canonicalization"); });
+  await t.step("04 expect signature_block", async () => { assertEquals(await verifyByIssuerDoc(iss, { ...e, signature: { ...e.signature, alg: "RS256" } }, { now }), "signature_block"); });
+  await t.step("05 expect pinned_key_id", async () => { assertEquals(await verifyByIssuerDoc(iss, e, { now, pinned: "0".repeat(16) }), "pinned_key_id"); });
+  await t.step("06 expect issuer_key_id_match", async () => { assertEquals(await verifyByIssuerDoc(iss, { ...e, issuer: { ...e.issuer, key_id: "0".repeat(16) } }, { now }), "issuer_key_id_match"); });
+  await t.step("07 expect key_lookup", async () => { assertEquals(await verifyByIssuerDoc({ ...iss, keys: [] }, e, { now }), "key_lookup"); });
+  await t.step("08 expect key_integrity", async () => { assertEquals(await verifyByIssuerDoc({ ...iss, keys: [{ ...iss.keys[0], public_key_b64: btoa("x".repeat(32)) }] }, e, { now }), "key_integrity"); });
+  await t.step("09 expect validity_window", async () => { assertEquals(await verifyByIssuerDoc(iss, { ...e, expires_at: "2026-10-23T05:00:00Z" }, { now }), "validity_window"); });
   const retired = (at: string | undefined) => ({ ...iss, keys: [{ ...iss.keys[0], status: "retired", ...(at === undefined ? {} : { retired_at: at }) }] });
-  assertEquals(await verifyByIssuerDoc(retired("2026-10-21T04:59:59Z"), e, { now }), "key_not_retired");
-  assertEquals(await verifyByIssuerDoc(retired(undefined), e, { now }), "key_not_retired");
-  assertEquals(await verifyByIssuerDoc(retired(e.issued_at), e, { now }), "valid", "issued_at == retired_at is accepted");
-  assertEquals(await verifyByIssuerDoc(iss, e, { now, prefix: false }), "signature", "no prefix -> fail");
-  assertEquals(await verifyByIssuerDoc(iss, { ...e, subject: { ...e.subject, url: "https://evil.example/" } }, { now }), "signature");
-  assertEquals(await verifyByIssuerDoc(iss, e, { now: now - 120 }), "not_future");
-  assertEquals(await verifyByIssuerDoc(iss, e, { now: now + 901 }), "not_expired");
+  await t.step("10 expect key_not_retired", async () => { assertEquals(await verifyByIssuerDoc(retired("2026-10-21T04:59:59Z"), e, { now }), "key_not_retired"); });
+  await t.step("11 expect key_not_retired", async () => { assertEquals(await verifyByIssuerDoc(retired(undefined), e, { now }), "key_not_retired"); });
+  await t.step("12 expect valid", async () => { assertEquals(await verifyByIssuerDoc(retired(e.issued_at), e, { now }), "valid", "issued_at == retired_at is accepted"); });
+  await t.step("13 expect signature", async () => { assertEquals(await verifyByIssuerDoc(iss, e, { now, prefix: false }), "signature", "no prefix -> fail"); });
+  await t.step("14 expect signature", async () => { assertEquals(await verifyByIssuerDoc(iss, { ...e, subject: { ...e.subject, url: "https://evil.example/" } }, { now }), "signature"); });
+  await t.step("15 expect not_future", async () => { assertEquals(await verifyByIssuerDoc(iss, e, { now: now - 120 }), "not_future"); });
+  await t.step("16 expect not_expired", async () => { assertEquals(await verifyByIssuerDoc(iss, e, { now: now + 901 }), "not_expired"); });
   // The official verifier agrees on the retired boundary and the key_id mismatch.
   assertEquals((await officialVerify(e, retired(e.issued_at), NOW))[0], true);
   assertEquals((await officialVerify(e, retired("2026-10-21T04:59:59Z"), NOW))[0], false);
   assertEquals((await officialVerify({ ...e, issuer: { ...e.issuer, key_id: "0".repeat(16) } }, iss, NOW))[0], false);
   const m: any = await (await handler(new Request("http://h.example/.well-known/bazaar-snapshot.json"), { env })).json();
   assert(await verifyMetaByIssuerDoc(iss, m)); assert(!await verifyMetaByIssuerDoc(iss, m, false));
+});
+Deno.test("L2: published key timestamps are normalized to second precision and verify with the official verifier", async () => {
+  const { keyHistory, envSigner } = await import("../lib/sign.ts");
+  const raw = new Uint8Array(32).fill(7);
+  const h = await keyHistory((k) => k === "SIGNING_KEY_HISTORY" ? JSON.stringify([{ public_key_b64: b64e(raw), created_at: "2026-01-01T00:00:00.5Z", retired_at: "2026-10-21T05:00:00.999Z" }]) : env(k));
+  assertEquals([h.retired[0].created_at, h.retired[0].retired_at], ["2026-01-01T00:00:00Z", "2026-10-21T05:00:00Z"]);
+  const e: any = await attest(facts(), { signer: await envSigner(env), now: NOW });
+  // the current key retired at "...05:00:00.999Z" is published as "...05:00:00Z"; the official verifier accepts it (issued_at == retired_at)
+  const cur = (await keyHistory(env)).current;
+  const h2 = await keyHistory((k) => k === "SIGNING_KEY_HISTORY" ? JSON.stringify([{ public_key_b64: cur.public_key_b64, retired_at: "2026-10-21T05:00:00.999Z" }]) : env(k));
+  const iss = { keys: [h2.retired[0]] }; assertEquals(iss.keys[0].retired_at, "2026-10-21T05:00:00Z");
+  assertEquals((await officialVerify(e, iss, NOW))[0], true);
+});
+Deno.test("L1: official verifier rejects an unknown key status and an active key with retired_at", async () => {
+  const { keyHistory, envSigner } = await import("../lib/sign.ts");
+  const e: any = await attest(facts(), { signer: await envSigner(env), now: NOW }); const cur = (await keyHistory(env)).current;
+  assertEquals(await officialVerify(e, { keys: [cur] }, NOW), [true, `valid: key_id ${cur.key_id}, issued ${e.issued_at}, expires ${e.expires_at}`]);
+  assertEquals((await officialVerify(e, { keys: [{ ...cur, status: "revoked" }] }, NOW))[1], "unknown key status");
+  assertEquals((await officialVerify(e, { keys: [{ ...cur, retired_at: "2026-10-22T00:00:00Z" }] }, NOW))[1], "active key must not carry retired_at");
 });

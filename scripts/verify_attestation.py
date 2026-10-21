@@ -47,9 +47,12 @@ def verify(att, issuer, now=None, check_expiry=True, expected_key_id=None):
     iat, exp = ts(att.get("issued_at")), ts(att.get("expires_at"))
     if iat is None or exp is None: return False, "issued_at/expires_at unparseable"
     if exp < iat or exp - iat > 86400: return False, "validity window must be 0..86400 s"
-    if k.get("status") == "retired":
+    if k.get("status") == "active":
+        if "retired_at" in k: return False, "active key must not carry retired_at"
+    elif k.get("status") == "retired":
         r = ts(k.get("retired_at"))
         if r is None or iat > r: return False, "issued after key was retired"
+    else: return False, "unknown key status"
     msg = DOMAIN + rfc8785.dumps({x: v for x, v in att.items() if x != "signature"})
     try: eddsa.new(eddsa.import_public_key(raw), "rfc8032").verify(msg, base64.b64decode(sig["value_b64"], validate=True))
     except Exception: return False, "bad signature"
