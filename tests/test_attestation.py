@@ -258,5 +258,6 @@ class TIssuerDocDrift(unittest.TestCase):
         with self.assertRaises(TypeError): VA.verify(e, iss, now=NOW)  # keyword-only, no default
         self.assertEqual(VA.verify(e, iss, now=NOW, expected_key_id=None), (False, "no pinned key_id (expected_key_id is mandatory)"))
         self.assertTrue(VA.verify(e, iss, now=NOW, expected_key_id=s[0])[0])
+        for truthy in ("false", 1, "yes", [1]): self.assertEqual(VA.verify(e, iss, now=NOW, expected_key_id=None, allow_unpinned=truthy)[0], False, truthy)
 
 if __name__ == "__main__": unittest.main()

@@ -38,7 +38,7 @@ def verify(att, issuer, now=None, check_expiry=True, *, expected_key_id, allow_u
     WARNING: expected_key_id is mandatory. Take it, and the issuer document, from a source you trust (never from
     issuer.issuer_url inside the attestation). allow_unpinned=True skips the pin and exists for tests only; without a
     pin, anyone who can make you load their issuer document can make their own attestations verify."""
-    if expected_key_id is None and not allow_unpinned: return False, "no pinned key_id (expected_key_id is mandatory)"
+    if expected_key_id is None and allow_unpinned is not True: return False, "no pinned key_id (expected_key_id is mandatory)"
     if not isinstance(att, dict) or not isinstance(issuer, dict): return False, "attestation and issuer must be JSON objects"
     if att.get("spec") != "prepay-check-attestation" or att.get("version") != "1.0" or att.get("canonicalization") != "JCS":
         return False, "unsupported spec/version/canonicalization"
