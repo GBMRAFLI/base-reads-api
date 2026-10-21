@@ -9,7 +9,9 @@ import { CDP_HOST, enabled as cdpEnabled, headers as cdpHeaders } from "./lib/cd
 import * as SG from "./lib/settle_guard.ts";
 import * as LG from "./lib/ledger.ts";
 import { SCHEMA, snapshotDates, loadIndex, readSnapMeta, checkUrl, configureOutbound, hostOf } from "./lib/preflight.ts";
-import { guardConfig, ResultCache, WindowLimiter } from "./lib/guards.ts";
+import { guardConfig, ipv6Prefix48, ResultCache, WindowLimiter } from "./lib/guards.ts";
+import { OUTBOUND } from "./lib/preflight.ts";
+import { scheduleReorgCheck, sweepReorg, type ReorgRec } from "./lib/reorg.ts";
 import { isoOrNull, keyHistory, loadKey, publicKeyInfo, sign, signJcs, SigningUnavailable } from "./lib/sign.ts";
 import { CANON, CONTACT, ISSUER_NAME, SPEC, VERSION } from "./lib/attestation.ts";
 import ATT_SCHEMA from "../spec/prepay-check-attestation-v1.schema.json" with { type: "json" };
@@ -22,8 +24,7 @@ const USDCS: Record<string, string> = { "eip155:8453": "0x833589fCD6eDb6E08f4c7C
 export type Deps = { env: (k: string) => string | undefined; rpc?: Rpc; fac?: (p: string, body: unknown) => Promise<any>;
   resolver?: Resolver; fetcher?: Fetcher; background?: (p: Promise<unknown>) => void;
   check?: (tx: string, r: any, payer: string | undefined) => Promise<any>; ip?: string;
-  /** Delayed job runner for the post-delivery reorg re-check (A4); set by the server entrypoint, absent in most tests. */
-  schedule?: (ms: number, fn: () => Promise<void>) => void };
+ };
 const cfg = (env: Deps["env"]) => {
   const NETWORK = env("NETWORK") || "eip155:8453"; // empty NETWORK= means mainnet
   return { FAC: env("FACILITATOR") ?? "https://facilitator.payai.network", RPC: env("RPC") ?? "https://mainnet.base.org",
@@ -160,7 +161,11 @@ export async function snapshotMeta(env: Deps["env"] = (k) => Deno.env.get(k)) {
     if (!last_attempt_at) last_attempt_at = m?.last_attempt_at ?? null;
   }
   const lastSha = last ? ((await (await import("./lib/preflight.ts")).readSnapMeta(last))?.sha256 ?? null) : null;
-  const meta = { version: 1, started_at: dates[0] ?? null, last_updated: last, last_sha256: lastSha,
+  // L3: per-day content hashes of the recent snapshots are inside the signed meta, so a verifier can bind any recent
+  // attestation's snapshot_sha256 to a signed value (not only the newest day).
+  const { readSnapMeta: rsm } = await import("./lib/preflight.ts"); const snapshot_sha256: Record<string, string | null> = {};
+  for (const d of dates.slice(-30)) snapshot_sha256[d] = (await rsm(d))?.sha256 ?? null;
+  const meta = { version: 1, started_at: dates[0] ?? null, last_updated: last, last_sha256: lastSha, snapshot_sha256,
     last_attempt_at, total_snapshots: dates.length, covered_listings: covered,
     last_status: status, last_failed_pages: failed_pages, last_error };
   return { metadata: meta, signature: await signJcs(meta, env), pubkey_url: "/x402/preflight/pubkey" };
@@ -314,7 +319,11 @@ async function handleGet(req: Request, d: Deps): Promise<Response> {
   if (publicUrlError(env)) return send(503, { error: "public origin not configured" }); // mainnet without PUBLIC_URL: never use Host
   if (!sig) {
     // A6: unpaid 402s are pure computation (no DNS, GET or RPC) and limited per client IP.
-    if (d.ip && !abuse(env).unpaid.allow(SG.ipKey(d.ip) ?? d.ip)) return send(429, { error: "too many unpaid requests, retry later", scope: "ip" }, { "Retry-After": "60" });
+    // IPv6: per-/64 key plus a per-/48 aggregate, so a prefix spray is bounded without filling the per-client table.
+    const p48 = ipv6Prefix48(d.ip);
+    if (d.ip && (!abuse(env).unpaid.allow(SG.ipKey(d.ip) ?? d.ip) || (p48 !== null && !abuse(env).unpaid48.allow(p48)))) {
+      return send(429, { error: "too many unpaid requests, retry later", scope: "ip" }, { "Retry-After": "60" });
+    }
     const pr = required(path, req.headers.get("Host") ?? "", env); return send(402, pr, { "PAYMENT-REQUIRED": b64(pr) });
   }
   const [code, out, hd] = await paid(path, q, qs, sig, tReq, d, c, rpc, fac, req.headers.get("Host") ?? "");
@@ -322,15 +331,25 @@ async function handleGet(req: Request, d: Deps): Promise<Response> {
 }
 
 const FAILS = new SG.FailLimiter();
-type Abuse = { unpaid: WindowLimiter; perHost: WindowLimiter; cache: ResultCache<unknown> };
+type Abuse = { unpaid: WindowLimiter; unpaid48: WindowLimiter; hostPayer: WindowLimiter; perHost: WindowLimiter; cache: ResultCache<unknown>; probing: Set<string> };
 let ABUSE: Abuse | null = null;
 /** Per-process abuse guards (A6 unpaid limit, per-target outbound limit, A7 payer+target cache, outbound concurrency). */
 export function abuse(env: Deps["env"]): Abuse {
   if (!ABUSE) {
     const g = guardConfig(env); configureOutbound(g.outboundConcurrency);
-    ABUSE = { unpaid: new WindowLimiter(g.unpaidPerMin), perHost: new WindowLimiter(g.perHostPerMin), cache: new ResultCache(g.cacheTtlMs) };
+    ABUSE = { unpaid: new WindowLimiter(g.unpaidPerMin), unpaid48: new WindowLimiter(g.unpaidPer48PerMin), hostPayer: new WindowLimiter(g.hostPayerPerMin),
+      perHost: new WindowLimiter(g.perHostPerMin), cache: new ResultCache(g.cacheTtlMs), probing: new Set() };
   }
   return ABUSE;
+}
+/** A4 sweep with the production on-chain check; incidents go to the observations log. */
+export async function reorgSweep(env: Deps["env"], check?: (r: ReorgRec) => Promise<any>, now = Date.now()) {
+  const rpc = makeRpc(cfg(env).RPC);
+  const chk = check ?? ((x: ReorgRec) => verifyOnchain(rpc, x.tx, x.asset, x.payTo, x.amount, x.payer, x.network, 3, 1000, undefined, x.nonce, x.minConf));
+  return await sweepReorg(chk, async (x, why) => {
+    console.log("INCIDENT", why, x.path, x.tx);
+    await recordObservation(x.path, "incident", 0, null, why);
+  }, now);
 }
 export async function resetGuards() { await FAILS.clear(); ABUSE = null; }
 export const MAINNET = "eip155:8453";
@@ -399,23 +418,55 @@ async function paid(path: string, q: Record<string, string>, qs: string, sig: st
   const settleFirst = path === "/x402/preflight";
   const G = abuse(env);
   const cacheKey = (u: string) => who + "|" + u;
+  /** Probe the PAID url (or serve the payer+target cache, A7). The caller holds an outbound slot (M1). */
+  const runPreflight = async (u: string): Promise<[number, unknown]> => {
+    if (!u) return [400, { error: "give ?url=https://..." }];
+    const hit = G.cache.get(cacheKey(u)); if (hit) return [200, hit];
+    const ttlRaw = env("ATTESTATION_TTL_S") ?? ""; const ttl = /^[0-9]{1,6}$/.test(ttlRaw) ? Number(ttlRaw) : undefined; // normTtl: int >= 1 else 900
+    const res = await preflight(u, { resolver: d.resolver, fetcher: d.fetcher, env, rpc, ttlS: ttl, slotHeld: true,
+      issuerUrl: c.PUBLIC ? c.PUBLIC.replace(/\/+$/, "") + "/.well-known/issuer.json" : null });
+    if (res[0] === 200) G.cache.set(cacheKey(u), res[1]);
+    return res;
+  };
   const run = async (): Promise<[number, unknown]> => {
-    if (path === "/x402/preflight") {
-      const u = unquote(q.url ?? "");
-      const hit = u ? G.cache.get(cacheKey(u)) : null; // A7: same payer + target within 60 s: no new probe
-      if (hit) return [200, hit];
-      const ttlRaw = env("ATTESTATION_TTL_S") ?? ""; const ttl = /^[0-9]{1,6}$/.test(ttlRaw) ? Number(ttlRaw) : undefined; // normTtl: int >= 1 else 900
-      return u ? await preflight(u, { resolver: d.resolver, fetcher: d.fetcher, env, rpc, ttlS: ttl,
-        issuerUrl: c.PUBLIC ? c.PUBLIC.replace(/\/+$/, "") + "/.well-known/issuer.json" : null }).then((res) => { if (res[0] === 200) G.cache.set(cacheKey(u), res[1]); return res; })
-        : [400, { error: "give ?url=https://..." }];
-    }
+    if (path === "/x402/preflight") return await runPreflight(unquote(q.url ?? ""));
     return await new Chain(rpc, c.USDC).handle(path, q);
+  };
+  /** M1: reserve one global outbound slot and the payer's single probe slot, without waiting. null -> busy. */
+  const reserve = (): (() => void) | null => {
+    if (G.probing.has(who)) return null;
+    const rel = OUTBOUND.tryAcquire(); if (!rel) return null;
+    G.probing.add(who); let done = false;
+    return () => { if (done) return; done = true; G.probing.delete(who); rel(); };
+  };
+  const BUSY503: [number, unknown, Record<string, string>] = [503, { error: "probe capacity busy, retry shortly", charged: false }, { "Retry-After": "5" }];
+  /** Pending retry of a settled Pre-pay Check (L1): uses the url that was paid for, the per target+payer limit,
+   * the global per-target budget, an outbound slot, and at most 3 attempts. */
+  const MAX_TRIES = 3;
+  const retryPending = async (key: string, pend: any, oc: any): Promise<[number, unknown, Record<string, string>]> => {
+    const u: string = typeof pend.url === "string" ? pend.url : "";
+    const tries: number = Number.isInteger(pend.tries) ? pend.tries : 0;
+    if (!u || tries >= MAX_TRIES) {
+      bg(recordObservation(path, "incident", 0, null, "pending_retries_exhausted").catch(() => {}));
+      return [502, { error: "payment settled but the check could not be completed after " + MAX_TRIES + " attempts; contact support with your transaction", transaction: pend.tx }, payResp(N, true, pend.tx, who)];
+    }
+    const cached = G.cache.get(cacheKey(u));
+    if (!cached) {
+      if (!G.hostPayer.allow(hostOf(u) + "|" + who)) { await SG.setPending(key, pend); return [429, { error: "too many attempts for this target, retry later", scope: "target_payer", transaction: pend.tx }, { "Retry-After": "60" }]; }
+      if (!G.perHost.allow(hostOf(u))) { await SG.setPending(key, pend); return [202, { status: "settled_queued_target_budget", transaction: pend.tx, retry: "repeat the same request after 60 s" }, payResp(N, true, pend.tx, who)]; }
+    }
+    const slot = cached ? () => {} : reserve();
+    if (!slot) { await SG.setPending(key, pend); return [503, { error: "probe capacity busy, retry shortly", transaction: pend.tx }, { "Retry-After": "5" }]; }
+    let code = 0, out: unknown = null;
+    try { [code, out] = await runPreflight(u); } catch { code = 0; } finally { slot(); }
+    if (code !== 200) { await SG.setPending(key, { ...pend, tries: tries + 1 }); return [502, { error: "upstream error, retry the same request", transaction: pend.tx, attempts_left: MAX_TRIES - tries - 1 }, {}]; }
+    log(pend.tx, oc, true, pend.times); return [200, out, payResp(N, true, pend.tx, who)];
   };
   const busy: [number, unknown, Record<string, string>] = [429, { error: "too many concurrent payments, retry shortly", scope: "concurrency" }, {}];
   const release = await SG.acquireSlots({ ip: ids.ip }); // per-IP slot now; per-payer slot only after verify (L1)
   if (!release) return busy;
-  const held: { payer: (() => Promise<void>) | null } = { payer: null };
-  try { return await paidLocked(); } finally { if (held.payer) await held.payer(); await release(); }
+  const held: { payer: (() => Promise<void>) | null; slot: (() => void) | null } = { payer: null, slot: null };
+  try { return await paidLocked(); } finally { held.slot?.(); if (held.payer) await held.payer(); await release(); }
   async function paidLocked(): Promise<[number, unknown, Record<string, string>]> {
   const lim = await FAILS.blocked(ids); // checked while holding a slot: bursts cannot overshoot by more than the slot count
   if (lim) return [429, { error: "too many failed payments, retry later", scope: lim }, {}];
@@ -426,6 +477,7 @@ async function paid(path: string, q: Record<string, string>, qs: string, sig: st
       const oc: any = await check(pend.tx, r, who);
       if (oc.settled === null) { await SG.setPending(key, pend); return [202, { status: "settled_pending_onchain_confirmation", transaction: pend.tx }, payResp(N, true, pend.tx, who)]; }
       if (oc.settled === false) { log(pend.tx, oc, false, pend.times); return [402, { error: "settlement not confirmed on-chain: " + String(oc.reason) }, {}]; }
+      if (settleFirst) return await retryPending(key, pend, oc);
       let code: number, out: unknown;
       try { [code, out] = await run(); } catch { await SG.setPending(key, pend); return [502, { error: "upstream error, retry the same request" }, {}]; }
       if (code !== 200) { await SG.setPending(key, pend); return [code, out, {}]; }
@@ -450,8 +502,14 @@ async function paid(path: string, q: Record<string, string>, qs: string, sig: st
     if (!u) { await SG.unclaim(key); return [400, { error: "give ?url=https://...", charged: false }, {}]; }
     const chk = await checkUrl(u, d.resolver);
     if (!chk.u) { await SG.unclaim(key); return [400, { error: chk.err, target_url_allowed: false, charged: false }, {}]; }
-    if (!G.cache.get(cacheKey(u)) && !G.perHost.allow(hostOf(u))) {
-      await SG.unclaim(key); return [429, { error: "too many checks of this target in the last minute, retry later", scope: "target", charged: false }, { "Retry-After": "60" }];
+    if (!G.cache.get(cacheKey(u))) {
+      // H1: before settlement only a per target+payer limit applies; the global per-target budget is counted after settlement.
+      if (!G.hostPayer.allow(hostOf(u) + "|" + who)) {
+        await SG.unclaim(key); return [429, { error: "too many checks of this target by this payer in the last minute, retry later", scope: "target_payer", charged: false }, { "Retry-After": "60" }];
+      }
+      // M1: reserve the outbound slot now; if none is free, refuse before settlement (not charged).
+      held.slot = reserve();
+      if (!held.slot) { await SG.unclaim(key); return BUSY503; }
     }
   } else {
     try { [code, out] = await run(); } catch (e) {
@@ -460,28 +518,27 @@ async function paid(path: string, q: Record<string, string>, qs: string, sig: st
     }
     if (code !== 200) return [code, out, {}]; // bad input: not settled, not charged
   }
-  /** A4: some time after delivery, re-check the settlement; if it no longer holds (reorg), record an incident. Delivery stands. */
+  /** A4: persist a post-delivery settlement re-check in KV (survives restarts); the reorg-recheck cron processes it. */
   const watchReorg = (tx: string) => {
-    if (!d.schedule) return;
     const ms = /^[0-9]{1,7}$/.test(env("REORG_RECHECK_MS") ?? "") ? Number(env("REORG_RECHECK_MS")) : 120_000;
-    d.schedule(ms, async () => {
-      try {
-        const oc2: any = await check(tx, r, who);
-        if (oc2.settled !== true) {
-          console.log("INCIDENT post_delivery_reorg", path, tx);
-          await recordObservation(path, "incident", 0, null, "post_delivery_reorg:" + String(oc2.reason ?? oc2.settled));
-        }
-      } catch (e) { console.log("reorg re-check failed:", (e as Error).name); }
-    });
+    bg(scheduleReorgCheck({ path, tx, payer: who, asset: r.asset, payTo: r.payTo, amount: r.amount, nonce, network: N, minConf }, ms)
+      .catch((e) => console.log("reorg schedule failed:", (e as Error).name)));
   };
   /** Serve after settlement. Settle-first routes run the handler now; if it cannot finish, the payment is parked
    * and the same request is served on retry (pending path). */
   const deliver = async (tx: string, oc: any, times: [string, string, string]): Promise<[number, unknown, Record<string, string>]> => {
     if (settleFirst) {
+      const u = unquote(q.url ?? "");
+      // H1: the global per-target budget is counted only after a successful settlement; over budget -> queue, never refuse.
+      if (!G.cache.get(cacheKey(u)) && !G.perHost.allow(hostOf(u))) {
+        held.slot?.(); held.slot = null;
+        await SG.setPending(key, { path, tx, times, url: u, tries: 0 });
+        return [202, { status: "settled_queued_target_budget", transaction: tx, retry: "repeat the same request with the same payment header after 60 s" }, payResp(N, true, tx, who)];
+      }
       let ok = false;
-      try { [code, out] = await run(); ok = code === 200; } catch { ok = false; }
+      try { [code, out] = await runPreflight(u); ok = code === 200; } catch { ok = false; } finally { held.slot?.(); held.slot = null; }
       if (!ok) {
-        await SG.setPending(key, { path, tx, times });
+        await SG.setPending(key, { path, tx, times, url: u, tries: 1 });
         return [502, { error: "payment settled but the check could not complete; repeat the same request to receive it", transaction: tx }, payResp(N, true, tx, who)];
       }
     }
@@ -510,7 +567,8 @@ async function paid(path: string, q: Record<string, string>, qs: string, sig: st
   }
   if (oc.settled === true) return await deliver(tx, oc, times);
   if (oc.settled === null) {
-    await SG.setPending(key, { path, tx, times });
+    held.slot?.(); held.slot = null;
+    await SG.setPending(key, { path, tx, times, ...(settleFirst ? { url: unquote(q.url ?? ""), tries: 0 } : {}) });
     return [202, { status: "settled_pending_onchain_confirmation", transaction: tx,
       retry: "repeat the same request with the same payment header; it is served once the transfer is confirmed on Base" }, payResp(N, true, tx, who)];
   }
@@ -519,7 +577,6 @@ async function paid(path: string, q: Record<string, string>, qs: string, sig: st
 }
 }
 
-const SCHEDULE = (ms: number, fn: () => Promise<void>) => { const t = setTimeout(() => { fn().catch(() => {}); }, ms); Deno.unrefTimer(t); };
 /** Behind a local reverse proxy (TRUST_PROXY=1) the peer is loopback; use the last X-Forwarded-For hop the proxy appended. */
 /** Loopback: 127.0.0.0/8, ::1, and IPv4-mapped ::ffff:127.x.x.x. */
 export function isLoopback(ip: string) {
@@ -542,6 +599,7 @@ if (import.meta.main) {
   if ((env("SNAPSHOT_SCHEDULER") ?? "1") === "1") {
     Deno.cron("bazaar-snapshot", "15 0 * * *", async () => { await scheduledSnapshot(); }); // bounded, max once per UTC day
     Deno.cron("fail-counter-purge", "7 0 * * *", async () => { await FAILS.purge(); });
+    Deno.cron("reorg-recheck", "*/2 * * * *", async () => { await reorgSweep(env); }); // A4: persisted post-delivery re-checks
   }
   for (const w of startupWarnings(env)) console.warn("WARNING:", w);
   const lerr = LG.ledgerConfigError(env); if (lerr) throw new Error(lerr); // refuse to start without a durable ledger
@@ -550,5 +608,5 @@ if (import.meta.main) {
   if (mig.auth || mig.tx) console.log("ledger: imported", JSON.stringify(mig));
   assertOnchainMode(env); // refuse to start with ONCHAIN_CHECK=log on Base mainnet
   Deno.serve({ hostname: bindHost(env), port: Number(env("PORT") ?? 8000) },
-    (req, info) => handler(req, { env, ip: clientIp(req, (info.remoteAddr as Deno.NetAddr).hostname, env), schedule: SCHEDULE }));
+    (req, info) => handler(req, { env, ip: clientIp(req, (info.remoteAddr as Deno.NetAddr).hostname, env) }));
 }

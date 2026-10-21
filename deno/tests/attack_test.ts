@@ -1,7 +1,7 @@
 // Attack scenarios A1-A12 for the paid Pre-pay Check, plus outbound limits. Keys: repo throwaway test key (legacy
 // signature) and in-memory ephemeral keys; nothing here touches the network (resolver/fetcher/rpc/facilitator are stubs).
 import { assert, assertEquals } from "jsr:@std/assert@1";
-import { handler, reqFor, resetGuards } from "../main.ts";
+import { abuse, handler, reorgSweep, reqFor, resetGuards } from "../main.ts";
 import { useKv, rows, kv } from "../lib/store.ts";
 import { clearIndexCache, configureOutbound, IndexAssembler, OUTBOUND, preflight, readSnapMeta, saveIndex } from "../lib/preflight.ts";
 import { attest, verifyAttestation, type Signer } from "../lib/attestation.ts";
@@ -27,16 +27,19 @@ function rig(o: { settle?: () => any; chain?: { v: any }; fetchDelay?: number } 
   const resolver = async () => { n.dns++; return ["93.184.216.34"]; };
   const fetcher = async () => { n.fetch++; if (o.fetchDelay) await new Promise((r) => setTimeout(r, o.fetchDelay)); return new Response("{}", { status: 402, headers: { "PAYMENT-REQUIRED": btoa(JSON.stringify(CH())) } }); };
   const rpc = async () => { n.rpc++; return "0x"; };
-  const jobs: { ms: number; fn: () => Promise<void> }[] = [];
+  const bgs: Promise<unknown>[] = [];
   const call = async (sig: string | null, url = "https://t.example/x", ip = "198.51.100.7") => {
     const headers: Record<string, string> = sig ? { "PAYMENT-SIGNATURE": sig } : {};
     const res = await handler(new Request("http://h" + PATH + "?url=" + encodeURIComponent(url), { headers }),
-      { env, fac, rpc, resolver, fetcher: fetcher as any, check: async () => chain.v, background: () => {}, ip, schedule: (ms, fn) => { jobs.push({ ms, fn }); } });
+      { env, fac, rpc, resolver, fetcher: fetcher as any, check: async () => chain.v, background: (p) => { bgs.push(p); }, ip });
     return [res.status, await res.json()] as [number, any];
   };
-  return { n, call, jobs, chain };
+  return { n, call, bgs, chain, settle: (f: () => any) => { o.settle = f; } };
 }
-const fresh = async (over: Record<string, string> = {}) => { E = { ...BASE_ENV, ...over }; await resetGuards(); clearIndexCache(); };
+const fresh = async (over: Record<string, string> = {}) => {
+  E = { ...BASE_ENV, ...over }; await resetGuards(); clearIndexCache();
+  for await (const e of (await kv()).list({ prefix: ["reorg"] })) await (await kv()).delete(e.key);
+};
 
 Deno.test("A1 verified payment that is never settled -> 402 and the target is never probed (settle before probe)", async () => {
   await fresh();
@@ -46,7 +49,7 @@ Deno.test("A1 verified payment that is never settled -> 402 and the target is ne
   const t2 = rig({ chain: { v: { settled: false, reason: "nonce_not_in_settlement_tx" } } });
   assertEquals((await t2.call(pay()))[0], 402); assertEquals(t2.n.fetch, 0);
   const t3 = rig({ chain: { v: { settled: null } } }); assertEquals((await t3.call(pay()))[0], 202); assertEquals(t3.n.fetch, 0);
-  const t4 = rig(); assertEquals((await t4.call(pay()))[0], 200); assertEquals(t4.n.fetch, 1); // control: settled -> probed once
+  const t4 = rig(); assertEquals((await t4.call(pay(), "https://t4.example/x"))[0], 200); assertEquals(t4.n.fetch, 1); // control: settled -> probed once
 });
 Deno.test("A2 asset is not Base USDC -> rejected before verify/settle", async () => {
   await fresh(); const t = rig();
@@ -58,15 +61,19 @@ Deno.test("A3 network is not Base -> rejected before verify/settle", async () =>
   const [c, b] = await t.call(pay({ network: "eip155:1" })); assertEquals([c, b.error], [402, "accepted.network_mismatch"]);
   assertEquals([t.n.verify, t.n.settle, t.n.fetch], [0, 0, 0]);
 });
-Deno.test("A4 settle ok, delivered, then a simulated reorg -> incident logged, delivery stands", async () => {
-  await fresh({ REORG_RECHECK_MS: "1" }); const t = rig();
-  const [c, b] = await t.call(pay()); assertEquals(c, 200); assert(b.attestation);
-  assertEquals(t.jobs.length, 1); assertEquals(t.jobs[0].ms, 1);
-  t.chain.v = { settled: false, reason: "receipt_not_found" }; await t.jobs[0].fn(); // reorg: receipt gone
+Deno.test("A4 settle ok, delivered, then a simulated reorg -> incident logged, delivery stands (re-check persisted in KV)", async () => {
+  await fresh({ REORG_RECHECK_MS: "0" }); const t = rig();
+  const [c, b] = await t.call(pay()); assertEquals(c, 200); assert(b.attestation); await Promise.all(t.bgs);
+  const recs: any[] = []; for await (const e of (await kv()).list({ prefix: ["reorg"] })) recs.push(e.value);
+  assertEquals(recs.length, 1); // L2: persisted (survives a restart), not an in-memory timer
+  const done = await reorgSweep(env, async () => ({ settled: false, reason: "receipt_not_found" }), Date.now() + 1);
+  assertEquals(done, [recs[0].tx + ":incident"]);
   const inc = (await rows("observations.jsonl")).filter((r: any) => r.inputHash === "incident");
   assertEquals(inc.at(-1)?.note, "post_delivery_reorg:receipt_not_found");
-  const t2 = rig(); await t2.call(pay()); await t2.jobs[0].fn(); // no reorg: no new incident
-  assertEquals((await rows("observations.jsonl")).filter((r: any) => r.inputHash === "incident").length, inc.length);
+  const t2 = rig(); await t2.call(pay()); await Promise.all(t2.bgs);
+  assertEquals((await reorgSweep(env, async () => ({ settled: null }), Date.now() + 1)).at(-1)?.endsWith(":retry"), true); // not visible yet: retried later
+  const left = await reorgSweep(env, async () => ({ settled: true }), Date.now() + 600_000); assertEquals(left.length, 1); assert(left[0].endsWith(":ok"));
+  for await (const _ of (await kv()).list({ prefix: ["reorg"] })) throw new Error("records must be cleared");
 });
 Deno.test("A5 replay of the same payment header -> rejected (nonce ledger), settled once, probed once", async () => {
   await fresh(); const t = rig(); const sig = pay();
@@ -92,12 +99,69 @@ Deno.test("A7 pay once then 100 requests for the same target -> one probe; cache
   await new Promise((r) => setTimeout(r, 1100));
   assertEquals((await t.call(pay()))[0], 200); assertEquals(t.n.fetch, 2); // after TTL: probed again
 });
-Deno.test("per-target outbound budget per minute: over budget -> 429 before settlement (not charged)", async () => {
-  await fresh({ OUTBOUND_PER_HOST_PER_MIN: "3" }); const t = rig();
+Deno.test("H1 global per-target budget counts only settled checks; over budget after settlement -> queued (202), not refused", async () => {
+  await fresh({ OUTBOUND_PER_HOST_PER_MIN: "3", PER_TARGET_PAYER_PER_MIN: "100" });
+  const bad = rig({ settle: () => ({ success: false, errorReason: "unexpected_settle_error" }) });
+  for (let i = 0; i < 2; i++) assertEquals((await bad.call(pay(), "https://t.example/f" + i))[0], 402); // failed settles: no budget used
+  const t = rig();
   for (let i = 0; i < 3; i++) assertEquals((await t.call(pay(), "https://t.example/p" + i))[0], 200);
-  const [c, b] = await t.call(pay(), "https://t.example/p9"); assertEquals([c, b.scope, b.charged], [429, "target", false]);
-  assertEquals([t.n.settle, t.n.fetch], [3, 3]);
+  const sig = pay(); const [c, b] = await t.call(sig, "https://t.example/p9");
+  assertEquals([c, b.status], [202, "settled_queued_target_budget"]); assertEquals([t.n.settle, t.n.fetch], [4, 3]);
   assertEquals((await t.call(pay(), "https://other.example/p"))[0], 200); // other targets unaffected
+  abuse(env).perHost.allow("reset", 0); await resetGuards(); // budget window passes
+  const [c2, b2] = await t.call(sig, "https://t.example/p9"); assertEquals(c2, 200); assert(b2.attestation); assertEquals(t.n.settle, 5); // retry: no new settlement
+});
+Deno.test("H1 per target+payer limit before settlement: 3/min, then 429 not charged; other payers' budget unaffected", async () => {
+  await fresh(); const t = rig();
+  for (let i = 0; i < 3; i++) assertEquals((await t.call(pay(), "https://t.example/q" + i))[0], 200);
+  const [c, b] = await t.call(pay(), "https://t.example/q9"); assertEquals([c, b.scope, b.charged], [429, "target_payer", false]);
+  assertEquals(t.n.settle, 3);
+  assertEquals((await t.call(pay(), "https://u.example/q"))[0], 200);
+});
+Deno.test("M1 no free outbound slot -> 503 before settlement (not charged); one in-flight probe per payer", async () => {
+  await fresh(); configureOutbound(1); const t = rig({ fetchDelay: 80 });
+  const first = t.call(pay(), "https://m.example/a");
+  await new Promise((r) => setTimeout(r, 20));
+  const [c, b] = await t.call(pay(), "https://m2.example/b"); assertEquals([c, b.charged], [503, false]);
+  assertEquals((await first)[0], 200); assertEquals(t.n.settle, 1); assertEquals(OUTBOUND.active, 0);
+  configureOutbound(4); const t2 = rig({ fetchDelay: 80 });
+  const p1 = t2.call(pay(), "https://m3.example/a"); await new Promise((r) => setTimeout(r, 20));
+  const [c2, b2] = await t2.call(pay(), "https://m4.example/b"); assertEquals([c2, b2.charged], [503, false]); // same payer, slots free
+  assertEquals((await p1)[0], 200); assertEquals(t2.n.settle, 1);
+  const s = new Semaphore(1, 4); const r = s.tryAcquire()!; assertEquals(s.tryAcquire(), null); r(); assert(s.tryAcquire());
+});
+Deno.test("M2 full limiter table evicts the oldest key instead of refusing new clients; IPv6 /48 aggregate", async () => {
+  const w = new WindowLimiter(1, 60_000, 3);
+  for (const k of ["a", "b", "c"]) assert(w.allow(k, 0));
+  assert(w.allow("d", 1)); assertEquals(w.size, 3); // new client admitted; "a" evicted
+  assert(w.allow("a", 2)); assert(!w.allow("d", 3));
+  await fresh({ UNPAID_PER_48_PER_MIN: "5" }); const t = rig(); const codes: number[] = [];
+  for (let i = 0; i < 8; i++) codes.push((await t.call(null, "https://t.example/x", "2001:db8:1:" + (i + 1).toString(16) + "::1"))[0]);
+  assertEquals([codes.filter((c) => c === 402).length, codes.filter((c) => c === 429).length], [5, 3]);
+  assertEquals((await t.call(null, "https://t.example/x", "2001:db8:2::1"))[0], 402); // other /48 unaffected
+});
+Deno.test("L1 pending retry probes the paid url (not the retry query), at most 3 attempts", async () => {
+  await fresh(); let fail = true; const seen: string[] = [];
+  const t = rig(); const sig = pay();
+  const fetcher0 = async (u: string) => { seen.push(new URL(u).host); return new Response("{}", { status: 402 }); };
+  const call = async (url: string) => { const r = await handler(new Request("http://h" + PATH + "?url=" + encodeURIComponent(url), { headers: { "PAYMENT-SIGNATURE": sig } }),
+    { env, fac: async (p: string) => p === "/verify" ? { isValid: true } : { success: true, transaction: rnd(), payer: PAYER, network: "eip155:84532" },
+      rpc: async () => "0x", resolver: async (h: string) => { seen.push(h); if (fail && seen.length > 1) throw new Error("internal"); return ["93.184.216.34"]; }, fetcher: fetcher0 as any, check: async () => ({ settled: true }), background: () => {}, ip: "198.51.100.7" });
+    return [r.status, await r.json()] as [number, any]; };
+  void t;
+  assertEquals((await call("https://paid.example/x"))[0], 502);
+  assertEquals((await call("https://other.example/x"))[0], 502);
+  assert(seen.every((h) => h === "paid.example"), seen.join());
+  const [c3, b3] = await call("https://other.example/x"); assertEquals(c3, 502); assertEquals(b3.attempts_left, 0);
+  fail = false; const [c4, b4] = await call("https://paid.example/x"); assertEquals(c4, 502); assert(String(b4.error).includes("after 3 attempts"));
+  const inc = (await rows("observations.jsonl")).filter((r: any) => r.inputHash === "incident"); assertEquals(inc.at(-1)?.note, "pending_retries_exhausted");
+});
+Deno.test("L1 pending retries are subject to the per target+payer limit", async () => {
+  await fresh({ PER_TARGET_PAYER_PER_MIN: "1" }); const t = rig({ chain: { v: { settled: null } } }); const sig = pay();
+  assertEquals((await t.call(sig, "https://r.example/x"))[0], 202); // settled, not yet visible; parked with url (slot counted 1)
+  t.chain.v = { settled: true };
+  const [c, b] = await t.call(sig, "https://r.example/x"); assertEquals([c, b.scope], [429, "target_payer"]); assertEquals(t.n.fetch, 0);
+  await resetGuards(); assertEquals((await t.call(sig, "https://ignored.example/"))[0], 200); assertEquals(t.n.fetch, 1);
 });
 Deno.test("bounded outbound concurrency: never more than N probes in flight", async () => {
   await fresh(); configureOutbound(2); let live = 0, peak = 0;

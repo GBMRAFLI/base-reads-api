@@ -68,3 +68,16 @@ The Python server (`api/`) keeps its replay map, used-tx set and failed-settle c
 ## Open items
 - Python replay claims and pending deliveries are in process memory: a restart forgets them (the USDC contract still
   rejects a reused nonce on-chain, and the sales-log tx check survives restarts). Deno Deploy uses KV and is durable.
+
+## Re-audit hardening (paid Pre-pay Check)
+
+- Before settlement only a per target+payer limit applies (default 3/min, `PER_TARGET_PAYER_PER_MIN`). The global per-target budget (`OUTBOUND_PER_HOST_PER_MIN`) counts settled checks only; a settled check over that budget is queued (202) and served on retry, never refused.
+- An outbound slot is reserved before settlement without waiting; if none is free the request gets 503 and is not charged. At most one probe per payer is in flight.
+- Rate-limit tables evict the oldest key when full instead of refusing new clients. IPv6 clients are limited per /64 and per /48 aggregate (`UNPAID_PER_48_PER_MIN`, default 600).
+- A pending (settled, not yet delivered) check stores the paid URL; retries probe that URL only, at most 3 attempts, under the same limits.
+- Post-delivery settlement re-checks are persisted in KV (7-day expiry) and processed by a cron sweep every 2 minutes, so they survive restarts.
+- Signed snapshot metadata carries `snapshot_sha256` for the last 30 days. Limitation: the per-day hash is computed from the same KV that stores the snapshot, so it detects post-publication changes and inconsistent copies, not a compromise of the storage that wrote both.
+
+## Python reference implementation
+
+The Python code in `api/` is a reference implementation used for test vectors and cross-checks. It is not deployed and does not implement the paid-route abuse guards (settle-before-probe ordering, rate limits, outbound slots, pending retries, post-delivery re-checks). Only the Deno service under `deno/` serves traffic.

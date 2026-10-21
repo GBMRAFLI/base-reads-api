@@ -87,3 +87,7 @@ Steps (both official verifiers do all of them):
 5. Reject when now is after `expires_at` (unless explicitly ignored), or when the key was retired before `issued_at`.
 
 `test-vectors.json` holds JCS cases and one signed attestation (public key only) for cross-implementation tests.
+
+### Snapshot hash binding
+
+`/.well-known/bazaar-snapshot.json` signs `snapshot_sha256`, a map of date to content hash for the last 30 snapshots, so `claims.facts.bazaar.snapshot_sha256` of any recent attestation can be bound to a signed value. The hash is computed by the issuer from its own stored snapshot; it proves consistency with what the issuer published, not independent provenance of the Bazaar data.

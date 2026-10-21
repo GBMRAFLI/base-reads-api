@@ -406,14 +406,15 @@ export async function bazaarFacts(url: string, paytoList: string[], maxTrend = 1
 }
 
 export async function preflight(url: string, opts: { resolver?: Resolver; fetcher?: Fetcher; connect?: Connector; now?: number; env?: (k: string) => string | undefined;
-  rpc?: Rpc; signer?: Signer; issuerUrl?: string | null; ttlS?: number } = {}): Promise<[number, unknown]> {
+  rpc?: Rpc; signer?: Signer; issuerUrl?: string | null; ttlS?: number; slotHeld?: boolean } = {}): Promise<[number, unknown]> {
   const { u, err, ips } = await checkUrl(url, opts.resolver);
   if (!u) return [400, { error: err }];
   const base = { schema: SCHEMA, target: url, checked_at: isSoc(opts.now), disclaimer: "Deterministic observations only. Not advice to pay, buy or sell." };
   let reach: Record<string, unknown>, ch: any;
   if (err === "dns_unresolvable") { reach = { reachable: false, error_class: "dns_unresolvable" }; ch = null; }
   else {
-    const release = await OUTBOUND.acquire(); // bounded outbound concurrency (throws OutboundBusy when saturated)
+    // Bounded outbound concurrency. The paid route reserves its slot before settlement (slotHeld) and never waits here.
+    const release = opts.slotHeld ? () => {} : await OUTBOUND.acquire();
     try { [reach, ch] = await probe(u, PROBE_TIMEOUT_MS, opts.fetcher, ips?.[0], opts.connect); } finally { release(); }
   }
   const [valid, problems, acc] = validateChallenge(ch);
