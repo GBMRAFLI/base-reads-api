@@ -9,3 +9,4 @@ data/
 *.pem
 *.enc
 secrets/
+!static/reports/data/
