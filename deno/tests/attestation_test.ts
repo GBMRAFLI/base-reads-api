@@ -34,8 +34,8 @@ Deno.test("JCS vectors match Python rfc8785 byte for byte", () => {
 });
 Deno.test("Python-signed vector verifies in Deno (library and official script)", async () => {
   assertEquals((await verifyAttestation(V.signed.attestation, V.signed.public_key_b64, null)).ok, true);
-  assertEquals((await officialVerify(V.signed.attestation, V.signed.issuer, NOW))[0], true);
-  assertEquals((await officialVerify(V.signed.attestation, V.signed.issuer, NOW + 3600_000))[1], "expired at 2026-10-21T05:15:00Z");
+  assertEquals((await officialVerify(V.signed.attestation, V.signed.issuer, NOW, true, null, { allowUnpinned: true }))[0], true);
+  assertEquals((await officialVerify(V.signed.attestation, V.signed.issuer, NOW + 3600_000, true, null, { allowUnpinned: true }))[1], "expired at 2026-10-21T05:15:00Z");
 });
 Deno.test("envelope shape, TTL, signature, tamper and expiry", async () => {
   const k = await ephemeral(); const rpc = async () => "0x";
@@ -131,7 +131,7 @@ Deno.test("M1 domain separation: attestation, snapshot-meta and legacy signature
   const legacySig = await sigOver(kp.privateKey, new TextEncoder().encode(canonical(body)));
   assertEquals((await verifyAttestation({ ...body, signature: { ...e.signature, value_b64: legacySig } }, pub, NOW)).reason, "bad_signature");
   assert(!await v(legacySig, domainBytes(DOMAIN_SNAPSHOT_META, body)));
-  assertEquals((await officialVerify({ ...body, signature: { ...e.signature, value_b64: metaSig } }, { keys: [{ key_id: keyId, public_key_b64: pub, status: "active" }] }, NOW))[1], "bad signature");
+  assertEquals((await officialVerify({ ...body, signature: { ...e.signature, value_b64: metaSig } }, { keys: [{ key_id: keyId, public_key_b64: pub, status: "active" }] }, NOW, true, null, { allowUnpinned: true }))[1], "bad signature");
   assert((await verifyAttestation(e, pub, NOW)).ok);
 });
 Deno.test("L2 verifiers pin key_id and reject bad dates / windows", async () => {
@@ -140,16 +140,16 @@ Deno.test("L2 verifiers pin key_id and reject bad dates / windows", async () => 
   assertEquals((await verifyAttestation(e, other.pubB64, NOW)).reason, "key_id_mismatch");
   assertEquals((await verifyAttestation(e, k.pubB64, NOW, "0".repeat(16))).reason, "key_id_mismatch");
   assertEquals((await officialVerify(e, k.issuer, NOW, true, "0".repeat(16)))[0], false);
-  assertEquals((await officialVerify(e, { keys: [...k.issuer.keys, ...k.issuer.keys] }, NOW))[0], false);
+  assertEquals((await officialVerify(e, { keys: [...k.issuer.keys, ...k.issuer.keys] }, NOW, true, null, { allowUnpinned: true }))[0], false);
   const resign = async (o: any) => { o.signature.value_b64 = await k.signer.sign(signingBytes(o)).then(b64e); return o; };
   for (const [patch, why] of [[{ issued_at: "not-a-date" }, "bad_dates"], [{ expires_at: "2026-02-30T00:00:00Z" }, "bad_dates"],
     [{ expires_at: "2026-10-23T05:00:01Z" }, "bad_validity_window"], [{ expires_at: "2026-10-21T04:59:59Z" }, "bad_validity_window"]] as const) {
     const o = await resign({ ...structuredClone(e), ...patch }); assertEquals((await verifyAttestation(o, k.pubB64, NOW)).reason, why);
-    assertEquals((await officialVerify(o, k.issuer, NOW))[0], false);
+    assertEquals((await officialVerify(o, k.issuer, NOW, true, null, { allowUnpinned: true }))[0], false);
   }
   const fut = await resign({ ...structuredClone(e), issued_at: "2026-10-21T05:02:00Z", expires_at: "2026-10-21T05:10:00Z" });
   assertEquals((await verifyAttestation(fut, k.pubB64, NOW)).reason, "issued_in_future");
-  assertEquals((await officialVerify(fut, k.issuer, NOW))[1], "issued_at is in the future");
+  assertEquals((await officialVerify(fut, k.issuer, NOW, true, null, { allowUnpinned: true }))[1], "issued_at is in the future");
   const skew = await resign({ ...structuredClone(e), issued_at: "2026-10-21T05:00:59Z", expires_at: "2026-10-21T05:10:00Z" });
   assert((await verifyAttestation(skew, k.pubB64, NOW)).ok);
   const badIss = await resign({ ...structuredClone(e), issuer: { ...e.issuer, key_id: "f".repeat(16) } });
@@ -248,9 +248,9 @@ Deno.test("issuer.json rules alone verify real attestations; every documented ch
   await t.step("15 expect not_future", async () => { assertEquals(await VB(iss, e, { now: now - 120 }), "not_future"); });
   await t.step("16 expect not_expired", async () => { assertEquals(await VB(iss, e, { now: now + 901 }), "not_expired"); });
   // The official verifier agrees on the retired boundary and the key_id mismatch.
-  assertEquals((await officialVerify(e, retired(e.issued_at), NOW))[0], true);
-  assertEquals((await officialVerify(e, retired("2026-10-21T04:59:59Z"), NOW))[0], false);
-  assertEquals((await officialVerify({ ...e, issuer: { ...e.issuer, key_id: "0".repeat(16) } }, iss, NOW))[0], false);
+  assertEquals((await officialVerify(e, retired(e.issued_at), NOW, true, null, { allowUnpinned: true }))[0], true);
+  assertEquals((await officialVerify(e, retired("2026-10-21T04:59:59Z"), NOW, true, null, { allowUnpinned: true }))[0], false);
+  assertEquals((await officialVerify({ ...e, issuer: { ...e.issuer, key_id: "0".repeat(16) } }, iss, NOW, true, null, { allowUnpinned: true }))[0], false);
   const m: any = await (await handler(new Request("http://h.example/.well-known/bazaar-snapshot.json"), { env })).json();
   assert(await verifyMetaByIssuerDoc(iss, m)); assert(!await verifyMetaByIssuerDoc(iss, m, false));
 });
@@ -264,14 +264,14 @@ Deno.test("L2: published key timestamps are normalized to second precision and v
   const cur = (await keyHistory(env)).current;
   const h2 = await keyHistory((k) => k === "SIGNING_KEY_HISTORY" ? JSON.stringify([{ public_key_b64: cur.public_key_b64, retired_at: "2026-10-21T05:00:00.999Z" }]) : env(k));
   const iss = { keys: [h2.retired[0]] }; assertEquals(iss.keys[0].retired_at, "2026-10-21T05:00:00Z");
-  assertEquals((await officialVerify(e, iss, NOW))[0], true);
+  assertEquals((await officialVerify(e, iss, NOW, true, null, { allowUnpinned: true }))[0], true);
 });
 Deno.test("L1: official verifier rejects an unknown key status and an active key with retired_at", async () => {
   const { keyHistory, envSigner } = await import("../lib/sign.ts");
   const e: any = await attest(facts(), { signer: await envSigner(env), now: NOW }); const cur = (await keyHistory(env)).current;
-  assertEquals(await officialVerify(e, { keys: [cur] }, NOW), [true, `valid: key_id ${cur.key_id}, issued ${e.issued_at}, expires ${e.expires_at}`]);
-  assertEquals((await officialVerify(e, { keys: [{ ...cur, status: "revoked" }] }, NOW))[1], "unknown key status");
-  assertEquals((await officialVerify(e, { keys: [{ ...cur, retired_at: "2026-10-22T00:00:00Z" }] }, NOW))[1], "active key must not carry retired_at");
+  assertEquals(await officialVerify(e, { keys: [cur] }, NOW, true, null, { allowUnpinned: true }), [true, `valid: key_id ${cur.key_id}, issued ${e.issued_at}, expires ${e.expires_at}`]);
+  assertEquals((await officialVerify(e, { keys: [{ ...cur, status: "revoked" }] }, NOW, true, null, { allowUnpinned: true }))[1], "unknown key status");
+  assertEquals((await officialVerify(e, { keys: [{ ...cur, retired_at: "2026-10-22T00:00:00Z" }] }, NOW, true, null, { allowUnpinned: true }))[1], "active key must not carry retired_at");
 });
 Deno.test("MEDIUM: attacker-hosted issuer + attestation signed with the attacker's key is rejected", async () => {
   const legit = (await (await handler(new Request("http://h.example/.well-known/issuer.json"), { env })).json());
@@ -290,4 +290,9 @@ Deno.test("MEDIUM: attacker-hosted issuer + attestation signed with the attacker
   }
   assertEquals((await officialVerify(e, legit, Date.now(), true, legitKid))[0], false);
   await Deno.remove(d, { recursive: true });
+});
+Deno.test("L1: library verify() refuses without a pinned key_id unless allowUnpinned (tests only)", async () => {
+  const k = await ephemeral(); const e: any = await attest(facts(), { signer: k.signer, now: NOW });
+  assertEquals(await officialVerify(e, k.issuer, NOW, true, null), [false, "no pinned key_id (expectedKeyId is mandatory)"]);
+  assertEquals((await officialVerify(e, k.issuer, NOW, true, k.signer.keyId))[0], true);
 });

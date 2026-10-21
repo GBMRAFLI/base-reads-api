@@ -78,6 +78,9 @@ Verify with the key from `keys[]` of an issuer.json you fetched yourself (never 
 and a pinned `key_id` (mandatory; `--key-id`), never `signature.public_key_b64`, and run the checks in
 `signing.check_order`, stopping at the first failure. `scripts/verify_attestation.{py,ts}` implement them. Details: `spec/README.md`.
 
+Published signing key (second pin source; public data, the same values as `/.well-known/issuer.json`):
+`key_id` `72cb9da845cc948f`, fingerprint `SHA256:csudqEXMlI/dQFGjVQ5N2hl9R3/wXZXyP551gsX7Mz0`. If the key is rotated,
+this line is updated in the same release.
 Hook examples for the official clients: `examples/ts/preflight-hook.ts`, `examples/python/preflight_hook.py`.
 
 ## Facilitator

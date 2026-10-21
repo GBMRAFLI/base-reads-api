@@ -99,3 +99,9 @@ The Python code in `api/` is a reference implementation used for test vectors an
 - Failed settlements are counted per network (IPv4 /24, IPv6 /48; `FAILED_SETTLE_PER_NET_PER_MIN`, default 10). While a network is over that count, only the IPs and payers in it that themselves failed a settlement in the last minute are refused (429, before verification); other buyers on the same network are never affected. This limit only slows repeat offenders: a sender that rotates IPs or payers is never refused by it, which is harmless because a failed settlement is never charged and the probe slot is released immediately.
 - The slot is extended to 20 seconds when the probe starts, covering the probe timeout (5 s) and the attestation `eth_getCode` lookups (5 s timeout each, run in parallel), so it cannot lapse mid-probe.
 - If a cached result expired between the pre-check and delivery, the free retry takes a target budget unit before probing; without one it is re-parked (503, no new charge).
+
+## Signing key pin
+
+Published signing key (second pin source; public data, the same values as `/.well-known/issuer.json`):
+`key_id` `72cb9da845cc948f`, fingerprint `SHA256:csudqEXMlI/dQFGjVQ5N2hl9R3/wXZXyP551gsX7Mz0`. If the key is rotated,
+this line is updated in the same release.

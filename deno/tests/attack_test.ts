@@ -235,7 +235,7 @@ Deno.test("A12 an attestation from yesterday -> rejected (expires_at passed) by 
   const y: any = await attest(facts, { signer, now: Date.now() - 86400_000 });
   assertEquals((await verifyAttestation(y, pub)).reason, "expired");
   const iss = { keys: [{ key_id: kid, public_key_b64: pub, status: "active" }] };
-  assert((await officialVerify(y, iss))[1].startsWith("expired at "));
+  assert((await officialVerify(y, iss, Date.now(), true, null, { allowUnpinned: true }))[1].startsWith("expired at "));
   const d = await Deno.makeTempDir(); await Deno.writeTextFile(d + "/a.json", JSON.stringify(y)); await Deno.writeTextFile(d + "/i.json", JSON.stringify(iss));
   const py = await new Deno.Command("python3", { args: [new URL("../../scripts/verify_attestation.py", import.meta.url).pathname, d + "/a.json", "--issuer", d + "/i.json", "--key-id", kid], stdout: "piped" }).output();
   assertEquals(py.code, 1); assert(new TextDecoder().decode(py.stdout).startsWith("FAIL expired at "));

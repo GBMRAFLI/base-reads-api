@@ -39,11 +39,16 @@ async function load(src: string): Promise<any> {
   if (/^https?:\/\//.test(src)) return strictParse(await (await fetch(src, { headers: { Accept: "application/json" }, signal: AbortSignal.timeout(15000) })).text());
   return strictParse(src === "-" ? new TextDecoder().decode(await new Response(Deno.stdin.readable).arrayBuffer()) : await Deno.readTextFile(src));
 }
-export async function verify(att: any, issuer: any, now = Date.now(), checkExpiry = true, expectedKeyId?: string): Promise<[boolean, string]> {
+/** Verify one attestation against an issuer document.
+ * WARNING: expectedKeyId is mandatory. Take it, and the issuer document, from a source you trust (never from
+ * issuer.issuer_url inside the attestation). opts.allowUnpinned with expectedKeyId null exists for tests only; without
+ * a pin, anyone who can make you load their issuer document can make their own attestations verify. */
+export async function verify(att: any, issuer: any, now: number, checkExpiry: boolean, expectedKeyId: string | null, opts: { allowUnpinned?: boolean } = {}): Promise<[boolean, string]> {
+  if (expectedKeyId === null && opts.allowUnpinned !== true) return [false, "no pinned key_id (expectedKeyId is mandatory)"];
   if (!att || typeof att !== "object" || Array.isArray(att) || !issuer || typeof issuer !== "object") return [false, "attestation and issuer must be JSON objects"];
   if (att.spec !== "prepay-check-attestation" || att.version !== "1.0" || att.canonicalization !== "JCS") return [false, "unsupported spec/version/canonicalization"];
   const sig = att.signature; if (!sig || sig.alg !== "Ed25519" || typeof sig.value_b64 !== "string") return [false, "bad signature block"];
-  if (expectedKeyId !== undefined && sig.key_id !== expectedKeyId) return [false, "signature.key_id is not the expected key"];
+  if (expectedKeyId !== null && sig.key_id !== expectedKeyId) return [false, "signature.key_id is not the expected key"];
   if (att.issuer?.key_id !== sig.key_id) return [false, "issuer.key_id differs from signature.key_id"];
   const ks = (Array.isArray(issuer.keys) ? issuer.keys : []).filter((x: any) => x?.key_id === sig.key_id);
   if (ks.length !== 1) return [false, "signature.key_id not listed exactly once by issuer"];
@@ -86,7 +91,7 @@ if (import.meta.main) {
   if (!issuerSrc) { console.log("no issuer document: pass --issuer (the attestation's own issuer_url is never trusted)"); Deno.exit(2); }
   if (!keyId) { console.log("no pinned key: pass --key-id (pinning the expected key_id is mandatory)"); Deno.exit(2); }
   let iss: any; try { iss = await load(issuerSrc!); } catch (e) { console.log("FAIL issuer: " + (e as Error).message); Deno.exit(1); }
-  let [ok, why] = await verify(att, iss, Date.now(), checkExpiry, keyId);
+  let [ok, why] = await verify(att, iss, Date.now(), checkExpiry, keyId!);
   if (ok && snapSrc) { let sd: any; try { sd = await load(snapSrc); } catch (e) { console.log("FAIL snapshots: " + (e as Error).message); Deno.exit(1); } const [o2, w2] = verifySnapshotBinding(att, sd); if (!o2) [ok, why] = [false, w2]; else why += "; " + w2; }
   console.log((ok ? "OK " : "FAIL ") + why); Deno.exit(ok ? 0 : 1);
 }

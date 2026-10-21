@@ -84,9 +84,6 @@ deno run --allow-net --allow-read scripts/verify_attestation.ts response.json --
 yourself and pin the `key_id`). The verifiers never use `issuer.issuer_url` from the attestation: whoever produced the
 attestation also chose that URL, so an attacker could point it at their own issuer document and key.
 
-```
-```
-
 Steps, in this order (both official verifiers do all of them, stop at the first failure and report it; the same list
 is served machine-readably as `signing.check_order` and `verify[]` in `/.well-known/issuer.json`):
 0. Parse JSON strictly (duplicate object keys are rejected).

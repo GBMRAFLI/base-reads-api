@@ -25,8 +25,8 @@ class TA(unittest.TestCase):
     def test_jcs_vectors(self):
         for c in V["jcs"]: self.assertEqual(AT.jcs(c["input"]).decode(), c["canonical"])
         self.assertEqual(AT.signing_bytes(V["signed"]["attestation"]).decode(), V["signed"]["signing_bytes_utf8"])
-        ok, why = VA.verify(V["signed"]["attestation"], V["signed"]["issuer"], now=NOW); self.assertTrue(ok, why)
-        self.assertEqual(VA.verify(V["signed"]["attestation"], V["signed"]["issuer"], now=NOW + 3600), (False, "expired at 2026-10-21T05:15:00Z"))
+        ok, why = VA.verify(V["signed"]["attestation"], V["signed"]["issuer"], now=NOW, expected_key_id=None, allow_unpinned=True); self.assertTrue(ok, why)
+        self.assertEqual(VA.verify(V["signed"]["attestation"], V["signed"]["issuer"], now=NOW + 3600, expected_key_id=None, allow_unpinned=True), (False, "expired at 2026-10-21T05:15:00Z"))
     def test_envelope_sign_verify_tamper(self):
         s, pub, iss = ephemeral()
         e = AT.attest(facts(), s, rpc=lambda m, p: "0x", now=NOW, ttl_s=600, issuer_url="https://i.example/.well-known/issuer.json")
@@ -34,10 +34,10 @@ class TA(unittest.TestCase):
         self.assertEqual((e["issued_at"], e["expires_at"], e["issuer"]["contact"]), ("2026-10-21T05:00:00Z", "2026-10-21T05:10:00Z", "gbmrafli@agentmail.to"))
         self.assertEqual(AT.verify(e, pub, now=NOW), (True, None)); self.assertEqual(AT.verify(e, pub, now=NOW + 601), (False, "expired"))
         t = json.loads(json.dumps(e)); t["claims"]["facts"]["target"] = "https://x.example/"; self.assertEqual(AT.verify(t, pub, now=NOW), (False, "bad_signature"))
-        self.assertTrue(VA.verify(e, iss, now=NOW)[0])
+        self.assertTrue(VA.verify(e, iss, now=NOW, expected_key_id=None, allow_unpinned=True)[0])
         retired = {"keys": [dict(iss["keys"][0], status="retired", retired_at="2026-10-01T00:00:00Z")]}
-        self.assertEqual(VA.verify(e, retired, now=NOW), (False, "issued after key was retired"))
-        self.assertEqual(VA.verify(e, {"keys": []}, now=NOW), (False, "signature.key_id not listed exactly once by issuer"))
+        self.assertEqual(VA.verify(e, retired, now=NOW, expected_key_id=None, allow_unpinned=True), (False, "issued after key was retired"))
+        self.assertEqual(VA.verify(e, {"keys": []}, now=NOW, expected_key_id=None, allow_unpinned=True), (False, "signature.key_id not listed exactly once by issuer"))
         try: import jsonschema
         except ImportError: jsonschema = None
         if jsonschema: jsonschema.validate(e, SCHEMA)
@@ -88,20 +88,20 @@ class TFix(unittest.TestCase):
         for s_ in (meta_sig, legacy_sig):
             forged = dict(body, signature=dict(e["signature"], value_b64=base64.b64encode(s_).decode()))
             self.assertEqual(AT.verify(forged, pub, now=NOW), (False, "bad_signature"))
-            self.assertEqual(VA.verify(forged, {"keys": [{"key_id": kid, "public_key_b64": pub, "status": "active"}]}, now=NOW), (False, "bad signature"))
+            self.assertEqual(VA.verify(forged, {"keys": [{"key_id": kid, "public_key_b64": pub, "status": "active"}]}, now=NOW, expected_key_id=None, allow_unpinned=True), (False, "bad signature"))
         self.assertRaises(ValueError, ver, legacy_sig, AT.domain_bytes(AT.DOMAIN_SNAPSHOT_META, body))
     def test_l2_pinning_and_dates(self):
         s, pub, iss = ephemeral(); _, pub2, _ = ephemeral(); kid, sg = s
         e = AT.attest(facts(), s, now=NOW)
         self.assertEqual(AT.verify(e, pub2, now=NOW), (False, "key_id_mismatch")); self.assertEqual(AT.verify(e, pub, now=NOW, expected_key_id="0" * 16), (False, "key_id_mismatch"))
-        self.assertFalse(VA.verify(e, iss, now=NOW, expected_key_id="0" * 16)[0]); self.assertFalse(VA.verify(e, {"keys": iss["keys"] * 2}, now=NOW)[0])
+        self.assertFalse(VA.verify(e, iss, now=NOW, expected_key_id="0" * 16)[0]); self.assertFalse(VA.verify(e, {"keys": iss["keys"] * 2}, now=NOW, expected_key_id=None, allow_unpinned=True)[0])
         def resign(**p):
             o = json.loads(json.dumps(e)); o.update(p); o["signature"]["value_b64"] = base64.b64encode(sg(AT.signing_bytes(o))).decode(); return o
         for p_, why in (({"issued_at": "nan"}, "bad_dates"), ({"expires_at": "2026-02-30T00:00:00Z"}, "bad_dates"),
                         ({"expires_at": "2026-10-23T05:00:01Z"}, "bad_validity_window"), ({"expires_at": "2026-10-21T04:59:59Z"}, "bad_validity_window")):
-            o = resign(**p_); self.assertEqual(AT.verify(o, pub, now=NOW), (False, why)); self.assertFalse(VA.verify(o, iss, now=NOW)[0])
+            o = resign(**p_); self.assertEqual(AT.verify(o, pub, now=NOW), (False, why)); self.assertFalse(VA.verify(o, iss, now=NOW, expected_key_id=None, allow_unpinned=True)[0])
         fut = resign(issued_at="2026-10-21T05:02:00Z", expires_at="2026-10-21T05:10:00Z")
-        self.assertEqual(AT.verify(fut, pub, now=NOW), (False, "issued_in_future")); self.assertEqual(VA.verify(fut, iss, now=NOW)[1], "issued_at is in the future")
+        self.assertEqual(AT.verify(fut, pub, now=NOW), (False, "issued_in_future")); self.assertEqual(VA.verify(fut, iss, now=NOW, expected_key_id=None, allow_unpinned=True)[1], "issued_at is in the future")
         self.assertTrue(AT.verify(resign(issued_at="2026-10-21T05:00:59Z", expires_at="2026-10-21T05:10:00Z"), pub, now=NOW)[0])
     def test_l3_ttl(self):
         self.assertEqual([AT.norm_ttl(x) for x in (1, 600, 10 ** 9, 0, -5, 1.5, float("nan"), "600", None, True)], [1, 600, 86400, 900, 900, 900, 900, 900, 900, 900])
@@ -138,7 +138,7 @@ class TAttack(unittest.TestCase):
         self.assertEqual(VA.verify_snapshot_binding(e, {"snapshots": [{"date": "2026-10-20", "sha256": "b" * 64}]}), (False, "snapshot hash does not match the published snapshot"))
         self.assertFalse(VA.verify_snapshot_binding(e, {"snapshots": []})[0])
         y = AT.attest(facts(), s, now=NOW - 86400)
-        self.assertEqual(VA.verify(y, iss, now=NOW)[1], "expired at 2026-10-20T05:15:00Z"); self.assertEqual(AT.verify(y, pub, now=NOW), (False, "expired"))
+        self.assertEqual(VA.verify(y, iss, now=NOW, expected_key_id=None, allow_unpinned=True)[1], "expired at 2026-10-20T05:15:00Z"); self.assertEqual(AT.verify(y, pub, now=NOW), (False, "expired"))
 class TIssuerDocDrift(unittest.TestCase):
     """Verify real attestations and real snapshot meta using ONLY the rules read from the served issuer.json."""
     @staticmethod
@@ -213,18 +213,18 @@ class TIssuerDocDrift(unittest.TestCase):
         with self.subTest("15 expect not_future"): self.assertEqual(V(now=NOW - 120), "not_future")
         with self.subTest("16 expect not_expired"): self.assertEqual(V(now=NOW + 901), "not_expired")
         # official verifier agrees on the retired boundary and the key_id mismatch
-        self.assertTrue(VA.verify(e, ret(e["issued_at"]), now=NOW)[0])
-        self.assertFalse(VA.verify(e, ret("2026-10-21T04:59:59Z"), now=NOW)[0])
-        self.assertFalse(VA.verify(dict(e, issuer=dict(e["issuer"], key_id="0" * 16)), iss, now=NOW)[0])
+        self.assertTrue(VA.verify(e, ret(e["issued_at"]), now=NOW, expected_key_id=None, allow_unpinned=True)[0])
+        self.assertFalse(VA.verify(e, ret("2026-10-21T04:59:59Z"), now=NOW, expected_key_id=None, allow_unpinned=True)[0])
+        self.assertFalse(VA.verify(dict(e, issuer=dict(e["issuer"], key_id="0" * 16)), iss, now=NOW, expected_key_id=None, allow_unpinned=True)[0])
         m = json.loads(json.dumps(IX.snapshot_meta()))
         self.assertTrue(self._meta(iss, m)); self.assertFalse(self._meta(iss, m, prefix=False))
 
     def test_l1_official_verifier_key_status(self):
         k = PF.load_or_create_key(); cur = PF.key_history()["current"]
         e = json.loads(json.dumps(AT.attest(facts(), (cur["key_id"], lambda m: eddsa.new(k, "rfc8032").sign(m)), rpc=lambda m, p: "0x", now=NOW)))
-        self.assertTrue(VA.verify(e, {"keys": [cur]}, now=NOW)[0])
-        self.assertEqual(VA.verify(e, {"keys": [dict(cur, status="revoked")]}, now=NOW), (False, "unknown key status"))
-        self.assertEqual(VA.verify(e, {"keys": [dict(cur, retired_at="2026-10-22T00:00:00Z")]}, now=NOW), (False, "active key must not carry retired_at"))
+        self.assertTrue(VA.verify(e, {"keys": [cur]}, now=NOW, expected_key_id=None, allow_unpinned=True)[0])
+        self.assertEqual(VA.verify(e, {"keys": [dict(cur, status="revoked")]}, now=NOW, expected_key_id=None, allow_unpinned=True), (False, "unknown key status"))
+        self.assertEqual(VA.verify(e, {"keys": [dict(cur, retired_at="2026-10-22T00:00:00Z")]}, now=NOW, expected_key_id=None, allow_unpinned=True), (False, "active key must not carry retired_at"))
     def test_l2_key_timestamps_second_precision(self):
         self.assertEqual(PF.iso_or_none("2026-10-14T12:00:21.251Z"), "2026-10-14T12:00:21Z")
         k = PF.load_or_create_key(); cur = PF.key_history()["current"]
@@ -236,7 +236,7 @@ class TIssuerDocDrift(unittest.TestCase):
             else: os.environ["SIGNING_KEY_HISTORY"] = old
         self.assertEqual((r["created_at"], r["retired_at"]), ("2026-01-01T00:00:00Z", "2026-10-21T05:00:00Z"))
         e = json.loads(json.dumps(AT.attest(facts(), (cur["key_id"], lambda m: eddsa.new(k, "rfc8032").sign(m)), rpc=lambda m, p: "0x", now=NOW)))
-        self.assertTrue(VA.verify(e, {"keys": [r]}, now=NOW)[0])  # issued_at == normalized retired_at
+        self.assertTrue(VA.verify(e, {"keys": [r]}, now=NOW, expected_key_id=None, allow_unpinned=True)[0])  # issued_at == normalized retired_at
 
     def test_medium_attacker_issuer_rejected(self):
         """Attacker-hosted issuer + attestation signed with the attacker's key (issuer_url points at the attacker) -> rejected."""
@@ -252,5 +252,11 @@ class TIssuerDocDrift(unittest.TestCase):
         self.assertEqual(run("--issuer", d + "/evil_issuer.json"), 2)  # no --key-id: pin is mandatory
         self.assertEqual(run("--issuer", d + "/evil_issuer.json", "--key-id", legit_kid), 1)
         self.assertFalse(VA.verify(e, json.loads(json.dumps(IX.issuer_doc())), now=time.time(), expected_key_id=legit_kid)[0])
+
+    def test_l1_library_pin_mandatory(self):
+        s, pub, iss = ephemeral(); e = json.loads(json.dumps(AT.attest(facts(), s, rpc=lambda m, p: "0x", now=NOW)))
+        with self.assertRaises(TypeError): VA.verify(e, iss, now=NOW)  # keyword-only, no default
+        self.assertEqual(VA.verify(e, iss, now=NOW, expected_key_id=None), (False, "no pinned key_id (expected_key_id is mandatory)"))
+        self.assertTrue(VA.verify(e, iss, now=NOW, expected_key_id=s[0])[0])
 
 if __name__ == "__main__": unittest.main()
