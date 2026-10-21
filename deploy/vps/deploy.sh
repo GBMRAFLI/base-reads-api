@@ -14,7 +14,7 @@ SSH_OPTS="${SSH_OPTS:-}"; KEEP_RELEASES="${KEEP_RELEASES:-5}"
 ROOT="$(git rev-parse --show-toplevel)"
 SHA=$(git -C "$ROOT" rev-parse --short "$REF"); ID="$SHA-$(date -u +%Y%m%d%H%M%S)"
 tmp=$(mktemp -d); trap 'rm -rf "$tmp"' EXIT
-git -C "$ROOT" archive --format=tar "$REF" deno deploy/vps | tar -x -C "$tmp"
+git -C "$ROOT" archive --format=tar "$REF" deno deploy/vps spec | tar -x -C "$tmp"
 # fresh directory per deploy (same SHA included); never sync into the live release
 rsync -a -e "ssh $SSH_OPTS" "$tmp/" "$TARGET:/opt/base-reads/.incoming-$ID/"
 ssh $SSH_OPTS "$TARGET" bash -s -- "$ID" "$KEEP_RELEASES" "$RESTORE_KV" <<'REMOTE'
