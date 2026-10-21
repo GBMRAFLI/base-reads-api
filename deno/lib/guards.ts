@@ -20,7 +20,9 @@ export class WindowLimiter {
   /** True if allow(key) would succeed now (no count taken). */
   peek(key: string, now = Date.now()): boolean { const e = this.m.get(key); return !e || now - e.start >= this.windowMs || e.n < this.limit; }
   /** Return one unit taken by allow(key) in the current window (a reservation that was not used). */
-  release(key: string, now = Date.now()) { const e = this.m.get(key); if (e && now - e.start < this.windowMs && e.n > 0) e.n--; }
+  release(key: string, start: number, now = Date.now()) { const e = this.m.get(key); if (e && e.start === start && now - e.start < this.windowMs && e.n > 0) e.n--; }
+  /** Start of the key's current window (bind a reservation to it, so a release after a rollover is a no-op). */
+  windowStart(key: string): number | null { return this.m.get(key)?.start ?? null; }
   get size() { return this.m.size; }
   private prune(now: number) { for (const [k, e] of this.m) { if (now - e.start >= this.windowMs) this.m.delete(k); else break; } } // ordered by window start
   clear() { this.m.clear(); }
@@ -77,5 +79,36 @@ export function ipv6Prefix48(ip: string | null | undefined): string | null {
 export function guardConfig(env: (k: string) => string | undefined) {
   return { unpaidPerMin: posInt(env("UNPAID_PER_MIN"), 60), unpaidPer48PerMin: posInt(env("UNPAID_PER_48_PER_MIN"), 600),
     hostPayerPerMin: posInt(env("PER_TARGET_PAYER_PER_MIN"), 3), perHostPerMin: posInt(env("OUTBOUND_PER_HOST_PER_MIN"), 10),
-    outboundConcurrency: posInt(env("OUTBOUND_MAX_CONCURRENCY"), 4), cacheTtlMs: posInt(env("PREFLIGHT_CACHE_TTL_S"), 60) * 1000 };
+    outboundConcurrency: posInt(env("OUTBOUND_MAX_CONCURRENCY"), 4), cacheTtlMs: posInt(env("PREFLIGHT_CACHE_TTL_S"), 60) * 1000,
+    slotTtlMs: posInt(env("PROBE_SLOT_TTL_S"), 15) * 1000, failedSettlePerNetPerMin: posInt(env("FAILED_SETTLE_PER_NET_PER_MIN"), 10) };
+}
+/** Network key for failed-settle limits: IPv4 /24, IPv6 /48. */
+export function netKey(ip: string | null | undefined): string | null {
+  if (!ip) return null; const p = ipv6Prefix48(ip); if (p) return p;
+  const m = ip.match(/^(\d+)\.(\d+)\.(\d+)\.\d+$/); return m ? m[1] + "." + m[2] + "." + m[3] + ".0/24" : null;
+}
+
+/** Clock for probe slots (overridable in tests). */
+export const clock = { now: () => Date.now() };
+/** Signed snapshot meta cache epoch: bumped whenever a snapshot is saved or a scheduled snapshot ends (L1). */
+export const metaEpoch = { v: 0, bump() { this.v++; } };
+export type SlotResult = { id: string } | "payer_busy" | "full";
+/** Paid probe slots. reserve() is one synchronous step (atomic in the single-process server): purge expired, refuse if
+ * the payer already holds a live slot (one per payer), refuse if all slots are taken, else take one. A slot is bound to
+ * payer + payment nonce (the idempotency key) + target host and expires after ttlMs (abandoned requests free it). */
+export class SlotTable {
+  private m = new Map<string, { payer: string; exp: number }>();
+  constructor(public max: number, public ttlMs = 15_000) {}
+  private purge(now: number) { for (const [k, s] of this.m) if (s.exp <= now) this.m.delete(k); }
+  /** One slot is kept for retries of already-settled checks (pending=true), so they are never starved by new buyers. */
+  reserve(payer: string, nonce: string, host: string, now = clock.now(), pending = false): SlotResult {
+    this.purge(now);
+    for (const s of this.m.values()) if (s.payer === payer) return "payer_busy";
+    if (this.m.size >= (pending || this.max < 2 ? this.max : this.max - 1)) return "full";
+    const id = payer + "|" + nonce + "|" + host; this.m.set(id, { payer, exp: now + this.ttlMs }); return { id };
+  }
+  valid(id: string, now = clock.now()) { const s = this.m.get(id); return !!s && s.exp > now; }
+  release(id: string) { this.m.delete(id); }
+  free(now = clock.now()) { this.purge(now); return this.m.size < (this.max < 2 ? this.max : this.max - 1); }
+  active(now = clock.now()) { this.purge(now); return this.m.size; }
 }

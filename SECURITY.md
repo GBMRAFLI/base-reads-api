@@ -88,3 +88,12 @@ The Python code in `api/` is a reference implementation used for test vectors an
 - A pending check keeps a fixed 1-hour window from its first park. If it is not served in that window, a sweep (every 5 minutes) removes it atomically and logs a `pending_expired_unserved` incident with the settlement transaction. Refund path: the buyer contacts the issuer contact address with the transaction hash; the incident record is used to confirm the unserved payment and the amount is returned to the payer address.
 - Signed snapshot metadata is cached for 60 seconds.
 - Post-delivery re-check records are keyed by due time; a sweep lists only due records and removes each with a versionstamp-checked atomic delete before reporting.
+
+## Probe slots
+
+- Order on the paid route: result cache, then per target+payer limit, then probe slot, then target budget, then settlement, then probe.
+- A slot is reserved in one synchronous step after the payment signature is verified and before settlement. It is bound to payer + payment nonce (the idempotency key) + target host, lives 15 seconds (`PROBE_SLOT_TTL_S`), and each payer may hold one (a second parallel request from the same wallet gets 429). Unpaid requests reserve nothing.
+- One slot is kept for retries of already-settled checks, so new buyers cannot starve them.
+- Cache hit: a cached result for the same payer and target is still a paid result. It settles without taking a slot, since no outbound probe runs.
+- Settlement fails: the slot is released immediately and the answer is 402. Abandoned request: the slot expires after its TTL, nothing is charged. Slot expired during settlement: the payment is kept and the answer is 502 with `retry_free: true`; repeating the same request is served from the pending path without a second charge. All slots taken: 503 with `Retry-After`, nothing charged.
+- Failed settlements are also limited per network (IPv4 /24, IPv6 /48; `FAILED_SETTLE_PER_NET_PER_MIN`, default 10); over the limit the request is refused before verification.

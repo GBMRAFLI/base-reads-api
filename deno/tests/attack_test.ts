@@ -8,7 +8,8 @@ import { useKv, rows, kv } from "../lib/store.ts";
 import { clearIndexCache, configureOutbound, IndexAssembler, OUTBOUND, preflight, readSnapMeta, saveIndex } from "../lib/preflight.ts";
 import { attest, verifyAttestation, type Signer } from "../lib/attestation.ts";
 import { verify as officialVerify, verifySnapshotBinding } from "../../scripts/verify_attestation.ts";
-import { Semaphore, WindowLimiter } from "../lib/guards.ts";
+import { clock, metaEpoch, netKey, Semaphore, SlotTable, WindowLimiter } from "../lib/guards.ts";
+import { scheduledSnapshot } from "../lib/snapshot.ts";
 
 useKv(await Deno.openKv(":memory:"));
 const P = JSON.parse(Deno.readTextFileSync(new URL("./fixtures/py_signed.json", import.meta.url)));
@@ -16,9 +17,9 @@ const BASE_ENV: Record<string, string> = { SIGNING_KEY_PASSPHRASE: P.passphrase,
 let E: Record<string, string> = { ...BASE_ENV }; const env = (k: string) => E[k];
 const PAYER = "0x" + "a1".repeat(20); const PATH = "/x402/preflight";
 const rnd = () => "0x" + Array.from(crypto.getRandomValues(new Uint8Array(32)), (b) => b.toString(16).padStart(2, "0")).join("");
-function pay(acceptedOver: Record<string, string> = {}, nonce = rnd()) {
+function pay(acceptedOver: Record<string, string> = {}, nonce = rnd(), from = PAYER) {
   const r = reqFor(PATH, env); const now = Math.floor(Date.now() / 1000);
-  const a = { from: PAYER, to: r.payTo, value: r.amount, validAfter: String(now - 5), validBefore: String(now + 300), nonce };
+  const a = { from, to: r.payTo, value: r.amount, validAfter: String(now - 5), validBefore: String(now + 300), nonce };
   return btoa(JSON.stringify({ x402Version: 2, accepted: { ...r, ...acceptedOver }, payload: { authorization: a, signature: "0x" + "11".repeat(65) } }));
 }
 const CH = (payTo = reqFor(PATH, env).payTo) => ({ x402Version: 2, accepts: [{ scheme: "exact", network: "eip155:8453", amount: "10000", asset: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913", payTo, maxTimeoutSeconds: 60 }] });
@@ -117,18 +118,6 @@ Deno.test("H1 per target+payer limit before settlement: 3/min, then 429 not char
   const [c, b] = await t.call(pay(), "https://t.example/q9"); assertEquals([c, b.scope, b.charged], [429, "target_payer", false]);
   assertEquals(t.n.settle, 3);
   assertEquals((await t.call(pay(), "https://u.example/q"))[0], 200);
-});
-Deno.test("M1 no free outbound slot -> 503 before settlement (not charged); one in-flight probe per payer", async () => {
-  await fresh(); configureOutbound(1); const t = rig({ fetchDelay: 80 });
-  const first = t.call(pay(), "https://m.example/a");
-  await new Promise((r) => setTimeout(r, 20));
-  const [c, b] = await t.call(pay(), "https://m2.example/b"); assertEquals([c, b.charged], [503, false]);
-  assertEquals((await first)[0], 200); assertEquals(t.n.settle, 1); assertEquals(OUTBOUND.active, 0);
-  configureOutbound(4); const t2 = rig({ fetchDelay: 80 });
-  const p1 = t2.call(pay(), "https://m3.example/a"); await new Promise((r) => setTimeout(r, 20));
-  const [c2, b2] = await t2.call(pay(), "https://m4.example/b"); assertEquals([c2, b2.charged], [503, false]); // same payer, slots free
-  assertEquals((await p1)[0], 200); assertEquals(t2.n.settle, 1);
-  const s = new Semaphore(1, 4); const r = s.tryAcquire()!; assertEquals(s.tryAcquire(), null); r(); assert(s.tryAcquire());
 });
 Deno.test("M2 full limiter table evicts the oldest key instead of refusing new clients; IPv6 /48 aggregate", async () => {
   const w = new WindowLimiter(1, 60_000, 3);
@@ -305,4 +294,105 @@ Deno.test("L4 (re-audit 2) reorg sweep lists only due records; concurrent sweeps
   await Promise.all([sweepReorg(chk, async () => { incidents++; }, now + 1), sweepReorg(chk, async () => { incidents++; }, now + 1)]);
   assertEquals(incidents, 1); assert(!checked.includes("0xlater"));
   checked = []; await sweepReorg(chk, async () => { incidents++; }, now + 1); assertEquals(checked, []);
+});
+
+// ---- probe slots: cache -> slot -> settle -> probe; 15 s TTL; one per payer ----
+const P2 = "0x" + "b2".repeat(20), P3 = "0x" + "c3".repeat(20);
+const later = () => { let go!: (v: any) => void; const p = new Promise((r) => { go = r; }); return { p, go }; };
+const withClock = async (fn: (adv: (ms: number) => void) => Promise<void>) => {
+  let off = 0; const real = clock.now; clock.now = () => Date.now() + off;
+  try { await fn((ms) => { off += ms; }); } finally { clock.now = real; }
+};
+Deno.test("A13 attacker fills all slots -> honest buyer gets 503 + Retry-After, no facilitator call, no charge", async () => {
+  await fresh({ OUTBOUND_MAX_CONCURRENCY: "2", PER_TARGET_PAYER_PER_MIN: "100" }); // 2 slots: 1 for new buyers, 1 kept for settled retries
+  const hang = later(); const atk = rig({ settle: () => hang.p });
+  const p1 = atk.call(pay({}, rnd(), P2), "https://s1.example/a", "203.0.113.1");
+  await new Promise((r) => setTimeout(r, 10)); assertEquals(abuse(env).slots.active(), 1);
+  const t = rig(); const [c, b] = await t.call(pay(), "https://s2.example/h");
+  assertEquals([c, b.charged], [503, false]); assertEquals([t.n.verify, t.n.settle, t.n.fetch], [0, 0, 0]);
+  hang.go({ success: false, errorReason: "unexpected_settle_error" }); assertEquals((await p1)[0], 402);
+  assertEquals((await t.call(pay(), "https://s2.example/h"))[0], 200); // capacity back: paid and served
+});
+Deno.test("A13b 503 for a full target carries Retry-After", async () => {
+  await fresh({ OUTBOUND_MAX_CONCURRENCY: "2" }); const hang = later(); const atk = rig({ settle: () => hang.p });
+  const p1 = atk.call(pay({}, rnd(), P2), "https://s1.example/a", "203.0.113.1"); await new Promise((r) => setTimeout(r, 10));
+  const res = await handler(new Request("http://h" + PATH + "?url=" + encodeURIComponent("https://s3.example/"), { headers: { "PAYMENT-SIGNATURE": pay() } }),
+    { env, fac: async () => { throw new Error("no facilitator"); }, rpc: async () => "0x", background: () => {}, ip: "198.51.100.7" });
+  assertEquals([res.status, res.headers.get("Retry-After") !== null], [503, true]); await res.body?.cancel();
+  hang.go({ success: false }); await p1;
+});
+Deno.test("A14 abandoned request: its slot is released after the 15 s TTL, no charge", async () => {
+  await fresh({ OUTBOUND_MAX_CONCURRENCY: "2", PER_TARGET_PAYER_PER_MIN: "100" });
+  await withClock(async (adv) => {
+    const hang = later(); const ab = rig({ settle: () => hang.p });
+    const p1 = ab.call(pay({}, rnd(), P2), "https://ab.example/a", "203.0.113.2"); await new Promise((r) => setTimeout(r, 10));
+    const t = rig(); assertEquals((await t.call(pay(), "https://ok.example/h"))[0], 503);
+    adv(15_001); assertEquals(abuse(env).slots.active(), 0); // TTL passed: slot freed
+    assertEquals((await t.call(pay(), "https://ok.example/h"))[0], 200);
+    hang.go({ success: false, errorReason: "unexpected_settle_error" }); assertEquals((await p1)[0], 402); // never charged
+  });
+});
+Deno.test("A15 settle fails -> 402 and the slot is released immediately", async () => {
+  await fresh({ OUTBOUND_MAX_CONCURRENCY: "2" }); let during = -1;
+  const t = rig({ settle: () => { during = abuse(env).slots.active(); return { success: false, errorReason: "unexpected_settle_error" }; } });
+  const [c] = await t.call(pay(), "https://f.example/a"); assertEquals(c, 402); assertEquals(during, 1); assertEquals(abuse(env).slots.active(), 0);
+});
+Deno.test("A16 cache hit takes no slot (and settles: a cached result is still a paid result)", async () => {
+  await fresh({ OUTBOUND_MAX_CONCURRENCY: "2", PER_TARGET_PAYER_PER_MIN: "100" }); const t = rig();
+  assertEquals((await t.call(pay(), "https://c.example/a"))[0], 200);
+  const hang = later(); const atk = rig({ settle: () => hang.p });
+  const p1 = atk.call(pay({}, rnd(), P2), "https://x.example/a", "203.0.113.3"); await new Promise((r) => setTimeout(r, 10));
+  let peak = 0; const t2 = rig({ settle: () => { peak = abuse(env).slots.active(); return { success: true, transaction: rnd(), payer: PAYER, network: "eip155:84532" }; } });
+  const [c, b] = await t2.call(pay(), "https://c.example/a"); assertEquals(c, 200); assert(b.attestation);
+  assertEquals([peak, t2.n.settle, t2.n.fetch], [1, 1, 0]); // only the attacker's slot was taken
+  hang.go({ success: false }); await p1;
+});
+Deno.test("A17 same wallet, 2 parallel requests -> second gets 429, only one settle", async () => {
+  await fresh({ OUTBOUND_MAX_CONCURRENCY: "4", PER_TARGET_PAYER_PER_MIN: "100" }); const hang = later(); const t = rig({ settle: () => hang.p });
+  const p1 = t.call(pay(), "https://w1.example/a"); await new Promise((r) => setTimeout(r, 10));
+  const [c, b] = await t.call(pay(), "https://w2.example/b", "203.0.113.4"); assertEquals([c, b.scope, b.charged], [429, "payer", false]);
+  hang.go({ success: true, transaction: rnd(), payer: PAYER, network: "eip155:84532" }); assertEquals((await p1)[0], 200); assertEquals(t.n.settle, 1);
+});
+Deno.test("A18 settle takes 20 s (slot TTL 15 s) -> 502 with a free retry, never a second charge", async () => {
+  await fresh({ PER_TARGET_PAYER_PER_MIN: "100" });
+  await withClock(async (adv) => {
+    const t = rig({ settle: () => { adv(20_000); return { success: true, transaction: rnd(), payer: PAYER, network: "eip155:84532" }; } });
+    const sig = pay(); const [c, b] = await t.call(sig, "https://slow.example/a");
+    assertEquals([c, b.retry_free], [502, true]); assertEquals([t.n.settle, t.n.fetch], [1, 0]);
+    const [c2, b2] = await t.call(sig, "https://slow.example/a"); assertEquals(c2, 200); assert(b2.attestation);
+    assertEquals([t.n.settle, t.n.fetch], [1, 1]); // served on the same payment
+  });
+});
+Deno.test("L2 (434305e) budget release after a window rollover does not decrement the new window", () => {
+  const w = new WindowLimiter(2, 60_000); assert(w.allow("h", 0)); const s0 = w.windowStart("h")!;
+  assert(w.allow("h", 60_000)); assert(w.allow("h", 60_001)); // new window full
+  w.release("h", s0, 60_002); assert(!w.allow("h", 60_003)); // stale release ignored
+  const s1 = w.windowStart("h")!; w.release("h", s1, 60_004); assert(w.allow("h", 60_005)); // same-window release works
+});
+Deno.test("L3 (434305e) one slot is kept for settled retries: saturation by new buyers cannot starve them", async () => {
+  const s = new SlotTable(2, 15_000); assert(typeof s.reserve("a", "n1", "h", 0) === "object");
+  assertEquals(s.reserve("b", "n2", "h", 0), "full"); assert(typeof s.reserve("c", "n3", "h", 0, true) === "object");
+  await fresh({ OUTBOUND_MAX_CONCURRENCY: "2", PER_TARGET_PAYER_PER_MIN: "100" });
+  const t0 = rig({ chain: { v: { settled: null } } }); const sig = pay(); assertEquals((await t0.call(sig, "https://pq.example/a"))[0], 202); // settled, parked
+  const hang = later(); const atk = rig({ settle: () => hang.p });
+  const p1 = atk.call(pay({}, rnd(), P2), "https://x.example/a", "203.0.113.5"); await new Promise((r) => setTimeout(r, 10));
+  assertEquals((await rig().call(pay({}, rnd(), P3), "https://y.example/", "203.0.113.6"))[0], 503); // new buyers: full
+  t0.chain.v = { settled: true }; assertEquals((await t0.call(sig, "https://pq.example/a"))[0], 200); // settled retry: served
+  hang.go({ success: false }); await p1;
+});
+Deno.test("L4 (434305e) snapshot save / scheduled snapshot invalidates the signed meta cache", async () => {
+  await fresh(); const now = Date.now(); const a = await snapshotMeta(env, now); assert(a === await snapshotMeta(env, now));
+  const e0 = metaEpoch.v; await scheduledSnapshot((async () => { throw new Error("offline"); }) as any, Date.parse("2001-01-01T01:00:00Z")).catch(() => {});
+  assert(metaEpoch.v > e0); assert(a !== await snapshotMeta(env, now));
+  const e1 = metaEpoch.v; await saveIndex({ date: "2001-01-02" } as any).catch(() => {}); assert(metaEpoch.v > e1);
+});
+Deno.test("L1 (434305e, optional) failed settles are limited per /24 (IPv4) or /48 (IPv6) before verify", async () => {
+  await fresh({ FAILED_SETTLE_PER_NET_PER_MIN: "2", PER_TARGET_PAYER_PER_MIN: "100" });
+  const bad = rig({ settle: () => ({ success: false, errorReason: "unexpected_settle_error" }) });
+  assertEquals((await bad.call(pay(), "https://n.example/1", "198.51.100.7"))[0], 402);
+  assertEquals((await bad.call(pay({}, rnd(), P2), "https://n.example/2", "198.51.100.8"))[0], 402);
+  const t = rig(); const [c, b] = await t.call(pay({}, rnd(), P3), "https://n.example/3", "198.51.100.99");
+  assertEquals([c, b.scope, b.charged], [429, "network", false]); assertEquals(t.n.verify, 0);
+  assertEquals((await t.call(pay({}, rnd(), P3), "https://n.example/3", "203.0.113.9"))[0], 200); // other network fine
+  assertEquals([netKey("198.51.100.7"), netKey("2001:db8:1:2::1")], ["198.51.100.0/24", "2001:db8:1::/48"]);
 });

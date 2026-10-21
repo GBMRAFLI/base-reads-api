@@ -1,7 +1,7 @@
 // Port of api/preflight.py (facts, validation, Bazaar facts). Same facts schema and signatures.
 import { envSigner, sign } from "./sign.ts";
 import { attest, type Rpc, type Signer } from "./attestation.ts";
-import { Semaphore } from "./guards.ts";
+import { metaEpoch, Semaphore } from "./guards.ts";
 /** A9: a target gets 5 s to answer. */
 export const PROBE_TIMEOUT_MS = 5000;
 /** Bounded outbound concurrency for target probes (protects third parties and this host). */
@@ -286,6 +286,9 @@ export async function purgeOrphanGens(date: string, keepGen: number | string | n
 }
 /** Persist index via generationed chunks: write new gen, atomic flip snapdate, purge orphans. */
 export async function saveIndex(idx: Index, _keep?: number, _skipRetention = false): Promise<SnapDateMeta> {
+  try { return await saveIndexInner(idx); } finally { metaEpoch.bump(); } // L1: signed snapshot meta must not serve a stale cache
+}
+async function saveIndexInner(idx: Index): Promise<SnapDateMeta> {
   if (!idx.tier) idx.tier = "full";
   const k = await kv();
   const prev = await k.get<SnapDateMeta | number>(["snapdate", idx.date]);
