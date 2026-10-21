@@ -79,6 +79,16 @@ def sign(facts):
     k = load_or_create_key(); pub = public_key_info()
     sig = eddsa.new(k, "rfc8032").sign(canonical(facts))
     return {"facts": facts, "signature": {"alg": "Ed25519", "key_id": pub["key_id"], "public_key_b64": pub["public_key_b64"], "value_b64": base64.b64encode(sig).decode(), "signed_over": "canonical JSON of facts (sorted keys, no whitespace)"}}
+def env_signer():
+    """Attestation signer backed by the server-held key (never exported)."""
+    k = load_or_create_key(); return public_key_info()["key_id"], lambda m: eddsa.new(k, "rfc8032").sign(m)
+def sign_jcs(payload):
+    """JCS (RFC 8785) signature block for the free metadata endpoints."""
+    import attestation as AT
+    k = load_or_create_key(); pub = public_key_info()
+    return {"alg": "Ed25519", "key_id": pub["key_id"], "public_key_b64": pub["public_key_b64"],
+            "value_b64": base64.b64encode(eddsa.new(k, "rfc8032").sign(AT.domain_bytes(AT.DOMAIN_SNAPSHOT_META, payload))).decode(), "canonicalization": "JCS",
+            "domain": "bazaar-snapshot-meta/v1", "signed_over": "UTF-8 of 'bazaar-snapshot-meta/v1' + LF + RFC 8785 (JCS) canonical JSON of metadata"}
 def verify(envelope):
     s = envelope["signature"]; pk = eddsa.import_public_key(base64.b64decode(s["public_key_b64"]))
     try: eddsa.new(pk, "rfc8032").verify(canonical(envelope["facts"]), base64.b64decode(s["value_b64"])); return True
@@ -129,13 +139,13 @@ def check_url(url, resolver=socket.getaddrinfo):
 
 class PinnedHTTPSConnection(http.client.HTTPSConnection):
     """TCP to the pre-validated IP; TLS SNI + certificate check + Host header use the original hostname."""
-    def __init__(self, host, pinned_ip, port=443, timeout=8, context=None):
+    def __init__(self, host, pinned_ip, port=443, timeout=5, context=None):
         super().__init__(host, port, timeout=timeout, context=context or ssl.create_default_context()); self.pinned_ip = pinned_ip
     def connect(self):
         sock = socket.create_connection((self.pinned_ip, self.port), self.timeout)
         self.sock = self._context.wrap_socket(sock, server_hostname=self.host)
 
-def probe(u, pinned_ip, timeout=8, conn_cls=PinnedHTTPSConnection):
+def probe(u, pinned_ip, timeout=5, conn_cls=PinnedHTTPSConnection):  # A9: 5 s budget
     """One unpaid GET over the pinned IP. No redirects followed."""
     t0 = time.monotonic()
     path = (u.path or "/") + ("?" + u.query if u.query else "")
@@ -173,7 +183,8 @@ def validate_challenge(ch, now=None):
                       ("payTo", isinstance(a.get("payTo"), str) and bool(ADDR.match(a.get("payTo", "")))),
                       ("maxTimeoutSeconds", isinstance(a.get("maxTimeoutSeconds"), int) and 0 < a.get("maxTimeoutSeconds", 0) <= 3600)):
             if not ok: p.append(f"accepts[{i}].{f}_invalid")
-        out.append({"scheme": a.get("scheme"), "network": a.get("network"), "amount": amt, "asset": a.get("asset"), "payTo": a.get("payTo")})
+        st = lambda x: x if isinstance(x, str) else None  # summary: strings only (huge ints/objects -> None)
+        out.append({"scheme": st(a.get("scheme")), "network": st(a.get("network")), "amount": st(amt), "asset": st(a.get("asset")), "payTo": st(a.get("payTo"))})
     return not p, p, out
 
 # ---------- Bazaar snapshots ----------
@@ -216,7 +227,7 @@ def bazaar_facts(url, payto_list, max_trend=14):
             "host_listing_count": idx["hosts"].get(h, 0), "payout_wallet_reuse": wl,
             "last_called_at": cur and cur["lastCalledAt"], "payer_trend": trend}
 
-def preflight(url, now=None):
+def preflight(url, now=None, rpc=None, ttl_s=None, issuer_url=None):
     now = now or time.time()
     u, ip, err = check_url(url)
     if u is None: return 400, {"error": err}
@@ -229,4 +240,10 @@ def preflight(url, now=None):
     valid, problems, acc = validate_challenge(ch)
     facts = dict(base, reachability=reach, challenge={"valid": valid, "problems": problems, "accepts": acc},
                  bazaar=bazaar_facts(url, [a["payTo"] for a in acc if a.get("payTo")]))
-    return 200, sign(facts)
+    import attestation as AT
+    legacy = sign(facts)
+    try: att = AT.attest(facts, env_signer(), rpc=rpc, now=now, ttl_s=ttl_s, issuer_url=issuer_url)
+    except Exception as e:  # never break the paid response: legacy facts still served
+        print("attestation failed:", type(e).__name__, flush=True)
+        return 200, dict(legacy, attestation=None, attestation_error="attestation_unavailable")
+    return 200, dict(legacy, attestation=att)

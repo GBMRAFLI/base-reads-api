@@ -131,3 +131,7 @@ The default facilitator stays PayAI. To settle through the CDP facilitator (need
 missing, requests go out without auth exactly as before. CDP returns the same settle fields (`success`, `transaction`,
 `payer`, `network`), so the settlement tx hash handling is unchanged.
 
+
+## Implementations
+
+The production service is the Deno app in `deno/`. The Python code in `api/` is a non-deployed reference implementation (test vectors, cross-checks) and does not include the paid-route abuse guards described in SECURITY.md.

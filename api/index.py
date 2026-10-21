@@ -2,7 +2,7 @@
 Zero-LLM: every route is 100% deterministic code (JSON-RPC reads only)."""
 import calendar, json, os, re, base64, time, urllib.request, urllib.parse, sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-import preflight as PF
+import preflight as PF, attestation as AT
 import sales_log as MS, cdp_auth, settle_guard as SG
 iso = lambda t: time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(t)) + ".%03dZ" % int((t % 1) * 1000)
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -52,7 +52,9 @@ def handle(path, q):
     if path == "/x402/preflight":
         u = urllib.parse.unquote(q.get("url", ""))
         if not u: return 400, {"error": "give ?url=https://..."}
-        return PF.preflight(u)
+        t = os.environ.get("ATTESTATION_TTL_S", ""); ttl = int(t) if re.fullmatch(r"[0-9]{1,6}", t) else None  # int >= 1 else 900
+        base = os.environ.get("PUBLIC_URL", "").rstrip("/")
+        return PF.preflight(u, rpc=rpc, ttl_s=ttl, issuer_url=base + "/.well-known/issuer.json" if base else None)
     if path == "/base/address-intel":
         a = q.get("address", "")
         if not ADDR.match(a): return 400, {"error": "address must be 0x + 40 hex"}
@@ -141,7 +143,7 @@ def export(auth, q):
 REPO_URL = os.environ.get("REPO_URL", "https://github.com/GBMRAFLI/base-reads-api")
 def root():
     return {"service": "Base Reads", "network": NETWORK, "protocol": "x402 v2", "facilitator": facilitator_info(),
-            "free": ["/llms.txt", "/openapi.json", "/.well-known/402index-verify.txt", "/.well-known/x402-preflight", "/.well-known/x402-preflight-key-history.json", "/.well-known/bazaar-snapshot.json", "/x402/preflight/pubkey", "/bazaar/snapshots"],
+            "free": ["/llms.txt", "/openapi.json", "/.well-known/402index-verify.txt", "/.well-known/x402-preflight", "/.well-known/x402-preflight-key-history.json", "/.well-known/issuer.json", "/.well-known/prepay-check-attestation-v1.schema.json", "/.well-known/bazaar-snapshot.json", "/x402/preflight/pubkey", "/bazaar/snapshots"],
             "routes": {k: {"price_usdc": v[0] / 1e6, "description": v[1]} for k, v in ROUTES.items()}}
 REF_RE = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
 def clean_ref(qs):
@@ -167,7 +169,8 @@ def llms_txt():
           "- /base/network and /base/usdc-balance responses list related_routes (path and price) for follow-up reads"]
     L += ["", "## Discovery (free)", "", "- / : service index with routes and prices", "- /openapi.json : OpenAPI 3.1 description of the paid routes with prices", "- /bazaar/snapshots : daily Bazaar snapshot summary",
           "- /.well-known/bazaar-snapshot.json : signed snapshot series metadata", "- /.well-known/x402-preflight : Pre-pay Check schema and signing key",
-          "- /.well-known/x402-preflight-key-history.json : signing key history", "- /x402/preflight/pubkey : Ed25519 public key for verifying signed facts",
+          "- /.well-known/x402-preflight-key-history.json : signing key history",
+          "- /.well-known/issuer.json : attestation issuer, contact and signing keys (active and retired)", "- /.well-known/prepay-check-attestation-v1.schema.json : JSON Schema of the signed attestation (CC0)", "- /x402/preflight/pubkey : Ed25519 public key for verifying signed facts",
           "- Each 402 challenge carries extensions.bazaar (input schema and output example) for x402 Bazaar listing", "", "Facts only, no investment advice.", ""]
     return "\n".join(L)
 VERIFY_402INDEX_DEFAULT = "be918d4df21371f971ccaa589e4ed1adbe9a077a824950b1db21cebfbbf5ae3c"
@@ -175,7 +178,7 @@ def verify_token():
     """402index ownership token: INDEX_VERIFY_TOKEN if set, else the built-in constant. Served with no trailing newline."""
     return os.environ.get("INDEX_VERIFY_TOKEN") or VERIFY_402INDEX_DEFAULT
 FAVICON_B64 = "AAABAAEAEBAAAAEAIABoBAAAFgAAACgAAAAQAAAAIAAAAAEAIAAAAAAAQAQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA0lIA/9JSAP8AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAANJSAP/SUgD/0lIA/9JSAP/SUgD/0lIA/9JSAP/SUgD/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAANJSAP/SUgD/0lIA/9JSAP/SUgD/0lIA/9JSAP/SUgD/0lIA/9JSAP8AAAAAAAAAAAAAAAAAAAAAAAAAANJSAP/SUgD/0lIA/9JSAP/SUgD/0lIA/9JSAP/SUgD/0lIA/9JSAP/SUgD/0lIA/wAAAAAAAAAAAAAAANJSAP/SUgD/0lIA/9JSAP/SUgD/0lIA/9JSAP/SUgD/0lIA/9JSAP/SUgD/0lIA/9JSAP/SUgD/AAAAAAAAAADSUgD/0lIA/9JSAP/SUgD/0lIA///////////////////////SUgD/0lIA/9JSAP/SUgD/0lIA/wAAAAAAAAAA0lIA/9JSAP/SUgD/0lIA/9JSAP//////0lIA/9JSAP/SUgD//////9JSAP/SUgD/0lIA/9JSAP8AAAAA0lIA/9JSAP/SUgD/0lIA/9JSAP/SUgD//////9JSAP/SUgD/0lIA///////SUgD/0lIA/9JSAP/SUgD/0lIA/9JSAP/SUgD/0lIA/9JSAP/SUgD/0lIA///////////////////////SUgD/0lIA/9JSAP/SUgD/0lIA/9JSAP8AAAAA0lIA/9JSAP/SUgD/0lIA/9JSAP//////0lIA/9JSAP/SUgD//////9JSAP/SUgD/0lIA/9JSAP8AAAAAAAAAANJSAP/SUgD/0lIA/9JSAP/SUgD//////9JSAP/SUgD/0lIA///////SUgD/0lIA/9JSAP/SUgD/AAAAAAAAAADSUgD/0lIA/9JSAP/SUgD/0lIA///////////////////////SUgD/0lIA/9JSAP/SUgD/0lIA/wAAAAAAAAAAAAAAANJSAP/SUgD/0lIA/9JSAP/SUgD/0lIA/9JSAP/SUgD/0lIA/9JSAP/SUgD/0lIA/wAAAAAAAAAAAAAAAAAAAAAAAAAA0lIA/9JSAP/SUgD/0lIA/9JSAP/SUgD/0lIA/9JSAP/SUgD/0lIA/wAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAADSUgD/0lIA/9JSAP/SUgD/0lIA/9JSAP/SUgD/0lIA/wAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA0lIA/9JSAP8AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=="  # 16x16 ICO from scripts/gen_favicon.py
-FREE_PATHS = ("/", "/index.json", "/favicon.ico", "/llms.txt", "/openapi.json", "/.well-known/402index-verify.txt", "/.well-known/x402-preflight", "/.well-known/x402-preflight-key-history.json", "/.well-known/bazaar-snapshot.json", "/x402/preflight/pubkey", "/bazaar/snapshots")
+FREE_PATHS = ("/", "/index.json", "/favicon.ico", "/llms.txt", "/openapi.json", "/.well-known/402index-verify.txt", "/.well-known/x402-preflight", "/.well-known/x402-preflight-key-history.json", "/.well-known/issuer.json", "/.well-known/prepay-check-attestation-v1.schema.json", "/.well-known/bazaar-snapshot.json", "/x402/preflight/pubkey", "/bazaar/snapshots")
 def openapi():
     """OpenAPI 3.1 for the paid routes, generated from ROUTES + discovery.json so prices cannot drift from the 402 challenge."""
     paths = {}
@@ -199,7 +202,8 @@ def well_known():
     pub = PF.public_key_info()
     return {"service": "Base Reads", "schema": PF.SCHEMA, "alg": "Ed25519", "key_id": pub["key_id"], "public_key_b64": pub["public_key_b64"],
             "fingerprint": pub["fingerprint"], "fingerprint_short": pub["fingerprint_short"], "created_at": pub["created_at"],
-            "verify": ["Take the paid /x402/preflight response body: {facts, signature}.",
+            "attestation": {"spec": AT.SPEC, "version": AT.VERSION, "canonicalization": AT.CANON, "issuer": "/.well-known/issuer.json", "schema": "/.well-known/prepay-check-attestation-v1.schema.json"},
+            "verify": ["Take the paid /x402/preflight response body: {facts, signature} (legacy form; the v1.0 envelope is in \"attestation\", see /.well-known/issuer.json).",
                        "Serialize facts as canonical JSON: keys sorted, separators (',', ':'), ASCII-only escapes (Python json.dumps(facts, sort_keys=True, separators=(',', ':'))).",
                        "Verify signature.value_b64 (base64) over those bytes with Ed25519 (RFC 8032) and public_key_b64 (32-byte raw key).",
                        "Check signature.key_id matches key_id here; key_id = first 16 hex chars of sha256(raw public key)."],
@@ -209,8 +213,20 @@ def snapshot_meta():
     dates = PF.snapshot_dates(); last = dates[-1] if dates else None
     meta = {"version": 1, "started_at": dates[0] if dates else None, "last_updated": last, "total_snapshots": len(dates),
             "covered_listings": len(PF.load_index(last).get("resources", {})) if last else 0}
-    env = PF.sign(meta)
-    return {"metadata": env["facts"], "signature": env["signature"], "pubkey_url": "/x402/preflight/pubkey"}
+    return {"metadata": meta, "signature": PF.sign_jcs(meta), "pubkey_url": "/x402/preflight/pubkey"}
+ATT_SCHEMA = json.load(open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "spec", "prepay-check-attestation-v1.schema.json")))
+def issuer_doc():
+    """Attestation issuer document: identity, contact and every signing key (active + retired)."""
+    h = PF.key_history(); base = os.environ.get("PUBLIC_URL", "").rstrip("/")
+    return {"spec": AT.SPEC, "version": AT.VERSION, "issuer": {"name": AT.ISSUER_NAME, "contact": AT.CONTACT, "issuer_url": base + "/.well-known/issuer.json" if base else None},
+            "canonicalization": AT.CANON, "signature_alg": "Ed25519", "keys": [h["current"]] + h["retired"],
+            "schema": "/.well-known/prepay-check-attestation-v1.schema.json",
+            "key_policy": "Signing keys are generated and held only in the production server environment and are never published or exported. Rotation adds the new key as active and keeps old keys listed as retired with retired_at.",
+            "verify": ["Remove the \"signature\" member from the attestation object.",
+                       "Serialize the rest with RFC 8785 JSON Canonicalization Scheme (JCS) as UTF-8 bytes.",
+                       "Find the key in keys[] whose key_id equals signature.key_id; key_id = first 16 hex chars of sha256(raw 32-byte public key).",
+                       "Verify signature.value_b64 (base64) over those bytes with Ed25519 (RFC 8032).",
+                       "Optionally reject if now > expires_at, or if the key was retired before issued_at."]}
 _SNAP_SUM = {}
 def snapshot_summary(limit=30):
     """Free: daily Bazaar snapshot history (counts only), newest first."""
@@ -365,6 +381,10 @@ class handler(BaseHTTPRequestHandler):
             try: return s._send(200, well_known())
             except RuntimeError: return s._send(503, {"error": "signing key unavailable"})
         if path == "/bazaar/snapshots": return s._send(200, snapshot_summary())
+        if path == "/.well-known/prepay-check-attestation-v1.schema.json": return s._send(200, ATT_SCHEMA)
+        if path == "/.well-known/issuer.json":
+            try: return s._send(200, issuer_doc())
+            except RuntimeError: return s._send(503, {"error": "signing key unavailable"})
         if path in ("/.well-known/bazaar-snapshot.json", "/.well-known/x402-preflight-key-history.json"):
             try: return s._send(200, snapshot_meta() if "bazaar" in path else PF.key_history())
             except RuntimeError: return s._send(503, {"error": "signing key unavailable"})

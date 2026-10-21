@@ -7,9 +7,9 @@ import { ROUTES } from "../lib/routes.ts";
 import { rid } from "../lib/util.ts";
 import { useKv, rows } from "../lib/store.ts";
 import { recordSale, verifyOnchain, TRANSFER } from "../lib/stream.ts";
-import { bazaar, facClient, handler, reqFor, required, resetGuards, root, snapshotMeta, wellKnown } from "../main.ts";
+import { bazaar, facClient, handler, reqFor, required, resetGuards, root, snapshotMeta, snapshotSummary, wellKnown } from "../main.ts";
 import * as SG from "../lib/settle_guard.ts";
-import { keyHistory } from "../lib/sign.ts";
+import { keyHistory, verifyJcs } from "../lib/sign.ts";
 import { AUTH_USED } from "../lib/stream.ts";
 import { headers as cdpHeaders, jwt as cdpJwt } from "../lib/cdp_auth.ts";
 
@@ -269,8 +269,13 @@ Deno.test("well-known, key history, fingerprints, signed snapshot metadata, faci
     : k === "SIGNING_KEY_CREATED_AT" ? "2026-10-14T11:00:00Z" : env(k);
   const h: any = await keyHistory(hist);
   assertEquals([h.current.status, h.current.created_at, h.retired.length, h.retired[0].status], ["active", "2026-10-14T11:00:00Z", 1, "retired"]);
-  const m: any = await snapshotMeta(); assertEquals(Object.keys(m.metadata).sort(), ["covered_listings", "last_attempt_at", "last_error", "last_failed_pages", "last_status", "last_updated", "started_at", "total_snapshots", "version"]);
-  assertEquals(m.pubkey_url, "/x402/preflight/pubkey"); assert(await verify({ facts: m.metadata, signature: m.signature }));
+  const m: any = await snapshotMeta(); assertEquals(Object.keys(m.metadata).sort(), ["covered_listings", "last_attempt_at", "last_error", "last_failed_pages", "last_sha256", "last_status", "last_updated", "snapshot_sha256", "started_at", "total_snapshots", "version"]);
+  assertEquals(m.pubkey_url, "/x402/preflight/pubkey"); assert(await verifyJcs(m.metadata, m.signature));
+  // L3 regression: every recent day's content hash is inside the signed meta and equals the published per-day hash
+  const sm: any = await snapshotSummary(30); assertEquals(typeof m.metadata.snapshot_sha256, "object");
+  for (const e of sm.snapshots) assertEquals(m.metadata.snapshot_sha256[e.date], e.sha256, e.date);
+  const forged = { ...m.metadata, snapshot_sha256: { ...m.metadata.snapshot_sha256, "2000-01-01": "00".repeat(32) } }; assert(!await verifyJcs(forged, m.signature));
+  assert(!await verify({ facts: m.metadata, signature: m.signature })); // domain-separated from the legacy facts form
   for (const p of ["/.well-known/x402-preflight", "/.well-known/bazaar-snapshot.json", "/.well-known/x402-preflight-key-history.json", "/bazaar/snapshots"]) {
     const res = await handler(new Request("http://h" + p), { env }); assertEquals(res.status, 200, p); await res.body?.cancel();
   }

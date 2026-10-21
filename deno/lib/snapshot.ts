@@ -8,6 +8,7 @@ import {
 } from "./preflight.ts";
 export { dayAge } from "./preflight.ts";
 import { kv } from "./store.ts";
+import { metaEpoch } from "./guards.ts";
 
 const BAZAAR = Deno.env.get("BAZAAR_URL") ?? "https://api.cdp.coinbase.com/platform/v2/x402/discovery/resources";
 export const PAGE = 1000, PAGE_TIMEOUT_MS = 15000, RETRIES = 1;
@@ -161,6 +162,9 @@ export async function applyTierRetention(today = utcDay()) {
 }
 
 export async function scheduledSnapshot(f: typeof fetch = fetch, now = Date.now()): Promise<"skipped" | "ok" | "failed"> {
+  try { return await scheduledSnapshotInner(f, now); } finally { metaEpoch.bump(); } // L1: status/fail state feeds the signed meta
+}
+async function scheduledSnapshotInner(f: typeof fetch, now: number): Promise<"skipped" | "ok" | "failed"> {
   const day = utcDay(now); const k = await kv();
   if ((await k.get(["snapdate", day])).value != null) return "skipped";
   if ((await k.get(["snapfail", day])).value != null) return "skipped";

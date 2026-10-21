@@ -8,8 +8,12 @@ import DISCOVERY from "./lib/discovery.json" with { type: "json" };
 import { CDP_HOST, enabled as cdpEnabled, headers as cdpHeaders } from "./lib/cdp_auth.ts";
 import * as SG from "./lib/settle_guard.ts";
 import * as LG from "./lib/ledger.ts";
-import { SCHEMA, snapshotDates, loadIndex } from "./lib/preflight.ts";
-import { isoOrNull, keyHistory, loadKey, publicKeyInfo, sign, SigningUnavailable } from "./lib/sign.ts";
+import { SCHEMA, snapshotDates, loadIndex, readSnapMeta, checkUrl, configureOutbound, hostOf } from "./lib/preflight.ts";
+import { clock, guardConfig, ipv6Prefix48, metaEpoch, netKey, ResultCache, SlotTable, WindowLimiter } from "./lib/guards.ts";
+import { scheduleReorgCheck, sweepReorg, type ReorgRec } from "./lib/reorg.ts";
+import { isoOrNull, keyHistory, loadKey, publicKeyInfo, sign, signJcs, SigningUnavailable } from "./lib/sign.ts";
+import { CANON, CONTACT, ISSUER_NAME, SPEC, VERSION } from "./lib/attestation.ts";
+import ATT_SCHEMA from "../spec/prepay-check-attestation-v1.schema.json" with { type: "json" };
 import { scheduledSnapshot, latestSnapStatus, loadFail, mapErrorCode } from "./lib/snapshot.ts";
 import { EXPORT_FILES, kv, rows } from "./lib/store.ts";
 import { recordObservation, recordSale, verifyOnchain } from "./lib/stream.ts";
@@ -18,7 +22,8 @@ import { ADDR, b64json, iso, pyQuery, sha256hex, unquote } from "./lib/util.ts";
 const USDCS: Record<string, string> = { "eip155:8453": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913", "eip155:84532": "0x036CbD53842c5426634e7929541eC2318f3dCF7e" };
 export type Deps = { env: (k: string) => string | undefined; rpc?: Rpc; fac?: (p: string, body: unknown) => Promise<any>;
   resolver?: Resolver; fetcher?: Fetcher; background?: (p: Promise<unknown>) => void;
-  check?: (tx: string, r: any, payer: string | undefined) => Promise<any>; ip?: string };
+  check?: (tx: string, r: any, payer: string | undefined) => Promise<any>; ip?: string;
+ };
 const cfg = (env: Deps["env"]) => {
   const NETWORK = env("NETWORK") || "eip155:8453"; // empty NETWORK= means mainnet
   return { FAC: env("FACILITATOR") ?? "https://facilitator.payai.network", RPC: env("RPC") ?? "https://mainnet.base.org",
@@ -64,7 +69,7 @@ export const VERIFY_402INDEX_DEFAULT = "be918d4df21371f971ccaa589e4ed1adbe9a077a
 /** 402index ownership token: INDEX_VERIFY_TOKEN if set, else the built-in constant. Served with no trailing newline. */
 export const verifyToken = (env: Deps["env"]) => env("INDEX_VERIFY_TOKEN") || VERIFY_402INDEX_DEFAULT;
 export const FAVICON_B64 = "AAABAAEAEBAAAAEAIABoBAAAFgAAACgAAAAQAAAAIAAAAAEAIAAAAAAAQAQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA0lIA/9JSAP8AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAANJSAP/SUgD/0lIA/9JSAP/SUgD/0lIA/9JSAP/SUgD/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAANJSAP/SUgD/0lIA/9JSAP/SUgD/0lIA/9JSAP/SUgD/0lIA/9JSAP8AAAAAAAAAAAAAAAAAAAAAAAAAANJSAP/SUgD/0lIA/9JSAP/SUgD/0lIA/9JSAP/SUgD/0lIA/9JSAP/SUgD/0lIA/wAAAAAAAAAAAAAAANJSAP/SUgD/0lIA/9JSAP/SUgD/0lIA/9JSAP/SUgD/0lIA/9JSAP/SUgD/0lIA/9JSAP/SUgD/AAAAAAAAAADSUgD/0lIA/9JSAP/SUgD/0lIA///////////////////////SUgD/0lIA/9JSAP/SUgD/0lIA/wAAAAAAAAAA0lIA/9JSAP/SUgD/0lIA/9JSAP//////0lIA/9JSAP/SUgD//////9JSAP/SUgD/0lIA/9JSAP8AAAAA0lIA/9JSAP/SUgD/0lIA/9JSAP/SUgD//////9JSAP/SUgD/0lIA///////SUgD/0lIA/9JSAP/SUgD/0lIA/9JSAP/SUgD/0lIA/9JSAP/SUgD/0lIA///////////////////////SUgD/0lIA/9JSAP/SUgD/0lIA/9JSAP8AAAAA0lIA/9JSAP/SUgD/0lIA/9JSAP//////0lIA/9JSAP/SUgD//////9JSAP/SUgD/0lIA/9JSAP8AAAAAAAAAANJSAP/SUgD/0lIA/9JSAP/SUgD//////9JSAP/SUgD/0lIA///////SUgD/0lIA/9JSAP/SUgD/AAAAAAAAAADSUgD/0lIA/9JSAP/SUgD/0lIA///////////////////////SUgD/0lIA/9JSAP/SUgD/0lIA/wAAAAAAAAAAAAAAANJSAP/SUgD/0lIA/9JSAP/SUgD/0lIA/9JSAP/SUgD/0lIA/9JSAP/SUgD/0lIA/wAAAAAAAAAAAAAAAAAAAAAAAAAA0lIA/9JSAP/SUgD/0lIA/9JSAP/SUgD/0lIA/9JSAP/SUgD/0lIA/wAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAADSUgD/0lIA/9JSAP/SUgD/0lIA/9JSAP/SUgD/0lIA/wAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA0lIA/9JSAP8AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=="; // 16x16 ICO from scripts/gen_favicon.py
-export const FREE_PATHS = new Set(["/", "/index.json", "/favicon.ico", "/llms.txt", "/openapi.json", "/.well-known/402index-verify.txt", "/.well-known/x402-preflight", "/.well-known/x402-preflight-key-history.json", "/.well-known/bazaar-snapshot.json", "/x402/preflight/pubkey", "/bazaar/snapshots"]);
+export const FREE_PATHS = new Set(["/", "/index.json", "/favicon.ico", "/llms.txt", "/openapi.json", "/.well-known/402index-verify.txt", "/.well-known/x402-preflight", "/.well-known/x402-preflight-key-history.json", "/.well-known/issuer.json", "/.well-known/prepay-check-attestation-v1.schema.json", "/.well-known/bazaar-snapshot.json", "/x402/preflight/pubkey", "/bazaar/snapshots"]);
 /** OpenAPI 3.1 for the paid routes, generated from ROUTES + discovery.json so prices cannot drift from the 402 challenge. */
 export function openapi(env: Deps["env"]) {
   const c = cfg(env); const D = DISCOVERY as Record<string, any>; const paths: Record<string, unknown> = {};
@@ -97,29 +102,50 @@ export function llmsTxt(env: Deps["env"]) {
     "- /base/network and /base/usdc-balance responses list related_routes (path and price) for follow-up reads",
     "", "## Discovery (free)", "", "- / : service index with routes and prices", "- /openapi.json : OpenAPI 3.1 description of the paid routes with prices", "- /bazaar/snapshots : daily Bazaar snapshot summary",
     "- /.well-known/bazaar-snapshot.json : signed snapshot series metadata", "- /.well-known/x402-preflight : Pre-pay Check schema and signing key",
-    "- /.well-known/x402-preflight-key-history.json : signing key history", "- /x402/preflight/pubkey : Ed25519 public key for verifying signed facts",
+    "- /.well-known/x402-preflight-key-history.json : signing key history",
+    "- /.well-known/issuer.json : attestation issuer, contact and signing keys (active and retired)", "- /.well-known/prepay-check-attestation-v1.schema.json : JSON Schema of the signed attestation (CC0)", "- /x402/preflight/pubkey : Ed25519 public key for verifying signed facts",
     "- Each 402 challenge carries extensions.bazaar (input schema and output example) for x402 Bazaar listing", "", "Facts only, no investment advice.", ""];
   return L.join("\n");
 }
 export function root(env: Deps["env"]) {
   const c = cfg(env);
   return { service: "Base Reads", network: c.NETWORK, protocol: "x402 v2", facilitator: facilitatorInfo(env),
-    free: ["/llms.txt", "/openapi.json", "/.well-known/402index-verify.txt", "/.well-known/x402-preflight", "/.well-known/x402-preflight-key-history.json", "/.well-known/bazaar-snapshot.json", "/x402/preflight/pubkey", "/bazaar/snapshots"],
+    free: ["/llms.txt", "/openapi.json", "/.well-known/402index-verify.txt", "/.well-known/x402-preflight", "/.well-known/x402-preflight-key-history.json", "/.well-known/issuer.json", "/.well-known/prepay-check-attestation-v1.schema.json", "/.well-known/bazaar-snapshot.json", "/x402/preflight/pubkey", "/bazaar/snapshots"],
     routes: Object.fromEntries(Object.entries(ROUTES).map(([k, v]) => [k, { price_usdc: v[0] / 1e6, description: v[1] }])) };
 }
 export async function wellKnown(env: Deps["env"]) {
   const pub = await publicKeyInfo(env);
   return { service: "Base Reads", schema: SCHEMA, alg: "Ed25519", key_id: pub.key_id, public_key_b64: pub.public_key_b64,
     fingerprint: pub.fingerprint, fingerprint_short: pub.fingerprint_short, created_at: pub.created_at,
-    verify: ["Take the paid /x402/preflight response body: {facts, signature}.",
+    attestation: { spec: SPEC, version: VERSION, canonicalization: CANON, issuer: "/.well-known/issuer.json", schema: "/.well-known/prepay-check-attestation-v1.schema.json" },
+    verify: ["Take the paid /x402/preflight response body: {facts, signature} (legacy form; the v1.0 envelope is in \"attestation\", see /.well-known/issuer.json).",
       "Serialize facts as canonical JSON: keys sorted, separators (',', ':'), ASCII-only escapes (Python json.dumps(facts, sort_keys=True, separators=(',', ':'))).",
       "Verify signature.value_b64 (base64) over those bytes with Ed25519 (RFC 8032) and public_key_b64 (32-byte raw key).",
       "Check signature.key_id matches key_id here; key_id = first 16 hex chars of sha256(raw public key)."],
     facilitator: facilitatorInfo(env), repo: env("REPO_URL") ?? "https://github.com/GBMRAFLI/base-reads-api",
     routes: { pubkey: "/x402/preflight/pubkey", key_history: "/.well-known/x402-preflight-key-history.json", paid_check: "/x402/preflight", snapshots: "/bazaar/snapshots", snapshot_meta: "/.well-known/bazaar-snapshot.json" } };
 }
+/** Attestation issuer document: identity, contact and every signing key (active + retired) so old attestations stay verifiable. */
+export async function issuerDoc(env: Deps["env"]) {
+  const h = await keyHistory(env); const base = cfg(env).PUBLIC.replace(/\/+$/, "");
+  return { spec: SPEC, version: VERSION, issuer: { name: ISSUER_NAME, contact: CONTACT, issuer_url: base ? base + "/.well-known/issuer.json" : null },
+    canonicalization: CANON, signature_alg: "Ed25519", keys: [h.current, ...h.retired],
+    schema: "/.well-known/prepay-check-attestation-v1.schema.json",
+    key_policy: "Signing keys are generated and held only in the production server environment and are never published or exported. Rotation adds the new key as active and keeps old keys listed as retired with retired_at.",
+    verify: ["Remove the \"signature\" member from the attestation object.",
+      "Serialize the rest with RFC 8785 JSON Canonicalization Scheme (JCS) as UTF-8 bytes.",
+      "Find the key in keys[] whose key_id equals signature.key_id; key_id = first 16 hex chars of sha256(raw 32-byte public key).",
+      "Verify signature.value_b64 (base64) over those bytes with Ed25519 (RFC 8032).",
+      "Optionally reject if now > expires_at, or if the key was retired before issued_at."] };
+}
 /** Free, signed metadata about the daily Bazaar snapshot series (no snapshot contents). */
-export async function snapshotMeta(env: Deps["env"] = (k) => Deno.env.get(k)) {
+/** L3: the signed snapshot meta is cached for 60 s (it reads up to 31 KV entries and signs on every build). */
+let META_CACHE: { at: number; epoch: number; v: unknown } | null = null; const META_TTL_MS = 60_000;
+export async function snapshotMeta(env: Deps["env"] = (k) => Deno.env.get(k), now = Date.now()) {
+  if (META_CACHE && META_CACHE.epoch === metaEpoch.v && now - META_CACHE.at < META_TTL_MS) return META_CACHE.v as Awaited<ReturnType<typeof buildSnapshotMeta>>;
+  const v = await buildSnapshotMeta(env); META_CACHE = { at: now, epoch: metaEpoch.v, v }; return v;
+}
+async function buildSnapshotMeta(env: Deps["env"]) {
   const dates = await snapshotDates(); const last = dates.at(-1) ?? null; // last successful snapdate
   const today = new Date().toISOString().slice(0, 10);
   const todayFail = await loadFail(today);
@@ -139,11 +165,15 @@ export async function snapshotMeta(env: Deps["env"] = (k) => Deno.env.get(k)) {
     covered = m?.listings ?? 0;
     if (!last_attempt_at) last_attempt_at = m?.last_attempt_at ?? null;
   }
-  const meta = { version: 1, started_at: dates[0] ?? null, last_updated: last,
+  const lastSha = last ? ((await (await import("./lib/preflight.ts")).readSnapMeta(last))?.sha256 ?? null) : null;
+  // L3: per-day content hashes of the recent snapshots are inside the signed meta, so a verifier can bind any recent
+  // attestation's snapshot_sha256 to a signed value (not only the newest day).
+  const { readSnapMeta: rsm } = await import("./lib/preflight.ts"); const snapshot_sha256: Record<string, string | null> = {};
+  for (const d of dates.slice(-30)) snapshot_sha256[d] = (await rsm(d))?.sha256 ?? null;
+  const meta = { version: 1, started_at: dates[0] ?? null, last_updated: last, last_sha256: lastSha, snapshot_sha256,
     last_attempt_at, total_snapshots: dates.length, covered_listings: covered,
     last_status: status, last_failed_pages: failed_pages, last_error };
-  const e = await sign(meta, env);
-  return { metadata: e.facts, signature: e.signature, pubkey_url: "/x402/preflight/pubkey" };
+  return { metadata: meta, signature: await signJcs(meta, env), pubkey_url: "/x402/preflight/pubkey" };
 }
 const SNAP_SUM = new Map<string, Record<string, unknown>>();
 export async function snapshotSummary(limit = 30) {
@@ -155,7 +185,8 @@ export async function snapshotSummary(limit = 30) {
       const hosts = idx.tier === "aggregate" ? (idx.aggregate?.hosts ?? 0) : Object.keys(idx.hosts ?? {}).length;
       const wallets = idx.tier === "aggregate" ? (idx.aggregate?.payout_wallets ?? 0) : Object.keys(idx.wallet_hosts ?? {}).length;
       const status = (await latestSnapStatus(d)).status ?? idx.status ?? idx.coverage?.status ?? null;
-      SNAP_SUM.set(d, { date: d, status, resources: idx.tier === "full" ? vals.length : (idx.listings ?? 0), hosts, payout_wallets: wallets,
+      const sm = await readSnapMeta(d);
+      SNAP_SUM.set(d, { date: d, sha256: sm?.sha256 ?? null, status, resources: idx.tier === "full" ? vals.length : (idx.listings ?? 0), hosts, payout_wallets: wallets,
         calls30d_total: vals.reduce((a: number, r: any) => a + (r.calls30d || 0), 0), payers30d_total: vals.reduce((a: number, r: any) => a + (r.payers30d || 0), 0) });
     }
     out.push(SNAP_SUM.get(d)!);
@@ -274,6 +305,10 @@ async function handleGet(req: Request, d: Deps): Promise<Response> {
     try { return send(200, await wellKnown(env)); } catch (e) { if (e instanceof SigningUnavailable) return send(503, { error: "signing key unavailable" }); throw e; }
   }
   if (path === "/bazaar/snapshots") return send(200, await snapshotSummary());
+  if (path === "/.well-known/prepay-check-attestation-v1.schema.json") return send(200, ATT_SCHEMA);
+  if (path === "/.well-known/issuer.json") {
+    try { return send(200, await issuerDoc(env)); } catch (e) { if (e instanceof SigningUnavailable) return send(503, { error: "signing key unavailable" }); throw e; }
+  }
   if (path === "/.well-known/bazaar-snapshot.json" || path === "/.well-known/x402-preflight-key-history.json") {
     try { return send(200, path.includes("bazaar") ? await snapshotMeta(env) : await keyHistory(env)); }
     catch (e) { if (e instanceof SigningUnavailable) return send(503, { error: "signing key unavailable" }); throw e; }
@@ -287,13 +322,50 @@ async function handleGet(req: Request, d: Deps): Promise<Response> {
   const tReq = iso();
   const sig = req.headers.get("PAYMENT-SIGNATURE") ?? req.headers.get("X-PAYMENT");
   if (publicUrlError(env)) return send(503, { error: "public origin not configured" }); // mainnet without PUBLIC_URL: never use Host
-  if (!sig) { const pr = required(path, req.headers.get("Host") ?? "", env); return send(402, pr, { "PAYMENT-REQUIRED": b64(pr) }); }
+  if (!sig) {
+    // A6: unpaid 402s are pure computation (no DNS, GET or RPC) and limited per client IP.
+    // IPv6: per-/64 key plus a per-/48 aggregate, so a prefix spray is bounded without filling the per-client table.
+    const p48 = ipv6Prefix48(d.ip);
+    if (d.ip && (!abuse(env).unpaid.allow(SG.ipKey(d.ip) ?? d.ip) || (p48 !== null && !abuse(env).unpaid48.allow(p48)))) {
+      return send(429, { error: "too many unpaid requests, retry later", scope: "ip" }, { "Retry-After": "60" });
+    }
+    const pr = required(path, req.headers.get("Host") ?? "", env); return send(402, pr, { "PAYMENT-REQUIRED": b64(pr) });
+  }
   const [code, out, hd] = await paid(path, q, qs, sig, tReq, d, c, rpc, fac, req.headers.get("Host") ?? "");
   return send(code, out, hd);
 }
 
 const FAILS = new SG.FailLimiter();
-export async function resetGuards() { await FAILS.clear(); }
+type Abuse = { unpaid: WindowLimiter; unpaid48: WindowLimiter; hostPayer: WindowLimiter; perHost: WindowLimiter; failNet: WindowLimiter; failedWho: WindowLimiter; cache: ResultCache<unknown>; slots: SlotTable };
+let ABUSE: Abuse | null = null;
+/** Per-process abuse guards (A6 unpaid limit, per-target outbound limit, A7 payer+target cache, outbound concurrency). */
+export function abuse(env: Deps["env"]): Abuse {
+  if (!ABUSE) {
+    const g = guardConfig(env); configureOutbound(g.outboundConcurrency);
+    ABUSE = { unpaid: new WindowLimiter(g.unpaidPerMin), unpaid48: new WindowLimiter(g.unpaidPer48PerMin), hostPayer: new WindowLimiter(g.hostPayerPerMin),
+      perHost: new WindowLimiter(g.perHostPerMin), failNet: new WindowLimiter(g.failedSettlePerNetPerMin), failedWho: new WindowLimiter(1), cache: new ResultCache(g.cacheTtlMs), slots: new SlotTable(g.outboundConcurrency, g.slotTtlMs) };
+  }
+  return ABUSE;
+}
+/** A4 sweep with the production on-chain check; incidents go to the observations log. */
+export async function reorgSweep(env: Deps["env"], check?: (r: ReorgRec) => Promise<any>, now = Date.now()) {
+  const rpc = makeRpc(cfg(env).RPC);
+  const chk = check ?? ((x: ReorgRec) => verifyOnchain(rpc, x.tx, x.asset, x.payTo, x.amount, x.payer, x.network, 3, 1000, undefined, x.nonce, x.minConf));
+  return await sweepReorg(chk, async (x, why) => {
+    console.log("INCIDENT", why, x.path, x.tx);
+    await recordObservation(x.path, "incident", 0, null, why);
+  }, now);
+}
+/** M1: a settled check whose pending window passed unserved is logged as an incident (refund path: SECURITY.md). */
+export async function pendingSweep(now = Date.now()) {
+  return await SG.sweepExpiredPending(async (_key, rec) => {
+    console.log("INCIDENT pending_expired_unserved", rec.path, rec.tx);
+    await recordObservation(String(rec.path ?? "/x402/preflight"), "incident", 0, null, "pending_expired_unserved");
+  }, now);
+}
+/** Probe slot extension at probe start: probe timeout (5 s) + attestation eth_getCode timeout (5 s, parallel) + signing, with margin. */
+export const SLOT_PROBE_MS = 20_000;
+export async function resetGuards() { await FAILS.clear(); ABUSE = null; META_CACHE = null; }
 export const MAINNET = "eip155:8453";
 /** MIN_CONFIRMATIONS clamped to 1..64 (non-numeric or empty -> 1). */
 export function minConfirmations(env: Deps["env"]): number {
@@ -356,18 +428,67 @@ async function paid(path: string, q: Record<string, string>, qs: string, sig: st
     })());
   };
   const mismatch = (why: string) => bg(recordObservation(path, "settle-mismatch", 502, null, why).catch(() => {}));
+  // Pre-pay Check settles BEFORE probing the target (A1): an unsettled payment never causes outbound traffic.
+  const settleFirst = path === "/x402/preflight";
+  const G = abuse(env);
+  const cacheKey = (u: string) => who + "|" + u;
+  /** Probe the PAID url (or serve the payer+target cache, A7). The caller holds an outbound slot (M1). */
+  const runPreflight = async (u: string): Promise<[number, unknown]> => {
+    if (!u) return [400, { error: "give ?url=https://..." }];
+    const hit = G.cache.get(cacheKey(u)); if (hit) return [200, hit];
+    const ttlRaw = env("ATTESTATION_TTL_S") ?? ""; const ttl = /^[0-9]{1,6}$/.test(ttlRaw) ? Number(ttlRaw) : undefined; // normTtl: int >= 1 else 900
+    const res = await preflight(u, { resolver: d.resolver, fetcher: d.fetcher, env, rpc, ttlS: ttl, slotHeld: true,
+      issuerUrl: c.PUBLIC ? c.PUBLIC.replace(/\/+$/, "") + "/.well-known/issuer.json" : null });
+    if (res[0] === 200) G.cache.set(cacheKey(u), res[1]);
+    return res;
+  };
   const run = async (): Promise<[number, unknown]> => {
-    if (path === "/x402/preflight") {
-      const u = unquote(q.url ?? "");
-      return u ? await preflight(u, { resolver: d.resolver, fetcher: d.fetcher, env }) : [400, { error: "give ?url=https://..." }];
-    }
+    if (path === "/x402/preflight") return await runPreflight(unquote(q.url ?? ""));
     return await new Chain(rpc, c.USDC).handle(path, q);
+  };
+  /** Probe slot: one synchronous reservation bound to payer + payment nonce + target, 15 s TTL, one per payer. */
+  const reserve = (u: string, pending = false): { id: string } | "payer_busy" | "full" => G.slots.reserve(who, nonce, hostOf(u), clock.now(), pending);
+  const PAYER429: [number, unknown, Record<string, string>] = [429, { error: "this wallet already has a check in progress", scope: "payer", charged: false }, { "Retry-After": "5" }];
+  const CAP503 = (): [number, unknown, Record<string, string>] => [503, { error: "target check capacity is full for this minute, retry later", scope: "target", charged: false }, { "Retry-After": "60" }];
+  const BUSY503: [number, unknown, Record<string, string>] = [503, { error: "probe capacity busy, retry shortly", charged: false }, { "Retry-After": "5" }];
+  /** Pending retry of a settled Pre-pay Check (L1): uses the url that was paid for, the per target+payer limit,
+   * the global per-target budget, an outbound slot, and at most 3 attempts. */
+  const MAX_TRIES = 3;
+  const retryPending = async (key: string, pend: any, oc: any): Promise<[number, unknown, Record<string, string>]> => {
+    const u: string = typeof pend.url === "string" ? pend.url : "";
+    const tries: number = Number.isInteger(pend.tries) ? pend.tries : 0;
+    if (!u || tries >= MAX_TRIES) {
+      bg(recordObservation(path, "incident", 0, null, "pending_retries_exhausted").catch(() => {}));
+      return [502, { error: "payment settled but the check could not be completed after " + MAX_TRIES + " attempts; contact support with your transaction", transaction: pend.tx }, payResp(N, true, pend.tx, who)];
+    }
+    const cached = G.cache.get(cacheKey(u));
+    if (!cached) {
+      // The per-target budget unit was reserved before settlement and consumed by it: a retry does not take another.
+      if (!G.hostPayer.allow(hostOf(u) + "|" + who)) { await SG.setPending(key, pend); return [429, { error: "too many attempts for this target, retry later", scope: "target_payer", transaction: pend.tx }, { "Retry-After": "60" }]; }
+    }
+    // Settled retries may use the slot kept back from new buyers (L3), so saturation cannot starve them.
+    const rv = cached ? null : reserve(u, true);
+    if (rv === "payer_busy") { await SG.setPending(key, pend); return [429, { error: "this wallet already has a check in progress", scope: "payer", transaction: pend.tx }, { "Retry-After": "5" }]; }
+    if (rv === "full") { await SG.setPending(key, pend); return [503, { error: "probe capacity busy, retry shortly (no new charge)", transaction: pend.tx }, { "Retry-After": "5" }]; }
+    let rec = pend;
+    if (rv && pend.noBudget) { // L2: no budget unit was taken for this payment: take one now, or re-park
+      if (!G.perHost.allow(hostOf(u))) { G.slots.release(rv.id); await SG.setPending(key, pend); return [503, { error: "target check capacity is full, retry later (no new charge)", transaction: pend.tx }, { "Retry-After": "60" }]; }
+      const { noBudget: _nb, ...rest } = pend; rec = rest;
+    }
+    if (rv) G.slots.extend(rv.id, SLOT_PROBE_MS);
+    let code = 0, out: unknown = null;
+    try { [code, out] = await runPreflight(u); } catch { code = 0; } finally { if (rv) G.slots.release(rv.id); }
+    if (code !== 200) { await SG.setPending(key, { ...rec, tries: tries + 1 }); return [502, { error: "upstream error, retry the same request", transaction: pend.tx, attempts_left: MAX_TRIES - tries - 1 }, {}]; }
+    log(pend.tx, oc, true, pend.times); return [200, out, payResp(N, true, pend.tx, who)];
   };
   const busy: [number, unknown, Record<string, string>] = [429, { error: "too many concurrent payments, retry shortly", scope: "concurrency" }, {}];
   const release = await SG.acquireSlots({ ip: ids.ip }); // per-IP slot now; per-payer slot only after verify (L1)
   if (!release) return busy;
-  const held: { payer: (() => Promise<void>) | null } = { payer: null };
-  try { return await paidLocked(); } finally { if (held.payer) await held.payer(); await release(); }
+  // budget: a per-target budget unit reserved before settlement, bound to its window start (a release after a rollover
+  // is a no-op); returned unless a settlement consumed it (H1). slot: the probe slot id.
+  const held: { payer: (() => Promise<void>) | null; slot: string | null; budget: { host: string; start: number } | null } = { payer: null, slot: null, budget: null };
+  const freeSlot = () => { if (held.slot) G.slots.release(held.slot); held.slot = null; };
+  try { return await paidLocked(); } finally { freeSlot(); if (held.budget) G.perHost.release(held.budget.host, held.budget.start); if (held.payer) await held.payer(); await release(); }
   async function paidLocked(): Promise<[number, unknown, Record<string, string>]> {
   const lim = await FAILS.blocked(ids); // checked while holding a slot: bursts cannot overshoot by more than the slot count
   if (lim) return [429, { error: "too many failed payments, retry later", scope: lim }, {}];
@@ -378,6 +499,7 @@ async function paid(path: string, q: Record<string, string>, qs: string, sig: st
       const oc: any = await check(pend.tx, r, who);
       if (oc.settled === null) { await SG.setPending(key, pend); return [202, { status: "settled_pending_onchain_confirmation", transaction: pend.tx }, payResp(N, true, pend.tx, who)]; }
       if (oc.settled === false) { log(pend.tx, oc, false, pend.times); return [402, { error: "settlement not confirmed on-chain: " + String(oc.reason) }, {}]; }
+      if (settleFirst) return await retryPending(key, pend, oc);
       let code: number, out: unknown;
       try { [code, out] = await run(); } catch { await SG.setPending(key, pend); return [502, { error: "upstream error, retry the same request" }, {}]; }
       if (code !== 200) { await SG.setPending(key, pend); return [code, out, {}]; }
@@ -390,17 +512,80 @@ async function paid(path: string, q: Record<string, string>, qs: string, sig: st
   // so a rolled-back or restored KV can never let a spent authorization through again.
   if (await SG.authUsed(key)) return [402, { error: "payment authorization already used", hint: REUSE_HINT }, noPay("replay", N)];
   const body = { x402Version: 2, paymentPayload: withDiscovery(payload!, path, host, env), paymentRequirements: r };
+  if (settleFirst) {
+    // Rule: never charge without a result. Target capacity full -> 503 before any facilitator call (not charged).
+    const u0 = unquote(q.url ?? ""); let h0 = ""; try { h0 = new URL(u0).hostname.toLowerCase(); } catch { /* checked below */ }
+    if (h0 && !G.cache.get(cacheKey(u0)) && (!G.perHost.peek(hostOf(u0)) || !G.slots.free())) { await SG.unclaim(key); return CAP503(); }
+    // Failed-settle limit: only an IP or payer that itself failed a settle in the last minute is refused, and only while its
+    // network (/24, /48) is over the failed-settle threshold. The network count never blocks other IPs/payers in it.
+    const nk = netKey(ids.ip);
+    const failedHere = (ids.ip && !G.failedWho.peek("ip:" + (SG.ipKey(ids.ip) ?? ids.ip))) || !G.failedWho.peek("payer:" + who);
+    if (nk && failedHere && !G.failNet.peek(nk)) { await SG.unclaim(key); return [429, { error: "too many failed payments, retry later", scope: "failed_settle", charged: false }, { "Retry-After": "60" }]; }
+  }
   const v = await fac("/verify", body); const tVer = iso(); logBazaar("verify", path, v);
   if (!v.isValid) { const why = facErr(v.invalidReason); await FAILS.fail({ ip: ids.ip }, "verify"); return [402, { error: why }, noPay(why, N)]; }
   held.payer = await SG.acquireSlots({ payer: who }); // L1: a forged `from` never reaches this line
   if (!held.payer) { await SG.unclaim(key); return busy; } // not settled: the same authorization may be retried
   if (await FAILS.blocked({ payer: who })) { await SG.unclaim(key); return [429, { error: "too many failed payments, retry later", scope: "payer" }, {}]; }
-  let code: number, out: unknown;
-  try { [code, out] = await run(); } catch (e) {
-    if (e instanceof SigningUnavailable) return [503, { error: "signing unavailable, not charged" }, {}];
-    return [502, { error: "upstream error, not charged" }, {}];
+  let code = 0, out: unknown = null;
+  if (settleFirst) {
+    // Cheap input checks before settlement (not charged, authorization released): URL shape, SSRF policy (A8), per-target budget.
+    const u = unquote(q.url ?? "");
+    if (!u) { await SG.unclaim(key); return [400, { error: "give ?url=https://...", charged: false }, {}]; }
+    const chk = await checkUrl(u, d.resolver);
+    if (!chk.u) { await SG.unclaim(key); return [400, { error: chk.err, target_url_allowed: false, charged: false }, {}]; }
+    if (!G.cache.get(cacheKey(u))) {
+      // H1: before settlement only a per target+payer limit applies; the global per-target budget is counted after settlement.
+      if (!G.hostPayer.allow(hostOf(u) + "|" + who)) {
+        await SG.unclaim(key); return [429, { error: "too many checks of this target by this payer in the last minute, retry later", scope: "target_payer", charged: false }, { "Retry-After": "60" }];
+      }
+      // Order: cache (above) -> per-payer limit (above) -> slot -> target budget -> settle -> probe.
+      // Reserve the probe slot AND one unit of the target's global budget before settlement; either missing -> 503, not charged.
+      const rv = reserve(u);
+      if (rv === "payer_busy") { await SG.unclaim(key); return PAYER429; }
+      if (rv === "full") { await SG.unclaim(key); return BUSY503; }
+      held.slot = rv.id;
+      if (!G.perHost.allow(hostOf(u))) { freeSlot(); await SG.unclaim(key); return CAP503(); }
+      held.budget = { host: hostOf(u), start: G.perHost.windowStart(hostOf(u))! };
+    }
+  } else {
+    try { [code, out] = await run(); } catch (e) {
+      if (e instanceof SigningUnavailable) return [503, { error: "signing unavailable, not charged" }, {}];
+      return [502, { error: "upstream error, not charged" }, {}];
+    }
+    if (code !== 200) return [code, out, {}]; // bad input: not settled, not charged
   }
-  if (code !== 200) return [code, out, {}]; // bad input: not settled, not charged
+  /** A4: persist a post-delivery settlement re-check in KV (survives restarts); the reorg-recheck cron processes it. */
+  const watchReorg = (tx: string) => {
+    const ms = /^[0-9]{1,7}$/.test(env("REORG_RECHECK_MS") ?? "") ? Number(env("REORG_RECHECK_MS")) : 120_000;
+    bg(scheduleReorgCheck({ path, tx, payer: who, asset: r.asset, payTo: r.payTo, amount: r.amount, nonce, network: N, minConf }, ms)
+      .catch((e) => console.log("reorg schedule failed:", (e as Error).name)));
+  };
+  /** Serve after settlement. Settle-first routes run the handler now; if it cannot finish, the payment is parked
+   * and the same request is served on retry (pending path). */
+  const deliver = async (tx: string, oc: any, times: [string, string, string]): Promise<[number, unknown, Record<string, string>]> => {
+    if (settleFirst) {
+      const u = unquote(q.url ?? "");
+      held.budget = null; // settled: the reserved budget unit is consumed; the probe runs now on the reserved slot
+      const hit = G.cache.get(cacheKey(u)) != null;
+      // Slot expired during settlement (TTL), or the cache entry expired since the check: the payment is kept (no second
+      // charge) and the same request is served free on retry via the pending path.
+      if ((held.slot && !G.slots.valid(held.slot)) || (!held.slot && !hit)) {
+        // noBudget: the cache-hit path reserved no budget unit; the retry must take one before probing (L2).
+        const noBudget = !held.slot; freeSlot(); await SG.setPending(key, { path, tx, times, url: u, tries: 0, ...(noBudget ? { noBudget: true } : {}) });
+        return [502, { error: "the probe slot expired during settlement; repeat the same request to receive the result (no new charge)", transaction: tx, retry_free: true }, { ...payResp(N, true, tx, who), "Retry-After": "2" }];
+      }
+      let ok = false;
+      if (held.slot) G.slots.extend(held.slot, SLOT_PROBE_MS); // L1: slot covers probe timeout + attestation RPC
+      try { [code, out] = await runPreflight(u); ok = code === 200; } catch { ok = false; } finally { freeSlot(); }
+      if (!ok) {
+        await SG.setPending(key, { path, tx, times, url: u, tries: 1 });
+        return [502, { error: "payment settled but the check could not complete; repeat the same request to receive it", transaction: tx }, payResp(N, true, tx, who)];
+      }
+    }
+    log(tx, oc, true, times); watchReorg(tx);
+    return [200, out, payResp(N, true, tx, who)];
+  };
   // point of no return: record the authorization as consumed (fsync'ed) before asking for settlement
   if (!await SG.consumeAuth(key, { path, payload_sha256: await SG.payloadHash(payload!) })) return [402, { error: "payment authorization already used", hint: REUSE_HINT }, noPay("replay", N)];
   const st = await fac("/settle", body); const tSet = iso(); logBazaar("settle", path, st); const times: [string, string, string] = [tReq, tVer, tSet];
@@ -409,22 +594,25 @@ async function paid(path: string, q: Record<string, string>, qs: string, sig: st
   if (!st.success) {
     const oc: any = tx ? await check(tx, r, who) : { settled: false, reason: "no_tx_hash" };
     if (oc.settled === true && tx && await SG.claimTx(tx)) { // facilitator said failed, chain says paid: honor it
-      log(tx, { ...oc, note: "settle_reported_failure_but_confirmed_onchain" }, true, times);
-      return [200, out, payResp(N, true, tx, who)];
+      return await deliver(tx, { ...oc, note: "settle_reported_failure_but_confirmed_onchain" }, times);
     }
+    freeSlot(); // settle failed: release the slot now (the budget unit is returned in finally)
+    { const nk = netKey(ids.ip); if (nk) G.failNet.allow(nk); if (ids.ip) G.failedWho.allow("ip:" + (SG.ipKey(ids.ip) ?? ids.ip)); G.failedWho.allow("payer:" + who); }
     const why = facErr(st.errorReason); await FAILS.fail(ids, "settle");
     return [402, { error: why, hint: REUSE_HINT }, payResp(N, false, tx, who, why)]; // the authorization is spent
   }
+  held.budget = null; // the facilitator settled: the budget unit is consumed even if what follows fails
   if (!tx) { mismatch("settle_success_without_valid_tx_hash"); return [502, { error: "settlement response invalid, contact support with your payment" }, {}]; }
   if (!await SG.claimTx(tx)) { mismatch("settlement_tx_reused"); return [409, { error: "settlement transaction already used" }, noPay("replay", N)]; }
   const oc: any = await check(tx, r, who);
   if (mode === "log") {
-    log(tx, oc, true, times); if (oc.settled !== true) mismatch("onchain_" + String(oc.reason));
-    return [200, out, payResp(N, true, tx, who)];
+    if (oc.settled !== true) mismatch("onchain_" + String(oc.reason));
+    return await deliver(tx, oc, times);
   }
-  if (oc.settled === true) { log(tx, oc, true, times); return [200, out, payResp(N, true, tx, who)]; }
+  if (oc.settled === true) return await deliver(tx, oc, times);
   if (oc.settled === null) {
-    await SG.setPending(key, { path, tx, times });
+    freeSlot();
+    await SG.setPending(key, { path, tx, times, ...(settleFirst ? { url: unquote(q.url ?? ""), tries: 0 } : {}) });
     return [202, { status: "settled_pending_onchain_confirmation", transaction: tx,
       retry: "repeat the same request with the same payment header; it is served once the transfer is confirmed on Base" }, payResp(N, true, tx, who)];
   }
@@ -455,6 +643,8 @@ if (import.meta.main) {
   if ((env("SNAPSHOT_SCHEDULER") ?? "1") === "1") {
     Deno.cron("bazaar-snapshot", "15 0 * * *", async () => { await scheduledSnapshot(); }); // bounded, max once per UTC day
     Deno.cron("fail-counter-purge", "7 0 * * *", async () => { await FAILS.purge(); });
+    Deno.cron("pending-expiry", "*/5 * * * *", async () => { await pendingSweep(); }); // M1: unserved paid checks -> incident
+    Deno.cron("reorg-recheck", "*/2 * * * *", async () => { await reorgSweep(env); }); // A4: persisted post-delivery re-checks
   }
   for (const w of startupWarnings(env)) console.warn("WARNING:", w);
   const lerr = LG.ledgerConfigError(env); if (lerr) throw new Error(lerr); // refuse to start without a durable ledger

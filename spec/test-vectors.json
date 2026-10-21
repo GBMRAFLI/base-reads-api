@@ -1,0 +1,210 @@
+{
+ "license": "CC0-1.0",
+ "jcs": [
+  {
+   "input": {
+    "b": 1,
+    "a": 2
+   },
+   "canonical": "{\"a\":2,\"b\":1}"
+  },
+  {
+   "input": {
+    "u": "é 😀\"\\\n\t\u0001",
+    "€": 1,
+    "😀": 2,
+    "a": 3
+   },
+   "canonical": "{\"a\":3,\"u\":\"é 😀\\\"\\\\\\n\\t\\u0001\",\"€\":1,\"😀\":2}"
+  },
+  {
+   "input": [
+    1,
+    0,
+    10,
+    1e+21,
+    0.5,
+    123456789012,
+    null,
+    true,
+    false
+   ],
+   "canonical": "[1,0,10,1e+21,0.5,123456789012,null,true,false]"
+  },
+  {
+   "input": {
+    "nested": {
+     "z": [],
+     "a": {}
+    },
+    "": ""
+   },
+   "canonical": "{\"\":\"\",\"nested\":{\"a\":{},\"z\":[]}}"
+  },
+  {
+   "input": {
+    "amount": "1000",
+    "network": "eip155:8453"
+   },
+   "canonical": "{\"amount\":\"1000\",\"network\":\"eip155:8453\"}"
+  }
+ ],
+ "signed": {
+  "public_key_b64": "ZszYRjhi4K1ImeY3opR4Dr38gsfj34axxAip33qMbwo=",
+  "key_id": "224386300d6c7386",
+  "signing_bytes_utf8": "prepay-check-attestation/v1\n{\"attestation_id\":\"00000000-0000-4000-8000-000000000001\",\"canonicalization\":\"JCS\",\"claims\":{\"checks\":[{\"id\":\"endpoint_reachable\",\"observed\":402,\"status\":\"pass\"},{\"expected\":402,\"id\":\"http_402_returned\",\"observed\":402,\"status\":\"pass\"},{\"id\":\"challenge_well_formed\",\"observed\":[],\"status\":\"pass\"},{\"expected\":\"eip155:8453\",\"id\":\"network_is_base\",\"observed\":[\"eip155:8453\"],\"status\":\"pass\"},{\"expected\":\"0x833589fcd6edb6e08f4c7c32d4f71b54bda02913\",\"id\":\"asset_is_base_usdc\",\"observed\":[\"0x833589fcd6edb6e08f4c7c32d4f71b54bda02913\"],\"status\":\"pass\"},{\"id\":\"payto_is_eoa\",\"observed\":[{\"address\":\"0x2222222222222222222222222222222222222222\",\"kind\":\"eoa\"}],\"status\":\"pass\"},{\"id\":\"bazaar_snapshot_available\",\"observed\":\"no_snapshot\",\"status\":\"fail\"},{\"id\":\"listed_in_bazaar\",\"observed\":null,\"status\":\"not_applicable\"},{\"expected\":\"<= 5000 ms\",\"id\":\"responds_within_5000ms\",\"observed\":120,\"status\":\"pass\"},{\"id\":\"pay_to_matches_snapshot\",\"observed\":{\"challenge\":[\"0x2222222222222222222222222222222222222222\"],\"snapshot\":null},\"status\":\"not_applicable\"}],\"checks_failed\":[\"bazaar_snapshot_available\"],\"checks_passed\":[\"endpoint_reachable\",\"http_402_returned\",\"challenge_well_formed\",\"network_is_base\",\"asset_is_base_usdc\",\"payto_is_eoa\",\"responds_within_5000ms\"],\"facts\":{\"bazaar\":{\"available\":false,\"reason\":\"no_snapshot\"},\"challenge\":{\"accepts\":[{\"amount\":\"10000\",\"asset\":\"0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913\",\"network\":\"eip155:8453\",\"payTo\":\"0x2222222222222222222222222222222222222222\",\"scheme\":\"exact\"}],\"problems\":[],\"valid\":true},\"checked_at\":\"2026-10-21T05:00:00Z\",\"disclaimer\":\"Deterministic observations only. Not advice to pay, buy or sell.\",\"reachability\":{\"http_status\":402,\"latency_ms\":120,\"reachable\":true},\"schema\":\"prepay-check/v1\",\"target\":\"https://a.example/x\"},\"pay_to_matches_snapshot\":null,\"payto_code\":[{\"address\":\"0x2222222222222222222222222222222222222222\",\"code_bytes\":0,\"kind\":\"eoa\"}]},\"expires_at\":\"2026-10-21T05:15:00Z\",\"issued_at\":\"2026-10-21T05:00:00Z\",\"issuer\":{\"contact\":\"gbmrafli@agentmail.to\",\"issuer_url\":\"https://issuer.example/.well-known/issuer.json\",\"key_id\":\"224386300d6c7386\",\"name\":\"Base Reads Pre-pay Check\"},\"spec\":\"prepay-check-attestation\",\"subject\":{\"type\":\"x402_endpoint\",\"url\":\"https://a.example/x\"},\"version\":\"1.0\"}",
+  "attestation": {
+   "spec": "prepay-check-attestation",
+   "version": "1.0",
+   "canonicalization": "JCS",
+   "attestation_id": "00000000-0000-4000-8000-000000000001",
+   "issued_at": "2026-10-21T05:00:00Z",
+   "expires_at": "2026-10-21T05:15:00Z",
+   "issuer": {
+    "name": "Base Reads Pre-pay Check",
+    "key_id": "224386300d6c7386",
+    "issuer_url": "https://issuer.example/.well-known/issuer.json",
+    "contact": "gbmrafli@agentmail.to"
+   },
+   "subject": {
+    "type": "x402_endpoint",
+    "url": "https://a.example/x"
+   },
+   "claims": {
+    "facts": {
+     "schema": "prepay-check/v1",
+     "target": "https://a.example/x",
+     "checked_at": "2026-10-21T05:00:00Z",
+     "disclaimer": "Deterministic observations only. Not advice to pay, buy or sell.",
+     "reachability": {
+      "reachable": true,
+      "http_status": 402,
+      "latency_ms": 120
+     },
+     "challenge": {
+      "valid": true,
+      "problems": [],
+      "accepts": [
+       {
+        "scheme": "exact",
+        "network": "eip155:8453",
+        "amount": "10000",
+        "asset": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
+        "payTo": "0x2222222222222222222222222222222222222222"
+       }
+      ]
+     },
+     "bazaar": {
+      "available": false,
+      "reason": "no_snapshot"
+     }
+    },
+    "payto_code": [
+     {
+      "address": "0x2222222222222222222222222222222222222222",
+      "kind": "eoa",
+      "code_bytes": 0
+     }
+    ],
+    "pay_to_matches_snapshot": null,
+    "checks": [
+     {
+      "id": "endpoint_reachable",
+      "status": "pass",
+      "observed": 402
+     },
+     {
+      "id": "http_402_returned",
+      "status": "pass",
+      "observed": 402,
+      "expected": 402
+     },
+     {
+      "id": "challenge_well_formed",
+      "status": "pass",
+      "observed": []
+     },
+     {
+      "id": "network_is_base",
+      "status": "pass",
+      "observed": [
+       "eip155:8453"
+      ],
+      "expected": "eip155:8453"
+     },
+     {
+      "id": "asset_is_base_usdc",
+      "status": "pass",
+      "observed": [
+       "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913"
+      ],
+      "expected": "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913"
+     },
+     {
+      "id": "payto_is_eoa",
+      "status": "pass",
+      "observed": [
+       {
+        "address": "0x2222222222222222222222222222222222222222",
+        "kind": "eoa"
+       }
+      ]
+     },
+     {
+      "id": "bazaar_snapshot_available",
+      "status": "fail",
+      "observed": "no_snapshot"
+     },
+     {
+      "id": "listed_in_bazaar",
+      "status": "not_applicable",
+      "observed": null
+     },
+     {
+      "id": "responds_within_5000ms",
+      "status": "pass",
+      "observed": 120,
+      "expected": "<= 5000 ms"
+     },
+     {
+      "id": "pay_to_matches_snapshot",
+      "status": "not_applicable",
+      "observed": {
+       "challenge": [
+        "0x2222222222222222222222222222222222222222"
+       ],
+       "snapshot": null
+      }
+     }
+    ],
+    "checks_passed": [
+     "endpoint_reachable",
+     "http_402_returned",
+     "challenge_well_formed",
+     "network_is_base",
+     "asset_is_base_usdc",
+     "payto_is_eoa",
+     "responds_within_5000ms"
+    ],
+    "checks_failed": [
+     "bazaar_snapshot_available"
+    ]
+   },
+   "signature": {
+    "alg": "Ed25519",
+    "key_id": "224386300d6c7386",
+    "value_b64": "9emF8oDRHWl6OhgUzUp/4c+qFeZwDmBtxHkC6dUFJRy3u8c9XrW0gyETi+SIvkDJOCPyGSA9dhPZkBNK3HgkDA=="
+   }
+  },
+  "issuer": {
+   "keys": [
+    {
+     "alg": "Ed25519",
+     "key_id": "224386300d6c7386",
+     "public_key_b64": "ZszYRjhi4K1ImeY3opR4Dr38gsfj34axxAip33qMbwo=",
+     "status": "active"
+    }
+   ]
+  }
+ }
+}

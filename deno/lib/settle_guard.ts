@@ -80,11 +80,31 @@ export function expiry(p: Record<string, any>, margin = 60): number | null {
 export function nonceOf(p: Record<string, any>): string | null {
   const n = String(authorization(p)?.nonce ?? ""); return NONCE_RE.test(n) ? n.toLowerCase() : null;
 }
-export async function setPending(key: string, rec: unknown) { await (await kv()).set(["pending", key], rec, { expireIn: 3600_000 }); }
-/** Atomically remove and return a parked delivery, so two concurrent retries cannot both be served. */
-export async function takePending(key: string): Promise<any | null> {
-  const k = await kv(); const e = await k.get(["pending", key]);
+export const PENDING_TTL_MS = 3600_000;
+/** Park a settled, undelivered check. `until` is fixed at the first park; re-parking keeps it. The KV record outlives
+ * `until` by a day so the expiry sweep can see it; ["pendexp", until, key] indexes it for that sweep. */
+export async function setPending(key: string, rec: Record<string, any>, now = Date.now()) {
+  const until = typeof rec.until === "number" ? rec.until : now + PENDING_TTL_MS; const r: Record<string, any> = { ...rec, until };
+  const op = (await kv()).atomic().set(["pending", key], r, { expireIn: until - now + 86400_000 })
+    .set(["pendexp", until, key], r.tx ?? null, { expireIn: until - now + 86400_000 });
+  await op.commit();
+}
+/** Pending records whose `until` passed without being served: atomically removed (versionstamp-checked), then reported. */
+export async function sweepExpiredPending(onExpired: (key: string, rec: any) => Promise<void>, now = Date.now(), limit = 100) {
+  const k = await kv(); const out: string[] = [];
+  for await (const ix of k.list<string | null>({ start: ["pendexp", 0], end: ["pendexp", now] }, { limit })) {
+    const key = String(ix.key[2]); const e = await k.get<any>(["pending", key]);
+    if (e.versionstamp === null || e.value?.until !== ix.key[1]) { await k.atomic().check(ix).delete(ix.key).commit(); continue; } // served or re-parked
+    const op = k.atomic().check(e).check(ix).delete(e.key).delete(ix.key);
+    if ((await op.commit()).ok) { await onExpired(key, e.value); out.push(key); }
+  }
+  return out;
+}
+/** Atomically remove and return a parked delivery, so two concurrent retries cannot both be served. Expired -> null. */
+export async function takePending(key: string, now = Date.now()): Promise<any | null> {
+  const k = await kv(); const e = await k.get<any>(["pending", key]);
   if (e.versionstamp === null) return null;
+  if (typeof e.value?.until === "number" && e.value.until <= now) return null; // left for the expiry sweep (incident)
   const r = await k.atomic().check(e).delete(["pending", key]).commit();
   return r.ok ? e.value : null;
 }

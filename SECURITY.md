@@ -68,3 +68,34 @@ The Python server (`api/`) keeps its replay map, used-tx set and failed-settle c
 ## Open items
 - Python replay claims and pending deliveries are in process memory: a restart forgets them (the USDC contract still
   rejects a reused nonce on-chain, and the sales-log tx check survives restarts). Deno Deploy uses KV and is durable.
+
+## Re-audit hardening (paid Pre-pay Check)
+
+- Before settlement the service applies a per target+payer limit (default 3/min, `PER_TARGET_PAYER_PER_MIN`) and reserves both an outbound slot and one unit of the target's global budget (`OUTBOUND_PER_HOST_PER_MIN`). If either is unavailable the answer is 503 with `Retry-After` and `charged:false`; when the target is already full this happens before any facilitator call. A failed settlement returns the reserved unit, so failed settles never consume the budget; a successful settlement consumes it and the probe runs immediately. A buyer is never charged into a queue.
+- An outbound slot is reserved before settlement without waiting; if none is free the request gets 503 and is not charged. At most one probe per payer is in flight.
+- Rate-limit tables evict the oldest key when full instead of refusing new clients. IPv6 clients are limited per /64 and per /48 aggregate (`UNPAID_PER_48_PER_MIN`, default 600).
+- A pending (settled, not yet delivered) check stores the paid URL; retries probe that URL only, at most 3 attempts, under the same limits.
+- Post-delivery settlement re-checks are persisted in KV (7-day expiry) and processed by a cron sweep every 2 minutes, so they survive restarts.
+- Signed snapshot metadata carries `snapshot_sha256` for the last 30 days. Limitation: the per-day hash is computed from the same KV that stores the snapshot, so it detects post-publication changes and inconsistent copies, not a compromise of the storage that wrote both.
+
+## Python reference implementation
+
+The Python code in `api/` is a reference implementation used for test vectors and cross-checks. It is not deployed and does not implement the paid-route abuse guards (settle-before-probe ordering, rate limits, outbound slots, pending retries, post-delivery re-checks). Only the Deno service under `deno/` serves traffic.
+
+## Queued and expired paid checks
+
+- Pending is used only for a settlement not yet visible on-chain and for a probe that failed after settlement; a retry probes the paid URL and does not take another budget unit.
+- A pending check keeps a fixed 1-hour window from its first park. If it is not served in that window, a sweep (every 5 minutes) removes it atomically and logs a `pending_expired_unserved` incident with the settlement transaction. Refund path: the buyer contacts the issuer contact address with the transaction hash; the incident record is used to confirm the unserved payment and the amount is returned to the payer address.
+- Signed snapshot metadata is cached for 60 seconds.
+- Post-delivery re-check records are keyed by due time; a sweep lists only due records and removes each with a versionstamp-checked atomic delete before reporting.
+
+## Probe slots
+
+- Order on the paid route: result cache, then per target+payer limit, then probe slot, then target budget, then settlement, then probe.
+- A slot is reserved in one synchronous step after the payment signature is verified and before settlement. It is bound to payer + payment nonce (the idempotency key) + target host, lives 15 seconds (`PROBE_SLOT_TTL_S`), and each payer may hold one (a second parallel request from the same wallet gets 429). Unpaid requests reserve nothing.
+- One slot is kept for retries of already-settled checks, so new buyers cannot starve them.
+- Cache hit: a cached result for the same payer and target is still a paid result. It settles without taking a slot, since no outbound probe runs.
+- Settlement fails: the slot is released immediately and the answer is 402. Abandoned request: the slot expires after its TTL, nothing is charged. Slot expired during settlement: the payment is kept and the answer is 502 with `retry_free: true`; repeating the same request is served from the pending path without a second charge. All slots taken: 503 with `Retry-After`, nothing charged.
+- Failed settlements are counted per network (IPv4 /24, IPv6 /48; `FAILED_SETTLE_PER_NET_PER_MIN`, default 10). While a network is over that count, only the IPs and payers in it that themselves failed a settlement in the last minute are refused (429, before verification); other buyers on the same network are never affected. This limit only slows repeat offenders: a sender that rotates IPs or payers is never refused by it, which is harmless because a failed settlement is never charged and the probe slot is released immediately.
+- The slot is extended to 20 seconds when the probe starts, covering the probe timeout (5 s) and the attestation `eth_getCode` lookups (5 s timeout each, run in parallel), so it cannot lapse mid-probe.
+- If a cached result expired between the pre-check and delivery, the free retry takes a target budget unit before probing; without one it is re-parked (503, no new charge).
