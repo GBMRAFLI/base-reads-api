@@ -12,7 +12,7 @@ import { SCHEMA, snapshotDates, loadIndex, readSnapMeta, checkUrl, configureOutb
 import { clock, guardConfig, ipv6Prefix48, metaEpoch, netKey, ResultCache, SlotTable, WindowLimiter } from "./lib/guards.ts";
 import { scheduleReorgCheck, sweepReorg, type ReorgRec } from "./lib/reorg.ts";
 import { isoOrNull, keyHistory, loadKey, publicKeyInfo, sign, signJcs, SigningUnavailable } from "./lib/sign.ts";
-import { CANON, CONTACT, ISSUER_NAME, SPEC, VERSION } from "./lib/attestation.ts";
+import { CANON, CONTACT, DOMAIN_ATTESTATION, DOMAIN_SNAPSHOT_META, ISSUER_NAME, SPEC, VERSION } from "./lib/attestation.ts";
 import ATT_SCHEMA from "../spec/prepay-check-attestation-v1.schema.json" with { type: "json" };
 import { scheduledSnapshot, latestSnapStatus, loadFail, mapErrorCode } from "./lib/snapshot.ts";
 import { EXPORT_FILES, kv, rows } from "./lib/store.ts";
@@ -103,7 +103,7 @@ export function llmsTxt(env: Deps["env"]) {
     "", "## Discovery (free)", "", "- / : service index with routes and prices", "- /openapi.json : OpenAPI 3.1 description of the paid routes with prices", "- /bazaar/snapshots : daily Bazaar snapshot summary",
     "- /.well-known/bazaar-snapshot.json : signed snapshot series metadata", "- /.well-known/x402-preflight : Pre-pay Check schema and signing key",
     "- /.well-known/x402-preflight-key-history.json : signing key history",
-    "- /.well-known/issuer.json : attestation issuer, contact and signing keys (active and retired)", "- /.well-known/prepay-check-attestation-v1.schema.json : JSON Schema of the signed attestation (CC0)", "- /x402/preflight/pubkey : Ed25519 public key for verifying signed facts",
+    "- /.well-known/issuer.json : attestation issuer, contact and signing keys (active and retired), plus machine-readable signing rules and verify steps. v1.0 attestation: Ed25519 (RFC 8032) over UTF-8 of \"prepay-check-attestation/v1\" + LF followed by RFC 8785 (JCS) of the attestation without its signature member; snapshot meta uses the prefix \"bazaar-snapshot-meta/v1\" + LF", "- /.well-known/prepay-check-attestation-v1.schema.json : JSON Schema of the signed attestation (CC0)", "- /x402/preflight/pubkey : Ed25519 public key for verifying signed facts",
     "- Each 402 challenge carries extensions.bazaar (input schema and output example) for x402 Bazaar listing", "", "Facts only, no investment advice.", ""];
   return L.join("\n");
 }
@@ -125,6 +125,32 @@ export async function wellKnown(env: Deps["env"]) {
     facilitator: facilitatorInfo(env), repo: env("REPO_URL") ?? "https://github.com/GBMRAFLI/base-reads-api",
     routes: { pubkey: "/x402/preflight/pubkey", key_history: "/.well-known/x402-preflight-key-history.json", paid_check: "/x402/preflight", snapshots: "/bazaar/snapshots", snapshot_meta: "/.well-known/bazaar-snapshot.json" } };
 }
+const hexOf = (s: string) => Array.from(new TextEncoder().encode(s), (b) => b.toString(16).padStart(2, "0")).join("");
+/** Machine-readable signing rules in issuer.json. Built from the same constants the signer uses, so docs cannot drift. */
+export const signingSpec = () => ({
+  algorithm: "Ed25519", algorithm_ref: "RFC 8032 (pure Ed25519, no pre-hash)",
+  canonicalization: CANON, canonicalization_ref: "RFC 8785", text_encoding: "UTF-8",
+  message: "signing_prefix || JCS(payload)",
+  public_key_encoding: "keys[].public_key_b64: standard base64 (RFC 4648, padded) of the raw 32-byte Ed25519 public key",
+  signature_encoding: "signature.value_b64: standard base64 (RFC 4648, padded) of the 64-byte Ed25519 signature",
+  key_id_derivation: "first 16 lowercase hex chars of sha256(raw 32-byte public key)",
+  domains: {
+    attestation: { signing_prefix: DOMAIN_ATTESTATION, signing_prefix_hex: hexOf(DOMAIN_ATTESTATION),
+      source: "/x402/preflight response, member \"attestation\"", payload: "the attestation object with its \"signature\" member removed (every other member is signed)",
+      signature_location: "attestation.signature" },
+    snapshot_meta: { signing_prefix: DOMAIN_SNAPSHOT_META, signing_prefix_hex: hexOf(DOMAIN_SNAPSHOT_META),
+      source: "/.well-known/bazaar-snapshot.json", payload: "the \"metadata\" member", signature_location: "signature" },
+  },
+});
+export const VERIFY_STEPS = [
+  "Pick the domain in signing.domains (attestation for /x402/preflight \"attestation\", snapshot_meta for /.well-known/bazaar-snapshot.json).",
+  "Build the payload: for an attestation, remove the \"signature\" member (all other members are signed); for snapshot meta, take \"metadata\".",
+  "Serialize the payload with RFC 8785 JSON Canonicalization Scheme (JCS) and encode it as UTF-8.",
+  "Prepend the UTF-8 bytes of signing_prefix (attestation: \"prepay-check-attestation/v1\" + LF, hex 7072657061792d636865636b2d6174746573746174696f6e2f76310a; snapshot meta: \"bazaar-snapshot-meta/v1\" + LF). Message = signing_prefix || JCS(payload). Without the prefix the signature does not verify.",
+  "Find the key in keys[] whose key_id equals signature.key_id; key_id = first 16 lowercase hex chars of sha256(raw 32-byte public key); public_key_b64 is standard base64 of that raw key.",
+  "Verify signature.value_b64 (standard base64, 64 bytes) over the message with Ed25519 (RFC 8032).",
+  "Reject unless spec == \"prepay-check-attestation\", version == \"1.0\" and canonicalization == \"JCS\"; reject unless issued_at and expires_at are valid UTC timestamps with 0 <= expires_at - issued_at <= 86400 s; reject if now > expires_at, if issued_at is more than 60 s in the future, or if the key was retired before issued_at. Recommended: pin the expected key_id (or fingerprint) out of band instead of trusting any listed key.",
+];
 /** Attestation issuer document: identity, contact and every signing key (active + retired) so old attestations stay verifiable. */
 export async function issuerDoc(env: Deps["env"]) {
   const h = await keyHistory(env); const base = cfg(env).PUBLIC.replace(/\/+$/, "");
@@ -132,11 +158,8 @@ export async function issuerDoc(env: Deps["env"]) {
     canonicalization: CANON, signature_alg: "Ed25519", keys: [h.current, ...h.retired],
     schema: "/.well-known/prepay-check-attestation-v1.schema.json",
     key_policy: "Signing keys are generated and held only in the production server environment and are never published or exported. Rotation adds the new key as active and keeps old keys listed as retired with retired_at.",
-    verify: ["Remove the \"signature\" member from the attestation object.",
-      "Serialize the rest with RFC 8785 JSON Canonicalization Scheme (JCS) as UTF-8 bytes.",
-      "Find the key in keys[] whose key_id equals signature.key_id; key_id = first 16 hex chars of sha256(raw 32-byte public key).",
-      "Verify signature.value_b64 (base64) over those bytes with Ed25519 (RFC 8032).",
-      "Optionally reject if now > expires_at, or if the key was retired before issued_at."] };
+    signing: signingSpec(),
+    verify: VERIFY_STEPS };
 }
 /** Free, signed metadata about the daily Bazaar snapshot series (no snapshot contents). */
 /** L3: the signed snapshot meta is cached for 60 s (it reads up to 31 KV entries and signs on every build). */

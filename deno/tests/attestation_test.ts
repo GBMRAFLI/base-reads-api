@@ -180,3 +180,34 @@ Deno.test("L1 huge-integer network in a 402: summary null, attestation still pro
   const [c2, r2]: any = await preflight("https://a.example/x", { resolver: async () => ["93.184.216.34"], fetcher, signer: boom, now: NOW, env });
   assertEquals([c2, r2.attestation, r2.attestation_error, !!r2.signature], [200, null, "attestation_unavailable", true]);
 });
+
+// Docs-drift guard: verify a real attestation and real snapshot meta using ONLY the rules read from the served issuer.json.
+async function verifyByIssuerDoc(iss: any, domain: string, payload: unknown, sig: { key_id: string; value_b64: string }, usePrefix = true) {
+  const s = iss.signing; const d = s.domains[domain];
+  assertEquals([s.algorithm, s.canonicalization, s.canonicalization_ref, s.text_encoding, s.message], ["Ed25519", "JCS", "RFC 8785", "UTF-8", "signing_prefix || JCS(payload)"]);
+  assertEquals(Array.from(new TextEncoder().encode(d.signing_prefix), (b) => b.toString(16).padStart(2, "0")).join(""), d.signing_prefix_hex);
+  const key = iss.keys.find((k: any) => k.key_id === sig.key_id); assert(key, "key listed");
+  const raw = Uint8Array.from(atob(key.public_key_b64), (c) => c.charCodeAt(0)); assertEquals(raw.length, 32);
+  assertEquals(hex(await crypto.subtle.digest("SHA-256", raw)).slice(0, 16), key.key_id);
+  const msg = new TextEncoder().encode((usePrefix ? d.signing_prefix : "") + jcs(payload));
+  const pk = await crypto.subtle.importKey("raw", raw, { name: s.algorithm }, false, ["verify"]);
+  return crypto.subtle.verify(s.algorithm, pk, Uint8Array.from(atob(sig.value_b64), (c) => c.charCodeAt(0)), msg);
+}
+Deno.test("issuer.json signing rules alone verify a real attestation and snapshot meta; no prefix -> fail", async () => {
+  useKv(await Deno.openKv(":memory:"));
+  const iss = await (await handler(new Request("http://h.example/.well-known/issuer.json"), { env })).json();
+  assertEquals(iss.signing.domains.attestation.signing_prefix, "prepay-check-attestation/v1\n");
+  assertEquals(iss.signing.domains.snapshot_meta.signing_prefix, "bazaar-snapshot-meta/v1\n");
+  assert(iss.verify.some((x: string) => x.includes("7072657061792d636865636b2d6174746573746174696f6e2f76310a")));
+  // Real attestation signed with the served (throwaway test) key, through the production signer path.
+  const { envSigner } = await import("../lib/sign.ts");
+  const e: any = await attest(facts(), { signer: await envSigner(env), now: NOW });
+  const { signature, ...payload } = e;
+  assert(await verifyByIssuerDoc(iss, "attestation", payload, signature));
+  assert(!await verifyByIssuerDoc(iss, "attestation", payload, signature, false), "must fail without prefix");
+  assert(!await verifyByIssuerDoc(iss, "snapshot_meta", payload, signature), "wrong domain must fail");
+  assert(!await verifyByIssuerDoc(iss, "attestation", { ...payload, version: "9" }, signature), "tamper must fail");
+  const m: any = await (await handler(new Request("http://h.example/.well-known/bazaar-snapshot.json"), { env })).json();
+  assert(await verifyByIssuerDoc(iss, "snapshot_meta", m.metadata, m.signature));
+  assert(!await verifyByIssuerDoc(iss, "snapshot_meta", m.metadata, m.signature, false));
+});

@@ -139,4 +139,31 @@ class TAttack(unittest.TestCase):
         self.assertFalse(VA.verify_snapshot_binding(e, {"snapshots": []})[0])
         y = AT.attest(facts(), s, now=NOW - 86400)
         self.assertEqual(VA.verify(y, iss, now=NOW)[1], "expired at 2026-10-20T05:15:00Z"); self.assertEqual(AT.verify(y, pub, now=NOW), (False, "expired"))
+class TIssuerDocDrift(unittest.TestCase):
+    """Verify a real attestation and real snapshot meta using ONLY the rules read from the served issuer.json."""
+    def _verify(self, iss, domain, payload, sig, use_prefix=True):
+        s = iss["signing"]; d = s["domains"][domain]
+        self.assertEqual((s["algorithm"], s["canonicalization"], s["canonicalization_ref"], s["text_encoding"], s["message"]), ("Ed25519", "JCS", "RFC 8785", "UTF-8", "signing_prefix || JCS(payload)"))
+        self.assertEqual(d["signing_prefix"].encode().hex(), d["signing_prefix_hex"])
+        key = [k for k in iss["keys"] if k["key_id"] == sig["key_id"]]; self.assertEqual(len(key), 1)
+        raw = base64.b64decode(key[0]["public_key_b64"]); self.assertEqual(len(raw), 32)
+        self.assertEqual(hashlib.sha256(raw).hexdigest()[:16], key[0]["key_id"])
+        import rfc8785
+        msg = (d["signing_prefix"].encode("utf-8") if use_prefix else b"") + rfc8785.dumps(payload)
+        try: eddsa.new(eddsa.import_public_key(raw), "rfc8032").verify(msg, base64.b64decode(sig["value_b64"])); return True
+        except ValueError: return False
+    def test_issuer_doc_rules_verify(self):
+        iss = json.loads(json.dumps(IX.issuer_doc()))  # as served (JSON round trip)
+        self.assertEqual(iss["signing"]["domains"]["attestation"]["signing_prefix"], "prepay-check-attestation/v1\n")
+        self.assertEqual(iss["signing"]["domains"]["snapshot_meta"]["signing_prefix"], "bazaar-snapshot-meta/v1\n")
+        k = PF.load_or_create_key(); kid = PF.public_key_info()["key_id"]
+        e = json.loads(json.dumps(AT.attest(facts(), (kid, lambda m: eddsa.new(k, "rfc8032").sign(m)), rpc=lambda m, p: "0x", now=NOW)))
+        payload = {x: v for x, v in e.items() if x != "signature"}
+        self.assertTrue(self._verify(iss, "attestation", payload, e["signature"]))
+        self.assertFalse(self._verify(iss, "attestation", payload, e["signature"], use_prefix=False))
+        self.assertFalse(self._verify(iss, "snapshot_meta", payload, e["signature"]))
+        m = json.loads(json.dumps(IX.snapshot_meta()))
+        self.assertTrue(self._verify(iss, "snapshot_meta", m["metadata"], m["signature"]))
+        self.assertFalse(self._verify(iss, "snapshot_meta", m["metadata"], m["signature"], use_prefix=False))
+
 if __name__ == "__main__": unittest.main()
