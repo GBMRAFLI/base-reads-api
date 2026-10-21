@@ -85,7 +85,7 @@ Deno.test("payTo eth_getCode: dedup, cap 4, rpc errors -> null, no rpc -> null",
 Deno.test("Deno-signed attestation verifies with the official Python script", async () => {
   const k = await ephemeral(); const e = await attest(facts(), { signer: k.signer, rpc: async () => "0x", now: Date.now() });
   const d = await Deno.makeTempDir(); await Deno.writeTextFile(d + "/a.json", JSON.stringify({ attestation: e })); await Deno.writeTextFile(d + "/i.json", JSON.stringify(k.issuer));
-  const run = async (f: string) => (await new Deno.Command("python3", { args: [new URL("../../scripts/verify_attestation.py", import.meta.url).pathname, f, "--issuer", d + "/i.json"], stdout: "piped" }).output()).code;
+  const run = async (f: string) => (await new Deno.Command("python3", { args: [new URL("../../scripts/verify_attestation.py", import.meta.url).pathname, f, "--issuer", d + "/i.json", "--key-id", k.signer.keyId], stdout: "piped" }).output()).code;
   assertEquals(await run(d + "/a.json"), 0);
   (e as any).claims.facts.target = "https://evil.example/"; await Deno.writeTextFile(d + "/b.json", JSON.stringify(e)); assertEquals(await run(d + "/b.json"), 1);
   await Deno.remove(d, { recursive: true });
@@ -191,7 +191,7 @@ async function verifyByIssuerDoc(iss: any, a: any, o: { now: number; pinned?: st
   const C8: Record<string, () => boolean | Promise<boolean>> = {
     spec_version_canonicalization: () => a.spec === "prepay-check-attestation" && a.version === "1.0" && a.canonicalization === s.canonicalization,
     signature_block: () => a.signature?.alg === s.algorithm && typeof a.signature?.value_b64 === "string",
-    pinned_key_id: () => o.pinned === undefined || a.signature.key_id === o.pinned,
+    pinned_key_id: () => typeof o.pinned === "string" && a.signature.key_id === o.pinned, // mandatory
     issuer_key_id_match: () => a.issuer?.key_id === a.signature.key_id,
     key_lookup: () => { const k = iss.keys.filter((k: any) => k.key_id === a.signature.key_id); key = k[0]; return k.length === 1; },
     key_integrity: async () => { const raw = b64d(key.public_key_b64); return raw.length === 32 && hex(await crypto.subtle.digest("SHA-256", raw)).slice(0, 16) === key.key_id; },
@@ -226,25 +226,27 @@ Deno.test("issuer.json rules alone verify real attestations; every documented ch
   const { envSigner } = await import("../lib/sign.ts");
   const e: any = await attest(facts(), { signer: await envSigner(env), now: NOW });
   const now = NOW / 1000; const kid = e.signature.key_id;
-  await t.step("01 expect valid", async () => { assertEquals(await verifyByIssuerDoc(iss, e, { now, pinned: kid }), "valid"); });
+  const VB = (i: any, x: any, o: { now: number; pinned?: string; prefix?: boolean }) => verifyByIssuerDoc(i, x, { pinned: kid, ...o });
+  await t.step("01 expect valid", async () => { assertEquals(await VB(iss, e, { now, pinned: kid }), "valid"); });
   // signature.public_key_b64 is informational: a wrong value there does not matter, keys[] is used.
-  await t.step("02 expect valid", async () => { assertEquals(await verifyByIssuerDoc(iss, { ...e, signature: { ...e.signature, public_key_b64: "AAAA" } }, { now }), "valid"); });
+  await t.step("02 expect valid", async () => { assertEquals(await VB(iss, { ...e, signature: { ...e.signature, public_key_b64: "AAAA" } }, { now }), "valid"); });
   // negatives, one per check
-  await t.step("03 expect spec_version_canonicalization", async () => { assertEquals(await verifyByIssuerDoc(iss, { ...e, version: "2.0" }, { now }), "spec_version_canonicalization"); });
-  await t.step("04 expect signature_block", async () => { assertEquals(await verifyByIssuerDoc(iss, { ...e, signature: { ...e.signature, alg: "RS256" } }, { now }), "signature_block"); });
-  await t.step("05 expect pinned_key_id", async () => { assertEquals(await verifyByIssuerDoc(iss, e, { now, pinned: "0".repeat(16) }), "pinned_key_id"); });
-  await t.step("06 expect issuer_key_id_match", async () => { assertEquals(await verifyByIssuerDoc(iss, { ...e, issuer: { ...e.issuer, key_id: "0".repeat(16) } }, { now }), "issuer_key_id_match"); });
-  await t.step("07 expect key_lookup", async () => { assertEquals(await verifyByIssuerDoc({ ...iss, keys: [] }, e, { now }), "key_lookup"); });
-  await t.step("08 expect key_integrity", async () => { assertEquals(await verifyByIssuerDoc({ ...iss, keys: [{ ...iss.keys[0], public_key_b64: btoa("x".repeat(32)) }] }, e, { now }), "key_integrity"); });
-  await t.step("09 expect validity_window", async () => { assertEquals(await verifyByIssuerDoc(iss, { ...e, expires_at: "2026-10-23T05:00:00Z" }, { now }), "validity_window"); });
+  await t.step("03 expect spec_version_canonicalization", async () => { assertEquals(await VB(iss, { ...e, version: "2.0" }, { now }), "spec_version_canonicalization"); });
+  await t.step("04 expect signature_block", async () => { assertEquals(await VB(iss, { ...e, signature: { ...e.signature, alg: "RS256" } }, { now }), "signature_block"); });
+  await t.step("05b expect pinned_key_id (no pin given)", async () => { assertEquals(await VB(iss, e, { now, pinned: undefined }), "pinned_key_id"); });
+  await t.step("05 expect pinned_key_id", async () => { assertEquals(await VB(iss, e, { now, pinned: "0".repeat(16) }), "pinned_key_id"); });
+  await t.step("06 expect issuer_key_id_match", async () => { assertEquals(await VB(iss, { ...e, issuer: { ...e.issuer, key_id: "0".repeat(16) } }, { now }), "issuer_key_id_match"); });
+  await t.step("07 expect key_lookup", async () => { assertEquals(await VB({ ...iss, keys: [] }, e, { now }), "key_lookup"); });
+  await t.step("08 expect key_integrity", async () => { assertEquals(await VB({ ...iss, keys: [{ ...iss.keys[0], public_key_b64: btoa("x".repeat(32)) }] }, e, { now }), "key_integrity"); });
+  await t.step("09 expect validity_window", async () => { assertEquals(await VB(iss, { ...e, expires_at: "2026-10-23T05:00:00Z" }, { now }), "validity_window"); });
   const retired = (at: string | undefined) => ({ ...iss, keys: [{ ...iss.keys[0], status: "retired", ...(at === undefined ? {} : { retired_at: at }) }] });
-  await t.step("10 expect key_not_retired", async () => { assertEquals(await verifyByIssuerDoc(retired("2026-10-21T04:59:59Z"), e, { now }), "key_not_retired"); });
-  await t.step("11 expect key_not_retired", async () => { assertEquals(await verifyByIssuerDoc(retired(undefined), e, { now }), "key_not_retired"); });
-  await t.step("12 expect valid", async () => { assertEquals(await verifyByIssuerDoc(retired(e.issued_at), e, { now }), "valid", "issued_at == retired_at is accepted"); });
-  await t.step("13 expect signature", async () => { assertEquals(await verifyByIssuerDoc(iss, e, { now, prefix: false }), "signature", "no prefix -> fail"); });
-  await t.step("14 expect signature", async () => { assertEquals(await verifyByIssuerDoc(iss, { ...e, subject: { ...e.subject, url: "https://evil.example/" } }, { now }), "signature"); });
-  await t.step("15 expect not_future", async () => { assertEquals(await verifyByIssuerDoc(iss, e, { now: now - 120 }), "not_future"); });
-  await t.step("16 expect not_expired", async () => { assertEquals(await verifyByIssuerDoc(iss, e, { now: now + 901 }), "not_expired"); });
+  await t.step("10 expect key_not_retired", async () => { assertEquals(await VB(retired("2026-10-21T04:59:59Z"), e, { now }), "key_not_retired"); });
+  await t.step("11 expect key_not_retired", async () => { assertEquals(await VB(retired(undefined), e, { now }), "key_not_retired"); });
+  await t.step("12 expect valid", async () => { assertEquals(await VB(retired(e.issued_at), e, { now }), "valid", "issued_at == retired_at is accepted"); });
+  await t.step("13 expect signature", async () => { assertEquals(await VB(iss, e, { now, prefix: false }), "signature", "no prefix -> fail"); });
+  await t.step("14 expect signature", async () => { assertEquals(await VB(iss, { ...e, subject: { ...e.subject, url: "https://evil.example/" } }, { now }), "signature"); });
+  await t.step("15 expect not_future", async () => { assertEquals(await VB(iss, e, { now: now - 120 }), "not_future"); });
+  await t.step("16 expect not_expired", async () => { assertEquals(await VB(iss, e, { now: now + 901 }), "not_expired"); });
   // The official verifier agrees on the retired boundary and the key_id mismatch.
   assertEquals((await officialVerify(e, retired(e.issued_at), NOW))[0], true);
   assertEquals((await officialVerify(e, retired("2026-10-21T04:59:59Z"), NOW))[0], false);
@@ -270,4 +272,22 @@ Deno.test("L1: official verifier rejects an unknown key status and an active key
   assertEquals(await officialVerify(e, { keys: [cur] }, NOW), [true, `valid: key_id ${cur.key_id}, issued ${e.issued_at}, expires ${e.expires_at}`]);
   assertEquals((await officialVerify(e, { keys: [{ ...cur, status: "revoked" }] }, NOW))[1], "unknown key status");
   assertEquals((await officialVerify(e, { keys: [{ ...cur, retired_at: "2026-10-22T00:00:00Z" }] }, NOW))[1], "active key must not carry retired_at");
+});
+Deno.test("MEDIUM: attacker-hosted issuer + attestation signed with the attacker's key is rejected", async () => {
+  const legit = (await (await handler(new Request("http://h.example/.well-known/issuer.json"), { env })).json());
+  const legitKid = legit.keys[0].key_id;
+  const evil = await ephemeral(); const d = await Deno.makeTempDir();
+  await Deno.writeTextFile(d + "/evil_issuer.json", JSON.stringify(evil.issuer));
+  const e: any = await attest(facts(), { signer: evil.signer, now: Date.now(), issuerUrl: d + "/evil_issuer.json" }); // issuer_url points at the attacker
+  await Deno.writeTextFile(d + "/a.json", JSON.stringify({ attestation: e }));
+  const cli = async (cmd: string, args: string[]) => (await new Deno.Command(cmd, { args, stdout: "piped" }).output()).code;
+  const PY = new URL("../../scripts/verify_attestation.py", import.meta.url).pathname, TS = new URL("../../scripts/verify_attestation.ts", import.meta.url).pathname;
+  const ts = (x: string[]) => cli("deno", ["run", "--allow-read", "--config", new URL("../deno.json", import.meta.url).pathname, TS, ...x]);
+  for (const run of [(x: string[]) => cli("python3", [PY, ...x]), ts]) {
+    assertEquals(await run([d + "/a.json"]), 2, "no --issuer: the attestation's issuer_url is not used");
+    assertEquals(await run([d + "/a.json", "--issuer", d + "/evil_issuer.json"]), 2, "no --key-id: pin is mandatory");
+    assertEquals(await run([d + "/a.json", "--issuer", d + "/evil_issuer.json", "--key-id", legitKid]), 1, "attacker issuer + pinned legit key_id -> FAIL");
+  }
+  assertEquals((await officialVerify(e, legit, Date.now(), true, legitKid))[0], false);
+  await Deno.remove(d, { recursive: true });
 });

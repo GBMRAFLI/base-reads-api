@@ -80,7 +80,7 @@
     }
    },
    "key_id_derivation": "first 16 lowercase hex chars of sha256(raw 32-byte public key)",
-   "key_source": "Use keys[] of this document (or a key pinned out of band). signature.public_key_b64 is informational only and MUST NOT be used for verification.",
+   "key_source": "Use keys[] of this document fetched from a URL you trust (never issuer.issuer_url from the attestation), and pin the expected key_id. signature.public_key_b64 is informational only and MUST NOT be used for verification.",
    "message": "signing_prefix || JCS(payload)",
    "on_failure": "Stop at the first failing check and report its name.",
    "public_key_encoding": "keys[].public_key_b64: standard base64 (RFC 4648, padded) of the raw 32-byte Ed25519 public key",
@@ -92,7 +92,7 @@
    "Check order: run the checks below in this order and stop at the first failure, reporting that step number and name (the official verifiers do the same). All checks apply to an attestation; snapshot meta uses only steps 5, 6 and 9 (with its own prefix).",
    "1 spec_version_canonicalization: require spec == \"prepay-check-attestation\", version == \"1.0\" and canonicalization == \"JCS\".",
    "2 signature_block: signature must be an object with alg == \"Ed25519\" and value_b64 a string. signature.public_key_b64 is informational only: a verifier MUST NOT use it for verification and MUST take the key from keys[] of this document (or from a key pinned out of band).",
-   "3 pinned_key_id: recommended; if you pinned an expected key_id (or fingerprint) out of band, require signature.key_id to equal it.",
+   "3 pinned_key_id: mandatory; pin the expected key_id (or fingerprint) from a source you trust and require signature.key_id to equal it. Never take the issuer document or key from issuer.issuer_url inside the attestation: whoever made the attestation chose that URL.",
    "4 issuer_key_id_match: require issuer.key_id == signature.key_id.",
    "5 key_lookup: require exactly one entry in keys[] with key_id == signature.key_id.",
    "6 key_integrity: keys[].public_key_b64 is standard base64 of the raw 32-byte Ed25519 public key; require 32 bytes and key_id == first 16 lowercase hex chars of sha256(raw key).",

@@ -65,7 +65,7 @@ class TA(unittest.TestCase):
     def test_python_signed_verifies_with_deno_script(self):
         s, pub, iss = ephemeral(); e = AT.attest(facts(), s, rpc=lambda m, p: "0x")
         d = tempfile.mkdtemp(); json.dump({"attestation": e}, open(d + "/a.json", "w")); json.dump(iss, open(d + "/i.json", "w"))
-        try: r = subprocess.run(["deno", "run", "--allow-read", "--config", os.path.join(R, "deno", "deno.json"), os.path.join(R, "scripts", "verify_attestation.ts"), d + "/a.json", "--issuer", d + "/i.json"], capture_output=True, timeout=120)
+        try: r = subprocess.run(["deno", "run", "--allow-read", "--config", os.path.join(R, "deno", "deno.json"), os.path.join(R, "scripts", "verify_attestation.ts"), d + "/a.json", "--issuer", d + "/i.json", "--key-id", s[0]], capture_output=True, timeout=120)
         except OSError: self.skipTest("deno not installed")
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
     def test_service_endpoints(self):
@@ -166,7 +166,7 @@ class TIssuerDocDrift(unittest.TestCase):
             except ValueError: return False
         checks = {"spec_version_canonicalization": lambda: (a.get("spec"), a.get("version"), a.get("canonicalization")) == ("prepay-check-attestation", "1.0", s["canonicalization"]),
                   "signature_block": lambda: isinstance(a.get("signature"), dict) and a["signature"].get("alg") == s["algorithm"] and isinstance(a["signature"].get("value_b64"), str),
-                  "pinned_key_id": lambda: pinned is None or a["signature"]["key_id"] == pinned,
+                  "pinned_key_id": lambda: isinstance(pinned, str) and a["signature"]["key_id"] == pinned,  # mandatory
                   "issuer_key_id_match": lambda: (a.get("issuer") or {}).get("key_id") == a["signature"]["key_id"],
                   "key_lookup": lookup, "key_integrity": integrity, "validity_window": window, "key_not_retired": retired, "signature": sig,
                   "not_future": lambda: T(a["issued_at"]) <= now + 60, "not_expired": lambda: now <= T(a["expires_at"])}
@@ -190,11 +190,12 @@ class TIssuerDocDrift(unittest.TestCase):
         for i, n in enumerate(s["check_order"]): self.assertTrue(iss["verify"][i + 1].startswith("%d %s:" % (i + 1, n)), n)
         k = PF.load_or_create_key(); kid = PF.public_key_info()["key_id"]
         e = json.loads(json.dumps(AT.attest(facts(), (kid, lambda m: eddsa.new(k, "rfc8032").sign(m)), rpc=lambda m, p: "0x", now=NOW)))
-        V = lambda att=e, i=iss, **kw: self._verify(i, att, kw.pop("now", NOW), **kw)
+        V = lambda att=e, i=iss, **kw: self._verify(i, att, kw.pop("now", NOW), **dict({"pinned": kid}, **kw))
         with self.subTest("01 expect valid"): self.assertEqual(V(pinned=kid), "valid")
         with self.subTest("02 expect valid"): self.assertEqual(V(dict(e, signature=dict(e["signature"], public_key_b64="AAAA"))), "valid")  # informational only
         with self.subTest("03 expect spec_version_canonicalization"): self.assertEqual(V(dict(e, version="2.0")), "spec_version_canonicalization")
         with self.subTest("04 expect signature_block"): self.assertEqual(V(dict(e, signature=dict(e["signature"], alg="RS256"))), "signature_block")
+        with self.subTest("05b expect pinned_key_id (no pin given)"): self.assertEqual(V(pinned=None), "pinned_key_id")
         with self.subTest("05 expect pinned_key_id"): self.assertEqual(V(pinned="0" * 16), "pinned_key_id")
         with self.subTest("06 expect issuer_key_id_match"): self.assertEqual(V(dict(e, issuer=dict(e["issuer"], key_id="0" * 16))), "issuer_key_id_match")
         with self.subTest("07 expect key_lookup"): self.assertEqual(V(i=dict(iss, keys=[])), "key_lookup")
@@ -236,5 +237,20 @@ class TIssuerDocDrift(unittest.TestCase):
         self.assertEqual((r["created_at"], r["retired_at"]), ("2026-01-01T00:00:00Z", "2026-10-21T05:00:00Z"))
         e = json.loads(json.dumps(AT.attest(facts(), (cur["key_id"], lambda m: eddsa.new(k, "rfc8032").sign(m)), rpc=lambda m, p: "0x", now=NOW)))
         self.assertTrue(VA.verify(e, {"keys": [r]}, now=NOW)[0])  # issued_at == normalized retired_at
+
+    def test_medium_attacker_issuer_rejected(self):
+        """Attacker-hosted issuer + attestation signed with the attacker's key (issuer_url points at the attacker) -> rejected."""
+        legit_kid = PF.key_history()["current"]["key_id"]
+        s, pub, evil = ephemeral(); d = tempfile.mkdtemp()
+        json.dump(evil, open(d + "/evil_issuer.json", "w"))
+        e = AT.attest(facts(), s, rpc=lambda m, p: "0x", issuer_url=d + "/evil_issuer.json")
+        json.dump({"attestation": e}, open(d + "/a.json", "w"))
+        import io, contextlib
+        def run(*a):
+            with contextlib.redirect_stdout(io.StringIO()): return VA.main([d + "/a.json", *a])
+        self.assertEqual(run(), 2)  # no --issuer: issuer_url from the attestation is never used
+        self.assertEqual(run("--issuer", d + "/evil_issuer.json"), 2)  # no --key-id: pin is mandatory
+        self.assertEqual(run("--issuer", d + "/evil_issuer.json", "--key-id", legit_kid), 1)
+        self.assertFalse(VA.verify(e, json.loads(json.dumps(IX.issuer_doc())), now=time.time(), expected_key_id=legit_kid)[0])
 
 if __name__ == "__main__": unittest.main()

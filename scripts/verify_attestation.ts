@@ -1,5 +1,7 @@
 // Official verifier for Pre-pay Check Attestation v1.0 (CC0). Deno:
-//   deno run --allow-net --allow-read scripts/verify_attestation.ts FILE|- [--issuer URL_OR_FILE] [--key-id KEY_ID] [--snapshots URL_OR_FILE] [--ignore-expiry]
+//   deno run --allow-net --allow-read scripts/verify_attestation.ts FILE|- --issuer URL_OR_FILE --key-id KEY_ID [--snapshots URL_OR_FILE] [--ignore-expiry]
+// --issuer and --key-id are required and must come from a source you trust; issuer.issuer_url inside the attestation
+// is never used, because whoever made the attestation also chose that URL.
 // FILE is the attestation object or a /x402/preflight response body containing "attestation".
 // Exit 0 = signature valid (and not expired), 1 = invalid, 2 = usage/input error. Says nothing about whether to pay.
 import canonicalizeMod from "npm:canonicalize@2.1.0";
@@ -75,12 +77,14 @@ export function verifySnapshotBinding(att: any, snapshots: any): [boolean, strin
   return [true, "snapshot " + bz.snapshot_date + " hash matches"];
 }
 if (import.meta.main) {
-  const a = [...Deno.args]; if (!a.length || a[0] === "-h" || a[0] === "--help") { console.log("usage: verify_attestation.ts FILE|- [--issuer URL_OR_FILE] [--key-id KEY_ID] [--snapshots URL_OR_FILE] [--ignore-expiry]"); Deno.exit(2); }
+  const a = [...Deno.args]; if (!a.length || a[0] === "-h" || a[0] === "--help") { console.log("usage: verify_attestation.ts FILE|- --issuer URL_OR_FILE --key-id KEY_ID [--snapshots URL_OR_FILE] [--ignore-expiry]"); Deno.exit(2); }
   const src = a.shift()!; let issuerSrc: string | null = null; let checkExpiry = true; let keyId: string | undefined; let snapSrc: string | null = null;
   while (a.length) { const x = a.shift()!; if (x === "--issuer" && a.length) issuerSrc = a.shift()!; else if (x === "--key-id" && a.length) keyId = a.shift()!; else if (x === "--snapshots" && a.length) snapSrc = a.shift()!; else if (x === "--ignore-expiry") checkExpiry = false; else { console.log("unknown argument: " + x); Deno.exit(2); } }
   let body: any; try { body = await load(src); } catch (e) { console.log("FAIL " + (e as Error).message); Deno.exit(1); }
   const att = body && typeof body === "object" && "attestation" in body ? body.attestation : body;
-  issuerSrc ??= att?.issuer?.issuer_url ?? null; if (!issuerSrc) { console.log("no issuer document: pass --issuer"); Deno.exit(2); }
+  // never fall back to att.issuer.issuer_url: an attacker controls it and could point it at their own issuer document
+  if (!issuerSrc) { console.log("no issuer document: pass --issuer (the attestation's own issuer_url is never trusted)"); Deno.exit(2); }
+  if (!keyId) { console.log("no pinned key: pass --key-id (pinning the expected key_id is mandatory)"); Deno.exit(2); }
   let iss: any; try { iss = await load(issuerSrc!); } catch (e) { console.log("FAIL issuer: " + (e as Error).message); Deno.exit(1); }
   let [ok, why] = await verify(att, iss, Date.now(), checkExpiry, keyId);
   if (ok && snapSrc) { let sd: any; try { sd = await load(snapSrc); } catch (e) { console.log("FAIL snapshots: " + (e as Error).message); Deno.exit(1); } const [o2, w2] = verifySnapshotBinding(att, sd); if (!o2) [ok, why] = [false, w2]; else why += "; " + w2; }

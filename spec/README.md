@@ -76,8 +76,15 @@ attestation whose `issued_at` is after its key's `retired_at` (equal is accepted
 ## Verifying
 
 ```
-python3 scripts/verify_attestation.py response.json            # uses issuer.issuer_url
-deno run --allow-net --allow-read scripts/verify_attestation.ts response.json --issuer issuer.json
+python3 scripts/verify_attestation.py response.json --issuer https://<service>/.well-known/issuer.json --key-id <pinned key_id>
+deno run --allow-net --allow-read scripts/verify_attestation.ts response.json --issuer issuer.json --key-id <pinned key_id>
+```
+
+`--issuer` and `--key-id` are required. Take both from a source you trust (fetch the service's `/.well-known/issuer.json`
+yourself and pin the `key_id`). The verifiers never use `issuer.issuer_url` from the attestation: whoever produced the
+attestation also chose that URL, so an attacker could point it at their own issuer document and key.
+
+```
 ```
 
 Steps, in this order (both official verifiers do all of them, stop at the first failure and report it; the same list
@@ -86,7 +93,7 @@ is served machine-readably as `signing.check_order` and `verify[]` in `/.well-kn
 1. `spec_version_canonicalization`: `spec` = `prepay-check-attestation`, `version` = `1.0`, `canonicalization` = `JCS`.
 2. `signature_block`: `signature.alg` = `Ed25519`, `signature.value_b64` is a string. `signature.public_key_b64` is
    informational only; a verifier MUST use the key from `keys[]` of the issuer document (or a key pinned out of band).
-3. `pinned_key_id` (recommended): `signature.key_id` equals the key_id you pinned (`--key-id`).
+3. `pinned_key_id` (mandatory): `signature.key_id` equals the key_id you pinned (`--key-id`).
 4. `issuer_key_id_match`: `issuer.key_id` = `signature.key_id`.
 5. `key_lookup`: `signature.key_id` is listed exactly once in `keys[]`.
 6. `key_integrity`: the listed key is 32 raw bytes and `key_id` = first 16 hex chars of its sha256.

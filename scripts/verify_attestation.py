@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """Official verifier for Pre-pay Check Attestation v1.0 (CC0).
-Usage: verify_attestation.py FILE|- [--issuer URL_OR_FILE] [--key-id KEY_ID] [--snapshots URL_OR_FILE] [--ignore-expiry]
+Usage: verify_attestation.py FILE|- --issuer URL_OR_FILE --key-id KEY_ID [--snapshots URL_OR_FILE] [--ignore-expiry]
+--issuer and --key-id are required: the issuer document and the key_id must come from a source you trust (for example
+the service's own /.well-known/issuer.json fetched once and pinned). issuer.issuer_url inside the attestation is never used,
+because whoever made the attestation also chose that URL.
 FILE is either the attestation object or a /x402/preflight response body that contains "attestation".
 Needs: pip install rfc8785 pycryptodome. Exit code 0 = signature valid (and not expired), 1 = invalid, 2 = usage/input error.
 Checks only the signature, key and validity window; it says nothing about whether to pay an endpoint."""
@@ -85,8 +88,9 @@ def main(argv):
     except ValueError as e: print("FAIL " + str(e)); return 1
     att = body.get("attestation", body) if isinstance(body, dict) else body
     if not isinstance(att, dict): print("FAIL attestation is not an object"); return 1
-    issuer_src = issuer_src or (att.get("issuer") or {}).get("issuer_url")
-    if not issuer_src: print("no issuer document: pass --issuer"); return 2
+    # never fall back to att.issuer.issuer_url: an attacker controls it and could point it at their own issuer document
+    if not issuer_src: print("no issuer document: pass --issuer (the attestation's own issuer_url is never trusted)"); return 2
+    if not key_id: print("no pinned key: pass --key-id (pinning the expected key_id is mandatory)"); return 2
     try: iss = load(issuer_src)
     except ValueError as e: print("FAIL issuer: " + str(e)); return 1
     ok, why = verify(att, iss, check_expiry=check_expiry, expected_key_id=key_id)
