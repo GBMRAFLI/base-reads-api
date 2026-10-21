@@ -134,6 +134,10 @@ export const signingSpec = () => ({
   public_key_encoding: "keys[].public_key_b64: standard base64 (RFC 4648, padded) of the raw 32-byte Ed25519 public key",
   signature_encoding: "signature.value_b64: standard base64 (RFC 4648, padded) of the 64-byte Ed25519 signature",
   key_id_derivation: "first 16 lowercase hex chars of sha256(raw 32-byte public key)",
+  key_source: "Use keys[] of this document (or a key pinned out of band). signature.public_key_b64 is informational only and MUST NOT be used for verification.",
+  retired_at: "Present only on keys with status \"retired\": RFC 3339 UTC YYYY-MM-DDTHH:MM:SSZ. Active keys have no retired_at. Valid iff issued_at <= retired_at.",
+  check_order: ["spec_version_canonicalization", "signature_block", "pinned_key_id", "issuer_key_id_match", "key_lookup", "key_integrity", "validity_window", "key_not_retired", "signature", "not_future", "not_expired"],
+  on_failure: "Stop at the first failing check and report its name.",
   domains: {
     attestation: { signing_prefix: DOMAIN_ATTESTATION, signing_prefix_hex: hexOf(DOMAIN_ATTESTATION),
       source: "/x402/preflight response, member \"attestation\"", payload: "the attestation object with its \"signature\" member removed (every other member is signed)",
@@ -143,13 +147,18 @@ export const signingSpec = () => ({
   },
 });
 export const VERIFY_STEPS = [
-  "Pick the domain in signing.domains (attestation for /x402/preflight \"attestation\", snapshot_meta for /.well-known/bazaar-snapshot.json).",
-  "Build the payload: for an attestation, remove the \"signature\" member (all other members are signed); for snapshot meta, take \"metadata\".",
-  "Serialize the payload with RFC 8785 JSON Canonicalization Scheme (JCS) and encode it as UTF-8.",
-  "Prepend the UTF-8 bytes of signing_prefix (attestation: \"prepay-check-attestation/v1\" + LF, hex 7072657061792d636865636b2d6174746573746174696f6e2f76310a; snapshot meta: \"bazaar-snapshot-meta/v1\" + LF). Message = signing_prefix || JCS(payload). Without the prefix the signature does not verify.",
-  "Find the key in keys[] whose key_id equals signature.key_id; key_id = first 16 lowercase hex chars of sha256(raw 32-byte public key); public_key_b64 is standard base64 of that raw key.",
-  "Verify signature.value_b64 (standard base64, 64 bytes) over the message with Ed25519 (RFC 8032).",
-  "Reject unless spec == \"prepay-check-attestation\", version == \"1.0\" and canonicalization == \"JCS\"; reject unless issued_at and expires_at are valid UTC timestamps with 0 <= expires_at - issued_at <= 86400 s; reject if now > expires_at, if issued_at is more than 60 s in the future, or if the key was retired before issued_at. Recommended: pin the expected key_id (or fingerprint) out of band instead of trusting any listed key.",
+  "Check order: run the checks below in this order and stop at the first failure, reporting that step number and name (the official verifiers do the same). All checks apply to an attestation; snapshot meta uses only steps 5, 6 and 9 (with its own prefix).",
+  "1 spec_version_canonicalization: require spec == \"prepay-check-attestation\", version == \"1.0\" and canonicalization == \"JCS\".",
+  "2 signature_block: signature must be an object with alg == \"Ed25519\" and value_b64 a string. signature.public_key_b64 is informational only: a verifier MUST NOT use it for verification and MUST take the key from keys[] of this document (or from a key pinned out of band).",
+  "3 pinned_key_id: recommended; if you pinned an expected key_id (or fingerprint) out of band, require signature.key_id to equal it.",
+  "4 issuer_key_id_match: require issuer.key_id == signature.key_id.",
+  "5 key_lookup: require exactly one entry in keys[] with key_id == signature.key_id.",
+  "6 key_integrity: keys[].public_key_b64 is standard base64 of the raw 32-byte Ed25519 public key; require 32 bytes and key_id == first 16 lowercase hex chars of sha256(raw key).",
+  "7 validity_window: issued_at and expires_at must be UTC timestamps YYYY-MM-DDTHH:MM:SSZ (second precision); require 0 <= expires_at - issued_at <= 86400 s.",
+  "8 key_not_retired: keys[].status is \"active\" or \"retired\". The active key has no retired_at member. A retired key has retired_at (RFC 3339 UTC, YYYY-MM-DDTHH:MM:SSZ). The attestation is valid only if issued_at <= retired_at (an attestation issued exactly at retired_at is still accepted); reject if issued_at > retired_at or if retired_at is missing or unparseable.",
+  "9 signature: payload = attestation without its \"signature\" member (snapshot meta: the \"metadata\" member); message = UTF-8 of signing_prefix (attestation: \"prepay-check-attestation/v1\" + LF, hex 7072657061792d636865636b2d6174746573746174696f6e2f76310a; snapshot meta: \"bazaar-snapshot-meta/v1\" + LF) followed by RFC 8785 (JCS) of the payload as UTF-8. Verify signature.value_b64 (standard base64, 64 bytes) over the message with Ed25519 (RFC 8032). Without the prefix the signature does not verify.",
+  "10 not_future: reject if issued_at > now + 60 s.",
+  "11 not_expired: reject if now > expires_at.",
 ];
 /** Attestation issuer document: identity, contact and every signing key (active + retired) so old attestations stay verifiable. */
 export async function issuerDoc(env: Deps["env"]) {

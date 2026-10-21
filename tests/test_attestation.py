@@ -1,5 +1,5 @@
 """Pre-pay Check Attestation v1.0 (Python). Keys are ephemeral, generated in memory per test."""
-import base64, hashlib, json, os, subprocess, sys, tempfile, unittest
+import base64, hashlib, json, os, subprocess, sys, tempfile, time, unittest
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import test_preflight  # noqa: F401  shared test env (temp dirs, throwaway key) set before api modules load
 R = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
@@ -140,30 +140,82 @@ class TAttack(unittest.TestCase):
         y = AT.attest(facts(), s, now=NOW - 86400)
         self.assertEqual(VA.verify(y, iss, now=NOW)[1], "expired at 2026-10-20T05:15:00Z"); self.assertEqual(AT.verify(y, pub, now=NOW), (False, "expired"))
 class TIssuerDocDrift(unittest.TestCase):
-    """Verify a real attestation and real snapshot meta using ONLY the rules read from the served issuer.json."""
-    def _verify(self, iss, domain, payload, sig, use_prefix=True):
-        s = iss["signing"]; d = s["domains"][domain]
-        self.assertEqual((s["algorithm"], s["canonicalization"], s["canonicalization_ref"], s["text_encoding"], s["message"]), ("Ed25519", "JCS", "RFC 8785", "UTF-8", "signing_prefix || JCS(payload)"))
-        self.assertEqual(d["signing_prefix"].encode().hex(), d["signing_prefix_hex"])
-        key = [k for k in iss["keys"] if k["key_id"] == sig["key_id"]]; self.assertEqual(len(key), 1)
-        raw = base64.b64decode(key[0]["public_key_b64"]); self.assertEqual(len(raw), 32)
-        self.assertEqual(hashlib.sha256(raw).hexdigest()[:16], key[0]["key_id"])
+    """Verify real attestations and real snapshot meta using ONLY the rules read from the served issuer.json."""
+    @staticmethod
+    def _ts(x):
+        import re, calendar
+        if not isinstance(x, str) or not re.match(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$", x): return None
+        return calendar.timegm(time.strptime(x, "%Y-%m-%dT%H:%M:%SZ"))
+    def _verify(self, iss, a, now, pinned=None, prefix=True):
+        """One function per name in signing.check_order; returns the first failing check name, or "valid"."""
         import rfc8785
-        msg = (d["signing_prefix"].encode("utf-8") if use_prefix else b"") + rfc8785.dumps(payload)
-        try: eddsa.new(eddsa.import_public_key(raw), "rfc8032").verify(msg, base64.b64decode(sig["value_b64"])); return True
+        s = iss["signing"]; d = s["domains"]["attestation"]; st = {}; T = self._ts
+        def lookup():
+            k = [k for k in iss["keys"] if k["key_id"] == a["signature"]["key_id"]]; st["k"] = k[0] if k else None; return len(k) == 1
+        def integrity():
+            raw = base64.b64decode(st["k"]["public_key_b64"]); return len(raw) == 32 and hashlib.sha256(raw).hexdigest()[:16] == st["k"]["key_id"]
+        def window():
+            i, e = T(a.get("issued_at")), T(a.get("expires_at")); return i is not None and e is not None and 0 <= e - i <= 86400
+        def retired():
+            k = st["k"]
+            if k["status"] == "active": return "retired_at" not in k
+            return k["status"] == "retired" and T(k.get("retired_at")) is not None and T(a["issued_at"]) <= T(k["retired_at"])
+        def sig():
+            msg = (d["signing_prefix"].encode("utf-8") if prefix else b"") + rfc8785.dumps({x: v for x, v in a.items() if x != "signature"})
+            try: eddsa.new(eddsa.import_public_key(base64.b64decode(st["k"]["public_key_b64"])), "rfc8032").verify(msg, base64.b64decode(a["signature"]["value_b64"])); return True
+            except ValueError: return False
+        checks = {"spec_version_canonicalization": lambda: (a.get("spec"), a.get("version"), a.get("canonicalization")) == ("prepay-check-attestation", "1.0", s["canonicalization"]),
+                  "signature_block": lambda: isinstance(a.get("signature"), dict) and a["signature"].get("alg") == s["algorithm"] and isinstance(a["signature"].get("value_b64"), str),
+                  "pinned_key_id": lambda: pinned is None or a["signature"]["key_id"] == pinned,
+                  "issuer_key_id_match": lambda: (a.get("issuer") or {}).get("key_id") == a["signature"]["key_id"],
+                  "key_lookup": lookup, "key_integrity": integrity, "validity_window": window, "key_not_retired": retired, "signature": sig,
+                  "not_future": lambda: T(a["issued_at"]) <= now + 60, "not_expired": lambda: now <= T(a["expires_at"])}
+        self.assertEqual(list(checks), s["check_order"])
+        for n in s["check_order"]:
+            if not checks[n](): return n
+        return "valid"
+    def _meta(self, iss, m, prefix=True):
+        import rfc8785
+        k = [k for k in iss["keys"] if k["key_id"] == m["signature"]["key_id"]][0]
+        msg = (iss["signing"]["domains"]["snapshot_meta"]["signing_prefix"].encode() if prefix else b"") + rfc8785.dumps(m["metadata"])
+        try: eddsa.new(eddsa.import_public_key(base64.b64decode(k["public_key_b64"])), "rfc8032").verify(msg, base64.b64decode(m["signature"]["value_b64"])); return True
         except ValueError: return False
     def test_issuer_doc_rules_verify(self):
         iss = json.loads(json.dumps(IX.issuer_doc()))  # as served (JSON round trip)
-        self.assertEqual(iss["signing"]["domains"]["attestation"]["signing_prefix"], "prepay-check-attestation/v1\n")
-        self.assertEqual(iss["signing"]["domains"]["snapshot_meta"]["signing_prefix"], "bazaar-snapshot-meta/v1\n")
+        s = iss["signing"]
+        self.assertEqual(s["domains"]["attestation"]["signing_prefix"], "prepay-check-attestation/v1\n")
+        self.assertEqual(s["domains"]["snapshot_meta"]["signing_prefix"], "bazaar-snapshot-meta/v1\n")
+        for d in s["domains"].values(): self.assertEqual(d["signing_prefix"].encode().hex(), d["signing_prefix_hex"])
+        self.assertEqual(len(iss["verify"]), len(s["check_order"]) + 1)
+        for i, n in enumerate(s["check_order"]): self.assertTrue(iss["verify"][i + 1].startswith("%d %s:" % (i + 1, n)), n)
         k = PF.load_or_create_key(); kid = PF.public_key_info()["key_id"]
         e = json.loads(json.dumps(AT.attest(facts(), (kid, lambda m: eddsa.new(k, "rfc8032").sign(m)), rpc=lambda m, p: "0x", now=NOW)))
-        payload = {x: v for x, v in e.items() if x != "signature"}
-        self.assertTrue(self._verify(iss, "attestation", payload, e["signature"]))
-        self.assertFalse(self._verify(iss, "attestation", payload, e["signature"], use_prefix=False))
-        self.assertFalse(self._verify(iss, "snapshot_meta", payload, e["signature"]))
+        V = lambda att=e, i=iss, **kw: self._verify(i, att, kw.pop("now", NOW), **kw)
+        self.assertEqual(V(pinned=kid), "valid")
+        self.assertEqual(V(dict(e, signature=dict(e["signature"], public_key_b64="AAAA"))), "valid")  # informational only
+        self.assertEqual(V(dict(e, version="2.0")), "spec_version_canonicalization")
+        self.assertEqual(V(dict(e, signature=dict(e["signature"], alg="RS256"))), "signature_block")
+        self.assertEqual(V(pinned="0" * 16), "pinned_key_id")
+        self.assertEqual(V(dict(e, issuer=dict(e["issuer"], key_id="0" * 16))), "issuer_key_id_match")
+        self.assertEqual(V(i=dict(iss, keys=[])), "key_lookup")
+        self.assertEqual(V(i=dict(iss, keys=[dict(iss["keys"][0], public_key_b64=base64.b64encode(b"x" * 32).decode())])), "key_integrity")
+        self.assertEqual(V(dict(e, expires_at="2026-10-23T05:00:00Z")), "validity_window")
+        def ret(at):
+            kk = dict(iss["keys"][0], status="retired")
+            if at is not None: kk["retired_at"] = at
+            return dict(iss, keys=[kk])
+        self.assertEqual(V(i=ret("2026-10-21T04:59:59Z")), "key_not_retired")
+        self.assertEqual(V(i=ret(None)), "key_not_retired")
+        self.assertEqual(V(i=ret(e["issued_at"])), "valid")  # issued_at == retired_at is accepted
+        self.assertEqual(V(prefix=False), "signature")  # no prefix -> fail
+        self.assertEqual(V(dict(e, subject=dict(e["subject"], url="https://evil.example/"))), "signature")
+        self.assertEqual(V(now=NOW - 120), "not_future")
+        self.assertEqual(V(now=NOW + 901), "not_expired")
+        # official verifier agrees on the retired boundary and the key_id mismatch
+        self.assertTrue(VA.verify(e, ret(e["issued_at"]), now=NOW)[0])
+        self.assertFalse(VA.verify(e, ret("2026-10-21T04:59:59Z"), now=NOW)[0])
+        self.assertFalse(VA.verify(dict(e, issuer=dict(e["issuer"], key_id="0" * 16)), iss, now=NOW)[0])
         m = json.loads(json.dumps(IX.snapshot_meta()))
-        self.assertTrue(self._verify(iss, "snapshot_meta", m["metadata"], m["signature"]))
-        self.assertFalse(self._verify(iss, "snapshot_meta", m["metadata"], m["signature"], use_prefix=False))
+        self.assertTrue(self._meta(iss, m)); self.assertFalse(self._meta(iss, m, prefix=False))
 
 if __name__ == "__main__": unittest.main()

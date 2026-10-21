@@ -74,7 +74,8 @@ Signed message = UTF-8 bytes of `prepay-check-attestation/v1` + LF (`\n`, hex `0
 canonical JSON of the attestation with its `signature` member removed; signature = Ed25519 (RFC 8032), standard base64.
 The snapshot metadata (`/.well-known/bazaar-snapshot.json`) uses the prefix `bazaar-snapshot-meta/v1` + LF over JCS(`metadata`).
 `/.well-known/issuer.json` publishes the same rules machine-readably (`signing.domains.*.signing_prefix`) plus the keys;
-`scripts/verify_attestation.{py,ts}` implement them. Details: `spec/README.md`.
+Verify with the key from `keys[]` (or a pinned key), never `signature.public_key_b64`, and run the checks in
+`signing.check_order`, stopping at the first failure. `scripts/verify_attestation.{py,ts}` implement them. Details: `spec/README.md`.
 
 Hook examples for the official clients: `examples/ts/preflight-hook.ts`, `examples/python/preflight_hook.py`.
 

@@ -70,8 +70,8 @@ repository, never published and never exported; tests use throwaway keys generat
 ## Keys and rotation
 
 `GET /.well-known/issuer.json` lists the issuer identity and every key: the active key and retired keys with
-`retired_at`. Retired keys stay listed so older attestations remain verifiable. A verifier should reject an
-attestation whose `issued_at` is after its key's `retired_at`.
+`retired_at`. Retired keys stay listed so older attestations remain verifiable. A verifier must reject an
+attestation whose `issued_at` is after its key's `retired_at` (equal is accepted).
 
 ## Verifying
 
@@ -80,13 +80,22 @@ python3 scripts/verify_attestation.py response.json            # uses issuer.iss
 deno run --allow-net --allow-read scripts/verify_attestation.ts response.json --issuer issuer.json
 ```
 
-Steps (both official verifiers do all of them):
-1. Parse JSON strictly (duplicate object keys are rejected).
-2. `signature.key_id` must equal `issuer.key_id`, must be listed exactly once in the issuer document (and equal `--key-id` if given),
-   and must equal the first 16 hex chars of sha256 of that listed public key.
-3. `issued_at` and `expires_at` must be valid timestamps; `0 <= expires_at - issued_at <= 86400` s; `issued_at <= now + 60` s.
-4. Remove `signature`, build `prepay-check-attestation/v1\n` + JCS, verify Ed25519.
-5. Reject when now is after `expires_at` (unless explicitly ignored), or when the key was retired before `issued_at`.
+Steps, in this order (both official verifiers do all of them, stop at the first failure and report it; the same list
+is served machine-readably as `signing.check_order` and `verify[]` in `/.well-known/issuer.json`):
+0. Parse JSON strictly (duplicate object keys are rejected).
+1. `spec_version_canonicalization`: `spec` = `prepay-check-attestation`, `version` = `1.0`, `canonicalization` = `JCS`.
+2. `signature_block`: `signature.alg` = `Ed25519`, `signature.value_b64` is a string. `signature.public_key_b64` is
+   informational only; a verifier MUST use the key from `keys[]` of the issuer document (or a key pinned out of band).
+3. `pinned_key_id` (recommended): `signature.key_id` equals the key_id you pinned (`--key-id`).
+4. `issuer_key_id_match`: `issuer.key_id` = `signature.key_id`.
+5. `key_lookup`: `signature.key_id` is listed exactly once in `keys[]`.
+6. `key_integrity`: the listed key is 32 raw bytes and `key_id` = first 16 hex chars of its sha256.
+7. `validity_window`: `issued_at` / `expires_at` are `YYYY-MM-DDTHH:MM:SSZ`; `0 <= expires_at - issued_at <= 86400` s.
+8. `key_not_retired`: active keys have no `retired_at`; a retired key has `retired_at` (RFC 3339 UTC, `YYYY-MM-DDTHH:MM:SSZ`).
+   Valid only if `issued_at <= retired_at` (equal is accepted); a retired key without a parseable `retired_at` is rejected.
+9. `signature`: remove `signature`, build `prepay-check-attestation/v1\n` + JCS, verify Ed25519.
+10. `not_future`: `issued_at <= now + 60` s.
+11. `not_expired`: `now <= expires_at` (unless explicitly ignored).
 
 `test-vectors.json` holds JCS cases and one signed attestation (public key only) for cross-implementation tests.
 
