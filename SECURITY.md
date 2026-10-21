@@ -81,3 +81,10 @@ The Python server (`api/`) keeps its replay map, used-tx set and failed-settle c
 ## Python reference implementation
 
 The Python code in `api/` is a reference implementation used for test vectors and cross-checks. It is not deployed and does not implement the paid-route abuse guards (settle-before-probe ordering, rate limits, outbound slots, pending retries, post-delivery re-checks). Only the Deno service under `deno/` serves traffic.
+
+## Queued and expired paid checks
+
+- A settled check queued on the per-target budget is served on retry without consuming that budget again, and while any queued check for a target is waiting, new settles for that target queue behind it (first in, first out).
+- A pending check keeps a fixed 1-hour window from its first park. If it is not served in that window, a sweep (every 5 minutes) removes it atomically and logs a `pending_expired_unserved` incident with the settlement transaction. Refund path: the buyer contacts the issuer contact address with the transaction hash; the incident record is used to confirm the unserved payment and the amount is returned to the payer address.
+- Signed snapshot metadata is cached for 60 seconds.
+- Post-delivery re-check records are keyed by due time; a sweep lists only due records and removes each with a versionstamp-checked atomic delete before reporting.

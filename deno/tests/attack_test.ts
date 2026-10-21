@@ -1,7 +1,9 @@
 // Attack scenarios A1-A12 for the paid Pre-pay Check, plus outbound limits. Keys: repo throwaway test key (legacy
 // signature) and in-memory ephemeral keys; nothing here touches the network (resolver/fetcher/rpc/facilitator are stubs).
 import { assert, assertEquals } from "jsr:@std/assert@1";
-import { abuse, handler, reorgSweep, reqFor, resetGuards } from "../main.ts";
+import { abuse, handler, pendingSweep, reorgSweep, reqFor, resetGuards, snapshotMeta } from "../main.ts";
+import { sweepReorg, scheduleReorgCheck } from "../lib/reorg.ts";
+import * as SG from "../lib/settle_guard.ts";
 import { useKv, rows, kv } from "../lib/store.ts";
 import { clearIndexCache, configureOutbound, IndexAssembler, OUTBOUND, preflight, readSnapMeta, saveIndex } from "../lib/preflight.ts";
 import { attest, verifyAttestation, type Signer } from "../lib/attestation.ts";
@@ -38,7 +40,7 @@ function rig(o: { settle?: () => any; chain?: { v: any }; fetchDelay?: number } 
 }
 const fresh = async (over: Record<string, string> = {}) => {
   E = { ...BASE_ENV, ...over }; await resetGuards(); clearIndexCache();
-  for await (const e of (await kv()).list({ prefix: ["reorg"] })) await (await kv()).delete(e.key);
+  for (const p of ["reorg", "pending", "pendexp", "pq"]) for await (const e of (await kv()).list({ prefix: [p] })) await (await kv()).delete(e.key);
 };
 
 Deno.test("A1 verified payment that is never settled -> 402 and the target is never probed (settle before probe)", async () => {
@@ -251,4 +253,41 @@ Deno.test("A12 an attestation from yesterday -> rejected (expires_at passed) by 
   const py = await new Deno.Command("python3", { args: [new URL("../../scripts/verify_attestation.py", import.meta.url).pathname, d + "/a.json", "--issuer", d + "/i.json"], stdout: "piped" }).output();
   assertEquals(py.code, 1); assert(new TextDecoder().decode(py.stdout).startsWith("FAIL expired at "));
   await Deno.remove(d, { recursive: true });
+});
+
+Deno.test("M1 (re-audit 2) attacker keeps the target budget used up: the honest queued buyer is still served, FIFO ahead of new settles", async () => {
+  await fresh({ OUTBOUND_PER_HOST_PER_MIN: "3", PER_TARGET_PAYER_PER_MIN: "1000" }); const t = rig();
+  for (let i = 0; i < 3; i++) assertEquals((await t.call(pay(), "https://v.example/a" + i))[0], 200); // attacker uses the budget
+  const honest = pay(); const [c0, b0] = await t.call(honest, "https://v.example/honest");
+  assertEquals([c0, b0.status], [202, "settled_queued_target_budget"]);
+  for (let m = 0; m < 3; m++) { // each new minute the attacker pays again first
+    await resetGuards();
+    const [ca, ba] = await t.call(pay(), "https://v.example/z" + m); assertEquals([ca, ba.status], [202, "settled_queued_target_budget"]); // queues behind
+  }
+  const [c1, b1] = await t.call(honest, "https://v.example/honest"); assertEquals(c1, 200); assert(b1.attestation); // served, budget still exhausted
+  assertEquals(await SG.queueHas("v.example"), true); // attacker's later checks still queued, in order
+});
+Deno.test("M1 (re-audit 2) a pending check that expires unserved -> atomically removed and logged as an incident", async () => {
+  await fresh(); const now = Date.now();
+  await SG.setPending("k1", { path: PATH, tx: "0xabc", times: {}, url: "https://e.example/", tries: 0, queued: true, host: "e.example" }, now);
+  assertEquals((await pendingSweep(now + 60_000)).length, 0); // not yet expired
+  assertEquals(await SG.takePending("k1", now + SG.PENDING_TTL_MS + 1), null); // expired: not served
+  assertEquals(await pendingSweep(now + SG.PENDING_TTL_MS + 1), ["k1"]);
+  assertEquals((await pendingSweep(now + SG.PENDING_TTL_MS + 2)).length, 0); // reported once
+  const inc = (await rows("observations.jsonl")).filter((r: any) => r.inputHash === "incident"); assertEquals(inc.at(-1)?.note, "pending_expired_unserved");
+  assertEquals(await SG.queueHas("e.example", now), false);
+});
+Deno.test("L3 (re-audit 2) signed snapshot meta is cached for 60 s", async () => {
+  await fresh(); const now = Date.now();
+  const a = await snapshotMeta(env, now); assert(a === await snapshotMeta(env, now + 59_000)); assert(a !== await snapshotMeta(env, now + 61_000));
+});
+Deno.test("L4 (re-audit 2) reorg sweep lists only due records; concurrent sweeps report an incident once", async () => {
+  await fresh(); const now = Date.now();
+  const base = { path: PATH, payer: PAYER, asset: "a", payTo: "p", amount: "1", nonce: "n", network: "eip155:84532", minConf: 1 };
+  await scheduleReorgCheck({ ...base, tx: "0xdue" }, 0, now); await scheduleReorgCheck({ ...base, tx: "0xlater" }, 3600_000, now);
+  let checked: string[] = []; let incidents = 0;
+  const chk = async (r: any) => { checked.push(r.tx); await new Promise((x) => setTimeout(x, 10)); return { settled: false, reason: "gone" }; };
+  await Promise.all([sweepReorg(chk, async () => { incidents++; }, now + 1), sweepReorg(chk, async () => { incidents++; }, now + 1)]);
+  assertEquals(incidents, 1); assert(!checked.includes("0xlater"));
+  checked = []; await sweepReorg(chk, async () => { incidents++; }, now + 1); assertEquals(checked, []);
 });

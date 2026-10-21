@@ -140,7 +140,13 @@ export async function issuerDoc(env: Deps["env"]) {
       "Optionally reject if now > expires_at, or if the key was retired before issued_at."] };
 }
 /** Free, signed metadata about the daily Bazaar snapshot series (no snapshot contents). */
-export async function snapshotMeta(env: Deps["env"] = (k) => Deno.env.get(k)) {
+/** L3: the signed snapshot meta is cached for 60 s (it reads up to 31 KV entries and signs on every build). */
+let META_CACHE: { at: number; v: unknown } | null = null; const META_TTL_MS = 60_000;
+export async function snapshotMeta(env: Deps["env"] = (k) => Deno.env.get(k), now = Date.now()) {
+  if (META_CACHE && now - META_CACHE.at < META_TTL_MS) return META_CACHE.v as Awaited<ReturnType<typeof buildSnapshotMeta>>;
+  const v = await buildSnapshotMeta(env); META_CACHE = { at: now, v }; return v;
+}
+async function buildSnapshotMeta(env: Deps["env"]) {
   const dates = await snapshotDates(); const last = dates.at(-1) ?? null; // last successful snapdate
   const today = new Date().toISOString().slice(0, 10);
   const todayFail = await loadFail(today);
@@ -351,7 +357,14 @@ export async function reorgSweep(env: Deps["env"], check?: (r: ReorgRec) => Prom
     await recordObservation(x.path, "incident", 0, null, why);
   }, now);
 }
-export async function resetGuards() { await FAILS.clear(); ABUSE = null; }
+/** M1: a settled check whose pending window passed unserved is logged as an incident (refund path: SECURITY.md). */
+export async function pendingSweep(now = Date.now()) {
+  return await SG.sweepExpiredPending(async (_key, rec) => {
+    console.log("INCIDENT pending_expired_unserved", rec.path, rec.tx);
+    await recordObservation(String(rec.path ?? "/x402/preflight"), "incident", 0, null, "pending_expired_unserved");
+  }, now);
+}
+export async function resetGuards() { await FAILS.clear(); ABUSE = null; META_CACHE = null; }
 export const MAINNET = "eip155:8453";
 /** MIN_CONFIRMATIONS clamped to 1..64 (non-numeric or empty -> 1). */
 export function minConfirmations(env: Deps["env"]): number {
@@ -453,13 +466,15 @@ async function paid(path: string, q: Record<string, string>, qs: string, sig: st
     const cached = G.cache.get(cacheKey(u));
     if (!cached) {
       if (!G.hostPayer.allow(hostOf(u) + "|" + who)) { await SG.setPending(key, pend); return [429, { error: "too many attempts for this target, retry later", scope: "target_payer", transaction: pend.tx }, { "Retry-After": "60" }]; }
-      if (!G.perHost.allow(hostOf(u))) { await SG.setPending(key, pend); return [202, { status: "settled_queued_target_budget", transaction: pend.tx, retry: "repeat the same request after 60 s" }, payResp(N, true, pend.tx, who)]; }
+      // M1: a check already queued on the target budget skips the budget (it was settled first; served ahead of new settles)
+      if (!pend.queued && !G.perHost.allow(hostOf(u))) { await SG.setPending(key, pend); return [202, { status: "settled_queued_target_budget", transaction: pend.tx, retry: "repeat the same request after 60 s" }, payResp(N, true, pend.tx, who)]; }
     }
     const slot = cached ? () => {} : reserve();
     if (!slot) { await SG.setPending(key, pend); return [503, { error: "probe capacity busy, retry shortly", transaction: pend.tx }, { "Retry-After": "5" }]; }
     let code = 0, out: unknown = null;
     try { [code, out] = await runPreflight(u); } catch { code = 0; } finally { slot(); }
     if (code !== 200) { await SG.setPending(key, { ...pend, tries: tries + 1 }); return [502, { error: "upstream error, retry the same request", transaction: pend.tx, attempts_left: MAX_TRIES - tries - 1 }, {}]; }
+    if (pend.queued && pend.host) await SG.queueDel(pend.host, pend.until, key);
     log(pend.tx, oc, true, pend.times); return [200, out, payResp(N, true, pend.tx, who)];
   };
   const busy: [number, unknown, Record<string, string>] = [429, { error: "too many concurrent payments, retry shortly", scope: "concurrency" }, {}];
@@ -530,9 +545,10 @@ async function paid(path: string, q: Record<string, string>, qs: string, sig: st
     if (settleFirst) {
       const u = unquote(q.url ?? "");
       // H1: the global per-target budget is counted only after a successful settlement; over budget -> queue, never refuse.
-      if (!G.cache.get(cacheKey(u)) && !G.perHost.allow(hostOf(u))) {
+      // M1: FIFO: while settled checks for this target wait in the queue, a new settle queues behind them.
+      if (!G.cache.get(cacheKey(u)) && (await SG.queueHas(hostOf(u)) || !G.perHost.allow(hostOf(u)))) {
         held.slot?.(); held.slot = null;
-        await SG.setPending(key, { path, tx, times, url: u, tries: 0 });
+        await SG.setPending(key, { path, tx, times, url: u, tries: 0, queued: true, host: hostOf(u) });
         return [202, { status: "settled_queued_target_budget", transaction: tx, retry: "repeat the same request with the same payment header after 60 s" }, payResp(N, true, tx, who)];
       }
       let ok = false;
@@ -599,6 +615,7 @@ if (import.meta.main) {
   if ((env("SNAPSHOT_SCHEDULER") ?? "1") === "1") {
     Deno.cron("bazaar-snapshot", "15 0 * * *", async () => { await scheduledSnapshot(); }); // bounded, max once per UTC day
     Deno.cron("fail-counter-purge", "7 0 * * *", async () => { await FAILS.purge(); });
+    Deno.cron("pending-expiry", "*/5 * * * *", async () => { await pendingSweep(); }); // M1: unserved paid checks -> incident
     Deno.cron("reorg-recheck", "*/2 * * * *", async () => { await reorgSweep(env); }); // A4: persisted post-delivery re-checks
   }
   for (const w of startupWarnings(env)) console.warn("WARNING:", w);
