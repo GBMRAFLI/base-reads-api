@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Official verifier for Pre-pay Check Attestation v1.0 (CC0).
-Usage: verify_attestation.py FILE|- [--issuer URL_OR_FILE] [--key-id KEY_ID] [--ignore-expiry]
+Usage: verify_attestation.py FILE|- [--issuer URL_OR_FILE] [--key-id KEY_ID] [--snapshots URL_OR_FILE] [--ignore-expiry]
 FILE is either the attestation object or a /x402/preflight response body that contains "attestation".
 Needs: pip install rfc8785 pycryptodome. Exit code 0 = signature valid (and not expired), 1 = invalid, 2 = usage/input error.
 Checks only the signature, key and validity window; it says nothing about whether to pay an endpoint."""
@@ -58,14 +58,25 @@ def verify(att, issuer, now=None, check_expiry=True, expected_key_id=None):
     if check_expiry and exp < now: return False, "expired at " + att["expires_at"]
     return True, "valid: key_id %s, issued %s, expires %s" % (k["key_id"], att["issued_at"], att["expires_at"])
 
+def verify_snapshot_binding(att, snapshots):
+    """A11: bind the attestation's Bazaar facts to the published snapshot hash (the /bazaar/snapshots document)."""
+    bz = ((att.get("claims") or {}).get("facts") or {}).get("bazaar") or {}
+    if bz.get("available") is not True: return True, "no snapshot facts to bind"
+    if not isinstance(bz.get("snapshot_sha256"), str): return False, "attestation carries no snapshot hash"
+    e = [x for x in (snapshots.get("snapshots") if isinstance(snapshots, dict) and isinstance(snapshots.get("snapshots"), list) else []) if isinstance(x, dict) and x.get("date") == bz.get("snapshot_date")]
+    if len(e) != 1: return False, "snapshot %s is not published exactly once" % bz.get("snapshot_date")
+    if e[0].get("sha256") != bz["snapshot_sha256"]: return False, "snapshot hash does not match the published snapshot"
+    return True, "snapshot %s hash matches" % bz["snapshot_date"]
+
 def main(argv):
     if not argv or argv[0] in ("-h", "--help"): print(__doc__); return 2
-    src, issuer_src, check_expiry, key_id = argv[0], None, True, None
+    src, issuer_src, check_expiry, key_id, snap_src = argv[0], None, True, None, None
     i = 1
     while i < len(argv):
         if argv[i] == "--issuer" and i + 1 < len(argv): issuer_src = argv[i + 1]; i += 2
         elif argv[i] == "--ignore-expiry": check_expiry = False; i += 1
         elif argv[i] == "--key-id" and i + 1 < len(argv): key_id = argv[i + 1]; i += 2
+        elif argv[i] == "--snapshots" and i + 1 < len(argv): snap_src = argv[i + 1]; i += 2
         else: print("unknown argument: " + argv[i]); return 2
     try: body = load(src)
     except ValueError as e: print("FAIL " + str(e)); return 1
@@ -76,6 +87,11 @@ def main(argv):
     try: iss = load(issuer_src)
     except ValueError as e: print("FAIL issuer: " + str(e)); return 1
     ok, why = verify(att, iss, check_expiry=check_expiry, expected_key_id=key_id)
+    if ok and snap_src:
+        try: sd = load(snap_src)
+        except ValueError as e: print("FAIL snapshots: " + str(e)); return 1
+        ok2, why2 = verify_snapshot_binding(att, sd)
+        ok, why = (ok2, why2) if not ok2 else (True, why + "; " + why2)
     print(("OK " if ok else "FAIL ") + why); return 0 if ok else 1
 
 if __name__ == "__main__": sys.exit(main(sys.argv[1:]))

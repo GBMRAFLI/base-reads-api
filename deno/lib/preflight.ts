@@ -1,6 +1,14 @@
 // Port of api/preflight.py (facts, validation, Bazaar facts). Same facts schema and signatures.
 import { envSigner, sign } from "./sign.ts";
 import { attest, type Rpc, type Signer } from "./attestation.ts";
+import { Semaphore } from "./guards.ts";
+/** A9: a target gets 5 s to answer. */
+export const PROBE_TIMEOUT_MS = 5000;
+/** Bounded outbound concurrency for target probes (protects third parties and this host). */
+export let OUTBOUND = new Semaphore(4);
+export function configureOutbound(n: number) { OUTBOUND = new Semaphore(n); }
+const hexOf = (b: ArrayBuffer) => Array.from(new Uint8Array(b), (x) => x.toString(16).padStart(2, "0")).join("");
+export class SnapshotHashMismatch extends Error { override name = "SnapshotHashMismatch"; }
 import { kv } from "./store.ts";
 import { isoSec } from "./util.ts";
 export const SCHEMA = "prepay-check/v1", UA = "base-reads-prepay-check/1.0";
@@ -173,6 +181,8 @@ export type SnapDateMeta = {
   gen?: number | string; chunks: number; tier: SnapTier;
   status: "complete" | "partial" | null; listings: number; gzip_bytes: number;
   legacy?: boolean;
+  /** sha256 (hex) of the stored gzip bytes; checked on every load (A11). Absent on older snapshots. */
+  sha256?: string;
   /** ISO time of the successful save that produced this meta; null if unknown. */
   last_attempt_at?: string | null;
 };
@@ -292,6 +302,7 @@ export async function saveIndex(idx: Index, _keep?: number, _skipRetention = fal
   const meta: SnapDateMeta = {
     gen: newGen, chunks: n, tier: idx.tier, status: idx.status ?? idx.coverage?.status ?? null,
     listings: idx.listings, gzip_bytes: z.length, legacy: false, last_attempt_at: attemptedAt,
+    sha256: hexOf(await crypto.subtle.digest("SHA-256", z as Uint8Array<ArrayBuffer>)),
   };
   if (_beforeFlip) await _beforeFlip();
   const flipped = await k.atomic().check(prev).set(["snapdate", idx.date], meta).commit();
@@ -336,6 +347,7 @@ export async function loadIndex(date: string): Promise<Index> {
   }
   if (!parts.length) throw new Error("empty_snapshot");
   const all = new Uint8Array(parts.reduce((a, p) => a + p.length, 0)); let o = 0; for (const p of parts) { all.set(p, o); o += p.length; }
+  if (!isLegacyMeta(meta) && meta.sha256 && hexOf(await crypto.subtle.digest("SHA-256", all)) !== meta.sha256) throw new SnapshotHashMismatch(date);
   const idx = JSON.parse(new TextDecoder().decode(await gz("", "d", all))) as Index;
   // bounded cache: a full index is ~10 MiB of heap at ~26k listings (measured), so keep only the newest few
   while (idxCache.size >= IDX_CACHE_MAX) idxCache.delete(idxCache.keys().next().value!);
@@ -354,7 +366,12 @@ export async function bazaarFacts(url: string, paytoList: string[], maxTrend = 1
       age_days, snapshot_age_days: age_days, max_age_days: FULL_MAX_AGE_DAYS }; };
   if (!full) { const newest = metas[metas.length - 1]; return tooOld(newest.date, newest.meta.tier ?? "full"); }
   if (dayAge(full.date, today) > FULL_MAX_AGE_DAYS) return tooOld(full.date, "full");
-  const last = full.date; const idx = await loadIndex(last); const h = hostOf(url); const key = url.split("?")[0];
+  const last = full.date; let idx: Index;
+  try { idx = await loadIndex(last); } catch (e) {
+    if (e instanceof SnapshotHashMismatch) return { available: false, reason: "snapshot_hash_mismatch", snapshot_date: last };
+    throw e;
+  }
+  const h = hostOf(url); const key = url.split("?")[0];
   const cur = idx.resources[key] ?? null; const listedPayTo = cur?.payTo ?? [];
   const wl: Record<string, unknown> = {};
   const ws = new Set([...paytoList.filter(Boolean).map((x) => x.toLowerCase()), ...listedPayTo]);
@@ -369,7 +386,9 @@ export async function bazaarFacts(url: string, paytoList: string[], maxTrend = 1
       trend.push({ snapshot: d, tier: meta.tier, payers30d: null, calls30d: null });
       continue;
     }
-    const r = (d === last ? idx : await loadIndex(d)).resources[key];
+    let r: any;
+    try { r = (d === last ? idx : await loadIndex(d)).resources[key]; }
+    catch (e) { if (!(e instanceof SnapshotHashMismatch)) throw e; trend.push({ snapshot: d, tier: "full", payers30d: null, calls30d: null, hash_mismatch: true }); continue; }
     trend.push({ snapshot: d, tier: "full", payers30d: r ? r.payers30d : null, calls30d: r ? r.calls30d : null });
   }
   const coverage = idx.coverage
@@ -377,7 +396,7 @@ export async function bazaarFacts(url: string, paytoList: string[], maxTrend = 1
     : { complete: null as boolean | null, status: idx.status ?? null };
   const isComplete = coverage.complete === true;
   const found = cur !== null;
-  const out: Record<string, unknown> = { available: true, snapshot_date: last,
+  const out: Record<string, unknown> = { available: true, snapshot_date: last, snapshot_sha256: full.meta.sha256 ?? null,
     listed: found ? true : (isComplete ? false : null), listed_payTo: listedPayTo,
     host_listing_count: idx.hosts[h] ?? 0, payout_wallet_reuse: wl,
     last_called_at: cur ? cur.lastCalledAt : null, payer_trend: trend, coverage };
@@ -393,7 +412,10 @@ export async function preflight(url: string, opts: { resolver?: Resolver; fetche
   const base = { schema: SCHEMA, target: url, checked_at: isSoc(opts.now), disclaimer: "Deterministic observations only. Not advice to pay, buy or sell." };
   let reach: Record<string, unknown>, ch: any;
   if (err === "dns_unresolvable") { reach = { reachable: false, error_class: "dns_unresolvable" }; ch = null; }
-  else [reach, ch] = await probe(u, 8000, opts.fetcher, ips?.[0], opts.connect);
+  else {
+    const release = await OUTBOUND.acquire(); // bounded outbound concurrency (throws OutboundBusy when saturated)
+    try { [reach, ch] = await probe(u, PROBE_TIMEOUT_MS, opts.fetcher, ips?.[0], opts.connect); } finally { release(); }
+  }
   const [valid, problems, acc] = validateChallenge(ch);
   const facts = { ...base, reachability: reach, challenge: { valid, problems, accepts: acc },
     bazaar: await bazaarFacts(url, acc.map((a) => a.payTo as string).filter(Boolean)) };

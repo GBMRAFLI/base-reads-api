@@ -72,7 +72,21 @@ def build_checks(facts, code):
                 "observed": bz.get("snapshot_date") if bz.get("available") else bz.get("reason")})
     out.append({"id": "listed_in_bazaar", "status": "not_applicable" if not bz.get("available") or bz.get("listed") is None else "pass" if bz["listed"] else "fail",
                 "observed": bz.get("listed") if bz.get("available") else None})
+    lat = reach.get("latency_ms") if isinstance(reach.get("latency_ms"), int) and not isinstance(reach.get("latency_ms"), bool) else None
+    out.append({"id": "responds_within_5000ms", "status": ("pass" if lat is not None and lat <= 5000 else "fail") if reach.get("reachable") else "fail" if reach.get("error_class") == "TimeoutError" else "not_applicable",
+                "observed": lat if reach.get("reachable") else reach.get("error_class"), "expected": "<= 5000 ms"})
+    m = pay_to_matches_snapshot(facts); lp = bz.get("listed_payTo")
+    out.append({"id": "pay_to_matches_snapshot", "status": "not_applicable" if m is None else "pass" if m else "fail",
+                "observed": {"challenge": challenge_pay_tos(facts), "snapshot": sorted({str(x).lower() for x in lp}) if isinstance(lp, list) else None}})
     return out
+
+def challenge_pay_tos(facts):
+    acc = (facts.get("challenge") or {}).get("accepts") or []
+    return sorted({a["payTo"].lower() for a in acc if isinstance(a, dict) and isinstance(a.get("payTo"), str)})
+def pay_to_matches_snapshot(facts):
+    bz = facts.get("bazaar") or {}; live = challenge_pay_tos(facts); lp = bz.get("listed_payTo")
+    if not bz.get("available") or bz.get("listed") is not True or not isinstance(lp, list) or not lp or not live: return None
+    return sorted({str(x).lower() for x in lp}) == live
 
 def attest(facts, signer, rpc=None, now=None, ttl_s=None, issuer_url=None):
     """signer = (key_id, sign(bytes) -> 64-byte signature)."""
@@ -85,7 +99,7 @@ def attest(facts, signer, rpc=None, now=None, ttl_s=None, issuer_url=None):
            "issued_at": iso(now), "expires_at": iso(int(now) + ttl),
            "issuer": {"name": ISSUER_NAME, "key_id": key_id, "issuer_url": issuer_url, "contact": CONTACT},
            "subject": {"type": "x402_endpoint", "url": facts.get("target")},
-           "claims": {"facts": facts, "payto_code": code, "checks": checks,
+           "claims": {"facts": facts, "payto_code": code, "pay_to_matches_snapshot": pay_to_matches_snapshot(facts), "checks": checks,
                       "checks_passed": [c["id"] for c in checks if c["status"] == "pass"],
                       "checks_failed": [c["id"] for c in checks if c["status"] == "fail"]}}
     env["signature"] = {"alg": "Ed25519", "key_id": key_id, "value_b64": base64.b64encode(sign_fn(signing_bytes(env))).decode()}

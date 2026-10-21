@@ -28,7 +28,7 @@
       "properties": { "type": { "const": "x402_endpoint" }, "url": { "type": "string" } }
     },
     "claims": {
-      "type": "object", "required": ["facts", "payto_code", "checks", "checks_passed", "checks_failed"], "additionalProperties": false,
+      "type": "object", "required": ["facts", "payto_code", "pay_to_matches_snapshot", "checks", "checks_passed", "checks_failed"], "additionalProperties": false,
       "properties": {
         "facts": { "type": "object", "description": "The Pre-pay Check facts object (schema prepay-check/v1): target, checked_at, reachability, challenge, bazaar, disclaimer." },
         "payto_code": {
@@ -36,6 +36,7 @@
           "items": { "type": "object", "required": ["address", "kind", "code_bytes"], "additionalProperties": false,
             "properties": { "address": { "type": "string", "pattern": "^0x[0-9a-f]{40}$" }, "kind": { "enum": ["eoa", "eip7702_delegated", "contract", null] }, "code_bytes": { "type": ["integer", "null"], "minimum": 0 }, "delegate": { "type": "string", "pattern": "^0x[0-9a-f]{40}$" } } }
         },
+        "pay_to_matches_snapshot": { "type": ["boolean", "null"], "description": "Whether the payTo set in the live 402 equals the payTo set recorded for this resource in the Bazaar snapshot; null when not comparable. A fact, not a verdict." },
         "checks": {
           "type": "array",
           "items": { "type": "object", "required": ["id", "status", "observed"], "additionalProperties": false,
@@ -58,6 +59,6 @@
   "$defs": {
     "ts": { "type": "string", "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}Z$" },
     "key_id": { "type": "string", "pattern": "^[0-9a-f]{16}$" },
-    "check_id": { "enum": ["endpoint_reachable", "http_402_returned", "challenge_well_formed", "network_is_base", "asset_is_base_usdc", "payto_is_eoa", "bazaar_snapshot_available", "listed_in_bazaar"] }
+    "check_id": { "enum": ["endpoint_reachable", "http_402_returned", "challenge_well_formed", "network_is_base", "asset_is_base_usdc", "payto_is_eoa", "bazaar_snapshot_available", "listed_in_bazaar", "responds_within_5000ms", "pay_to_matches_snapshot"] }
   }
 }

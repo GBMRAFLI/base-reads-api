@@ -139,13 +139,13 @@ def check_url(url, resolver=socket.getaddrinfo):
 
 class PinnedHTTPSConnection(http.client.HTTPSConnection):
     """TCP to the pre-validated IP; TLS SNI + certificate check + Host header use the original hostname."""
-    def __init__(self, host, pinned_ip, port=443, timeout=8, context=None):
+    def __init__(self, host, pinned_ip, port=443, timeout=5, context=None):
         super().__init__(host, port, timeout=timeout, context=context or ssl.create_default_context()); self.pinned_ip = pinned_ip
     def connect(self):
         sock = socket.create_connection((self.pinned_ip, self.port), self.timeout)
         self.sock = self._context.wrap_socket(sock, server_hostname=self.host)
 
-def probe(u, pinned_ip, timeout=8, conn_cls=PinnedHTTPSConnection):
+def probe(u, pinned_ip, timeout=5, conn_cls=PinnedHTTPSConnection):  # A9: 5 s budget
     """One unpaid GET over the pinned IP. No redirects followed."""
     t0 = time.monotonic()
     path = (u.path or "/") + ("?" + u.query if u.query else "")

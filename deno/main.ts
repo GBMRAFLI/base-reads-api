@@ -8,7 +8,8 @@ import DISCOVERY from "./lib/discovery.json" with { type: "json" };
 import { CDP_HOST, enabled as cdpEnabled, headers as cdpHeaders } from "./lib/cdp_auth.ts";
 import * as SG from "./lib/settle_guard.ts";
 import * as LG from "./lib/ledger.ts";
-import { SCHEMA, snapshotDates, loadIndex } from "./lib/preflight.ts";
+import { SCHEMA, snapshotDates, loadIndex, readSnapMeta, checkUrl, configureOutbound, hostOf } from "./lib/preflight.ts";
+import { guardConfig, ResultCache, WindowLimiter } from "./lib/guards.ts";
 import { isoOrNull, keyHistory, loadKey, publicKeyInfo, sign, signJcs, SigningUnavailable } from "./lib/sign.ts";
 import { CANON, CONTACT, ISSUER_NAME, SPEC, VERSION } from "./lib/attestation.ts";
 import ATT_SCHEMA from "../spec/prepay-check-attestation-v1.schema.json" with { type: "json" };
@@ -20,7 +21,9 @@ import { ADDR, b64json, iso, pyQuery, sha256hex, unquote } from "./lib/util.ts";
 const USDCS: Record<string, string> = { "eip155:8453": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913", "eip155:84532": "0x036CbD53842c5426634e7929541eC2318f3dCF7e" };
 export type Deps = { env: (k: string) => string | undefined; rpc?: Rpc; fac?: (p: string, body: unknown) => Promise<any>;
   resolver?: Resolver; fetcher?: Fetcher; background?: (p: Promise<unknown>) => void;
-  check?: (tx: string, r: any, payer: string | undefined) => Promise<any>; ip?: string };
+  check?: (tx: string, r: any, payer: string | undefined) => Promise<any>; ip?: string;
+  /** Delayed job runner for the post-delivery reorg re-check (A4); set by the server entrypoint, absent in most tests. */
+  schedule?: (ms: number, fn: () => Promise<void>) => void };
 const cfg = (env: Deps["env"]) => {
   const NETWORK = env("NETWORK") || "eip155:8453"; // empty NETWORK= means mainnet
   return { FAC: env("FACILITATOR") ?? "https://facilitator.payai.network", RPC: env("RPC") ?? "https://mainnet.base.org",
@@ -156,7 +159,8 @@ export async function snapshotMeta(env: Deps["env"] = (k) => Deno.env.get(k)) {
     covered = m?.listings ?? 0;
     if (!last_attempt_at) last_attempt_at = m?.last_attempt_at ?? null;
   }
-  const meta = { version: 1, started_at: dates[0] ?? null, last_updated: last,
+  const lastSha = last ? ((await (await import("./lib/preflight.ts")).readSnapMeta(last))?.sha256 ?? null) : null;
+  const meta = { version: 1, started_at: dates[0] ?? null, last_updated: last, last_sha256: lastSha,
     last_attempt_at, total_snapshots: dates.length, covered_listings: covered,
     last_status: status, last_failed_pages: failed_pages, last_error };
   return { metadata: meta, signature: await signJcs(meta, env), pubkey_url: "/x402/preflight/pubkey" };
@@ -171,7 +175,8 @@ export async function snapshotSummary(limit = 30) {
       const hosts = idx.tier === "aggregate" ? (idx.aggregate?.hosts ?? 0) : Object.keys(idx.hosts ?? {}).length;
       const wallets = idx.tier === "aggregate" ? (idx.aggregate?.payout_wallets ?? 0) : Object.keys(idx.wallet_hosts ?? {}).length;
       const status = (await latestSnapStatus(d)).status ?? idx.status ?? idx.coverage?.status ?? null;
-      SNAP_SUM.set(d, { date: d, status, resources: idx.tier === "full" ? vals.length : (idx.listings ?? 0), hosts, payout_wallets: wallets,
+      const sm = await readSnapMeta(d);
+      SNAP_SUM.set(d, { date: d, sha256: sm?.sha256 ?? null, status, resources: idx.tier === "full" ? vals.length : (idx.listings ?? 0), hosts, payout_wallets: wallets,
         calls30d_total: vals.reduce((a: number, r: any) => a + (r.calls30d || 0), 0), payers30d_total: vals.reduce((a: number, r: any) => a + (r.payers30d || 0), 0) });
     }
     out.push(SNAP_SUM.get(d)!);
@@ -307,13 +312,27 @@ async function handleGet(req: Request, d: Deps): Promise<Response> {
   const tReq = iso();
   const sig = req.headers.get("PAYMENT-SIGNATURE") ?? req.headers.get("X-PAYMENT");
   if (publicUrlError(env)) return send(503, { error: "public origin not configured" }); // mainnet without PUBLIC_URL: never use Host
-  if (!sig) { const pr = required(path, req.headers.get("Host") ?? "", env); return send(402, pr, { "PAYMENT-REQUIRED": b64(pr) }); }
+  if (!sig) {
+    // A6: unpaid 402s are pure computation (no DNS, GET or RPC) and limited per client IP.
+    if (d.ip && !abuse(env).unpaid.allow(SG.ipKey(d.ip) ?? d.ip)) return send(429, { error: "too many unpaid requests, retry later", scope: "ip" }, { "Retry-After": "60" });
+    const pr = required(path, req.headers.get("Host") ?? "", env); return send(402, pr, { "PAYMENT-REQUIRED": b64(pr) });
+  }
   const [code, out, hd] = await paid(path, q, qs, sig, tReq, d, c, rpc, fac, req.headers.get("Host") ?? "");
   return send(code, out, hd);
 }
 
 const FAILS = new SG.FailLimiter();
-export async function resetGuards() { await FAILS.clear(); }
+type Abuse = { unpaid: WindowLimiter; perHost: WindowLimiter; cache: ResultCache<unknown> };
+let ABUSE: Abuse | null = null;
+/** Per-process abuse guards (A6 unpaid limit, per-target outbound limit, A7 payer+target cache, outbound concurrency). */
+export function abuse(env: Deps["env"]): Abuse {
+  if (!ABUSE) {
+    const g = guardConfig(env); configureOutbound(g.outboundConcurrency);
+    ABUSE = { unpaid: new WindowLimiter(g.unpaidPerMin), perHost: new WindowLimiter(g.perHostPerMin), cache: new ResultCache(g.cacheTtlMs) };
+  }
+  return ABUSE;
+}
+export async function resetGuards() { await FAILS.clear(); ABUSE = null; }
 export const MAINNET = "eip155:8453";
 /** MIN_CONFIRMATIONS clamped to 1..64 (non-numeric or empty -> 1). */
 export function minConfirmations(env: Deps["env"]): number {
@@ -376,12 +395,19 @@ async function paid(path: string, q: Record<string, string>, qs: string, sig: st
     })());
   };
   const mismatch = (why: string) => bg(recordObservation(path, "settle-mismatch", 502, null, why).catch(() => {}));
+  // Pre-pay Check settles BEFORE probing the target (A1): an unsettled payment never causes outbound traffic.
+  const settleFirst = path === "/x402/preflight";
+  const G = abuse(env);
+  const cacheKey = (u: string) => who + "|" + u;
   const run = async (): Promise<[number, unknown]> => {
     if (path === "/x402/preflight") {
       const u = unquote(q.url ?? "");
+      const hit = u ? G.cache.get(cacheKey(u)) : null; // A7: same payer + target within 60 s: no new probe
+      if (hit) return [200, hit];
       const ttlRaw = env("ATTESTATION_TTL_S") ?? ""; const ttl = /^[0-9]{1,6}$/.test(ttlRaw) ? Number(ttlRaw) : undefined; // normTtl: int >= 1 else 900
       return u ? await preflight(u, { resolver: d.resolver, fetcher: d.fetcher, env, rpc, ttlS: ttl,
-        issuerUrl: c.PUBLIC ? c.PUBLIC.replace(/\/+$/, "") + "/.well-known/issuer.json" : null }) : [400, { error: "give ?url=https://..." }];
+        issuerUrl: c.PUBLIC ? c.PUBLIC.replace(/\/+$/, "") + "/.well-known/issuer.json" : null }).then((res) => { if (res[0] === 200) G.cache.set(cacheKey(u), res[1]); return res; })
+        : [400, { error: "give ?url=https://..." }];
     }
     return await new Chain(rpc, c.USDC).handle(path, q);
   };
@@ -417,12 +443,51 @@ async function paid(path: string, q: Record<string, string>, qs: string, sig: st
   held.payer = await SG.acquireSlots({ payer: who }); // L1: a forged `from` never reaches this line
   if (!held.payer) { await SG.unclaim(key); return busy; } // not settled: the same authorization may be retried
   if (await FAILS.blocked({ payer: who })) { await SG.unclaim(key); return [429, { error: "too many failed payments, retry later", scope: "payer" }, {}]; }
-  let code: number, out: unknown;
-  try { [code, out] = await run(); } catch (e) {
-    if (e instanceof SigningUnavailable) return [503, { error: "signing unavailable, not charged" }, {}];
-    return [502, { error: "upstream error, not charged" }, {}];
+  let code = 0, out: unknown = null;
+  if (settleFirst) {
+    // Cheap input checks before settlement (not charged, authorization released): URL shape, SSRF policy (A8), per-target budget.
+    const u = unquote(q.url ?? "");
+    if (!u) { await SG.unclaim(key); return [400, { error: "give ?url=https://...", charged: false }, {}]; }
+    const chk = await checkUrl(u, d.resolver);
+    if (!chk.u) { await SG.unclaim(key); return [400, { error: chk.err, target_url_allowed: false, charged: false }, {}]; }
+    if (!G.cache.get(cacheKey(u)) && !G.perHost.allow(hostOf(u))) {
+      await SG.unclaim(key); return [429, { error: "too many checks of this target in the last minute, retry later", scope: "target", charged: false }, { "Retry-After": "60" }];
+    }
+  } else {
+    try { [code, out] = await run(); } catch (e) {
+      if (e instanceof SigningUnavailable) return [503, { error: "signing unavailable, not charged" }, {}];
+      return [502, { error: "upstream error, not charged" }, {}];
+    }
+    if (code !== 200) return [code, out, {}]; // bad input: not settled, not charged
   }
-  if (code !== 200) return [code, out, {}]; // bad input: not settled, not charged
+  /** A4: some time after delivery, re-check the settlement; if it no longer holds (reorg), record an incident. Delivery stands. */
+  const watchReorg = (tx: string) => {
+    if (!d.schedule) return;
+    const ms = /^[0-9]{1,7}$/.test(env("REORG_RECHECK_MS") ?? "") ? Number(env("REORG_RECHECK_MS")) : 120_000;
+    d.schedule(ms, async () => {
+      try {
+        const oc2: any = await check(tx, r, who);
+        if (oc2.settled !== true) {
+          console.log("INCIDENT post_delivery_reorg", path, tx);
+          await recordObservation(path, "incident", 0, null, "post_delivery_reorg:" + String(oc2.reason ?? oc2.settled));
+        }
+      } catch (e) { console.log("reorg re-check failed:", (e as Error).name); }
+    });
+  };
+  /** Serve after settlement. Settle-first routes run the handler now; if it cannot finish, the payment is parked
+   * and the same request is served on retry (pending path). */
+  const deliver = async (tx: string, oc: any, times: [string, string, string]): Promise<[number, unknown, Record<string, string>]> => {
+    if (settleFirst) {
+      let ok = false;
+      try { [code, out] = await run(); ok = code === 200; } catch { ok = false; }
+      if (!ok) {
+        await SG.setPending(key, { path, tx, times });
+        return [502, { error: "payment settled but the check could not complete; repeat the same request to receive it", transaction: tx }, payResp(N, true, tx, who)];
+      }
+    }
+    log(tx, oc, true, times); watchReorg(tx);
+    return [200, out, payResp(N, true, tx, who)];
+  };
   // point of no return: record the authorization as consumed (fsync'ed) before asking for settlement
   if (!await SG.consumeAuth(key, { path, payload_sha256: await SG.payloadHash(payload!) })) return [402, { error: "payment authorization already used", hint: REUSE_HINT }, noPay("replay", N)];
   const st = await fac("/settle", body); const tSet = iso(); logBazaar("settle", path, st); const times: [string, string, string] = [tReq, tVer, tSet];
@@ -431,8 +496,7 @@ async function paid(path: string, q: Record<string, string>, qs: string, sig: st
   if (!st.success) {
     const oc: any = tx ? await check(tx, r, who) : { settled: false, reason: "no_tx_hash" };
     if (oc.settled === true && tx && await SG.claimTx(tx)) { // facilitator said failed, chain says paid: honor it
-      log(tx, { ...oc, note: "settle_reported_failure_but_confirmed_onchain" }, true, times);
-      return [200, out, payResp(N, true, tx, who)];
+      return await deliver(tx, { ...oc, note: "settle_reported_failure_but_confirmed_onchain" }, times);
     }
     const why = facErr(st.errorReason); await FAILS.fail(ids, "settle");
     return [402, { error: why, hint: REUSE_HINT }, payResp(N, false, tx, who, why)]; // the authorization is spent
@@ -441,10 +505,10 @@ async function paid(path: string, q: Record<string, string>, qs: string, sig: st
   if (!await SG.claimTx(tx)) { mismatch("settlement_tx_reused"); return [409, { error: "settlement transaction already used" }, noPay("replay", N)]; }
   const oc: any = await check(tx, r, who);
   if (mode === "log") {
-    log(tx, oc, true, times); if (oc.settled !== true) mismatch("onchain_" + String(oc.reason));
-    return [200, out, payResp(N, true, tx, who)];
+    if (oc.settled !== true) mismatch("onchain_" + String(oc.reason));
+    return await deliver(tx, oc, times);
   }
-  if (oc.settled === true) { log(tx, oc, true, times); return [200, out, payResp(N, true, tx, who)]; }
+  if (oc.settled === true) return await deliver(tx, oc, times);
   if (oc.settled === null) {
     await SG.setPending(key, { path, tx, times });
     return [202, { status: "settled_pending_onchain_confirmation", transaction: tx,
@@ -455,6 +519,7 @@ async function paid(path: string, q: Record<string, string>, qs: string, sig: st
 }
 }
 
+const SCHEDULE = (ms: number, fn: () => Promise<void>) => { const t = setTimeout(() => { fn().catch(() => {}); }, ms); Deno.unrefTimer(t); };
 /** Behind a local reverse proxy (TRUST_PROXY=1) the peer is loopback; use the last X-Forwarded-For hop the proxy appended. */
 /** Loopback: 127.0.0.0/8, ::1, and IPv4-mapped ::ffff:127.x.x.x. */
 export function isLoopback(ip: string) {
@@ -485,5 +550,5 @@ if (import.meta.main) {
   if (mig.auth || mig.tx) console.log("ledger: imported", JSON.stringify(mig));
   assertOnchainMode(env); // refuse to start with ONCHAIN_CHECK=log on Base mainnet
   Deno.serve({ hostname: bindHost(env), port: Number(env("PORT") ?? 8000) },
-    (req, info) => handler(req, { env, ip: clientIp(req, (info.remoteAddr as Deno.NetAddr).hostname, env) }));
+    (req, info) => handler(req, { env, ip: clientIp(req, (info.remoteAddr as Deno.NetAddr).hostname, env), schedule: SCHEDULE }));
 }

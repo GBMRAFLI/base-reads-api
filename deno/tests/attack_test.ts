@@ -1,0 +1,190 @@
+// Attack scenarios A1-A12 for the paid Pre-pay Check, plus outbound limits. Keys: repo throwaway test key (legacy
+// signature) and in-memory ephemeral keys; nothing here touches the network (resolver/fetcher/rpc/facilitator are stubs).
+import { assert, assertEquals } from "jsr:@std/assert@1";
+import { handler, reqFor, resetGuards } from "../main.ts";
+import { useKv, rows, kv } from "../lib/store.ts";
+import { clearIndexCache, configureOutbound, IndexAssembler, OUTBOUND, preflight, readSnapMeta, saveIndex } from "../lib/preflight.ts";
+import { attest, verifyAttestation, type Signer } from "../lib/attestation.ts";
+import { verify as officialVerify, verifySnapshotBinding } from "../../scripts/verify_attestation.ts";
+import { Semaphore, WindowLimiter } from "../lib/guards.ts";
+
+useKv(await Deno.openKv(":memory:"));
+const P = JSON.parse(Deno.readTextFileSync(new URL("./fixtures/py_signed.json", import.meta.url)));
+const BASE_ENV: Record<string, string> = { SIGNING_KEY_PASSPHRASE: P.passphrase, SIGNING_KEY_ENC_B64: P.enc_b64, PUBLIC_URL: "https://h.example", SELF_WALLETS: "0x" + "77".repeat(20), LEDGER_MEMORY_OK: "1", NETWORK: "eip155:84532" };
+let E: Record<string, string> = { ...BASE_ENV }; const env = (k: string) => E[k];
+const PAYER = "0x" + "a1".repeat(20); const PATH = "/x402/preflight";
+const rnd = () => "0x" + Array.from(crypto.getRandomValues(new Uint8Array(32)), (b) => b.toString(16).padStart(2, "0")).join("");
+function pay(acceptedOver: Record<string, string> = {}, nonce = rnd()) {
+  const r = reqFor(PATH, env); const now = Math.floor(Date.now() / 1000);
+  const a = { from: PAYER, to: r.payTo, value: r.amount, validAfter: String(now - 5), validBefore: String(now + 300), nonce };
+  return btoa(JSON.stringify({ x402Version: 2, accepted: { ...r, ...acceptedOver }, payload: { authorization: a, signature: "0x" + "11".repeat(65) } }));
+}
+const CH = (payTo = reqFor(PATH, env).payTo) => ({ x402Version: 2, accepts: [{ scheme: "exact", network: "eip155:8453", amount: "10000", asset: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913", payTo, maxTimeoutSeconds: 60 }] });
+/** Rig with call counters for every outbound dependency. */
+function rig(o: { settle?: () => any; chain?: { v: any }; fetchDelay?: number } = {}) {
+  const n = { verify: 0, settle: 0, fetch: 0, dns: 0, rpc: 0 }; const chain = o.chain ?? { v: { settled: true } };
+  const fac = async (p: string) => { if (p === "/verify") { n.verify++; return { isValid: true }; } n.settle++; return o.settle ? o.settle() : { success: true, transaction: rnd(), payer: PAYER, network: "eip155:84532" }; };
+  const resolver = async () => { n.dns++; return ["93.184.216.34"]; };
+  const fetcher = async () => { n.fetch++; if (o.fetchDelay) await new Promise((r) => setTimeout(r, o.fetchDelay)); return new Response("{}", { status: 402, headers: { "PAYMENT-REQUIRED": btoa(JSON.stringify(CH())) } }); };
+  const rpc = async () => { n.rpc++; return "0x"; };
+  const jobs: { ms: number; fn: () => Promise<void> }[] = [];
+  const call = async (sig: string | null, url = "https://t.example/x", ip = "198.51.100.7") => {
+    const headers: Record<string, string> = sig ? { "PAYMENT-SIGNATURE": sig } : {};
+    const res = await handler(new Request("http://h" + PATH + "?url=" + encodeURIComponent(url), { headers }),
+      { env, fac, rpc, resolver, fetcher: fetcher as any, check: async () => chain.v, background: () => {}, ip, schedule: (ms, fn) => { jobs.push({ ms, fn }); } });
+    return [res.status, await res.json()] as [number, any];
+  };
+  return { n, call, jobs, chain };
+}
+const fresh = async (over: Record<string, string> = {}) => { E = { ...BASE_ENV, ...over }; await resetGuards(); clearIndexCache(); };
+
+Deno.test("A1 verified payment that is never settled -> 402 and the target is never probed (settle before probe)", async () => {
+  await fresh();
+  const t = rig({ settle: () => ({ success: false, errorReason: "unexpected_settle_error" }) });
+  const [c, b] = await t.call(pay()); assertEquals(c, 402); assert(b.error);
+  assertEquals([t.n.settle, t.n.fetch], [1, 0]);
+  const t2 = rig({ chain: { v: { settled: false, reason: "nonce_not_in_settlement_tx" } } });
+  assertEquals((await t2.call(pay()))[0], 402); assertEquals(t2.n.fetch, 0);
+  const t3 = rig({ chain: { v: { settled: null } } }); assertEquals((await t3.call(pay()))[0], 202); assertEquals(t3.n.fetch, 0);
+  const t4 = rig(); assertEquals((await t4.call(pay()))[0], 200); assertEquals(t4.n.fetch, 1); // control: settled -> probed once
+});
+Deno.test("A2 asset is not Base USDC -> rejected before verify/settle", async () => {
+  await fresh(); const t = rig();
+  const [c, b] = await t.call(pay({ asset: "0x" + "12".repeat(20) })); assertEquals([c, b.error], [402, "accepted.asset_mismatch"]);
+  assertEquals([t.n.verify, t.n.settle, t.n.fetch], [0, 0, 0]);
+});
+Deno.test("A3 network is not Base -> rejected before verify/settle", async () => {
+  await fresh(); const t = rig();
+  const [c, b] = await t.call(pay({ network: "eip155:1" })); assertEquals([c, b.error], [402, "accepted.network_mismatch"]);
+  assertEquals([t.n.verify, t.n.settle, t.n.fetch], [0, 0, 0]);
+});
+Deno.test("A4 settle ok, delivered, then a simulated reorg -> incident logged, delivery stands", async () => {
+  await fresh({ REORG_RECHECK_MS: "1" }); const t = rig();
+  const [c, b] = await t.call(pay()); assertEquals(c, 200); assert(b.attestation);
+  assertEquals(t.jobs.length, 1); assertEquals(t.jobs[0].ms, 1);
+  t.chain.v = { settled: false, reason: "receipt_not_found" }; await t.jobs[0].fn(); // reorg: receipt gone
+  const inc = (await rows("observations.jsonl")).filter((r: any) => r.inputHash === "incident");
+  assertEquals(inc.at(-1)?.note, "post_delivery_reorg:receipt_not_found");
+  const t2 = rig(); await t2.call(pay()); await t2.jobs[0].fn(); // no reorg: no new incident
+  assertEquals((await rows("observations.jsonl")).filter((r: any) => r.inputHash === "incident").length, inc.length);
+});
+Deno.test("A5 replay of the same payment header -> rejected (nonce ledger), settled once, probed once", async () => {
+  await fresh(); const t = rig(); const sig = pay();
+  assertEquals((await t.call(sig))[0], 200);
+  for (let i = 0; i < 3; i++) { const [c] = await t.call(sig); assert(c === 409 || c === 402, String(c)); }
+  assertEquals([t.n.settle, t.n.fetch], [1, 1]);
+});
+Deno.test("A6 100 unpaid requests in a minute -> per-IP limit; unpaid 402 does no DNS/GET/RPC/facilitator work", async () => {
+  await fresh(); const t = rig(); const codes: number[] = [];
+  for (let i = 0; i < 100; i++) codes.push((await t.call(null))[0]);
+  assertEquals([codes.filter((c) => c === 402).length, codes.filter((c) => c === 429).length], [60, 40]);
+  assertEquals(t.n, { verify: 0, settle: 0, fetch: 0, dns: 0, rpc: 0 });
+  assertEquals((await t.call(null, "https://t.example/x", "203.0.113.9"))[0], 402); // other IPs unaffected
+  const w = new WindowLimiter(2, 1000); assert(w.allow("a", 0)); assert(w.allow("a", 1)); assert(!w.allow("a", 2)); assert(w.allow("a", 1000)); // window resets
+});
+Deno.test("A7 pay once then 100 requests for the same target -> one probe; cache 60 s per payer+target; then a new payment probes again", async () => {
+  await fresh({ PREFLIGHT_CACHE_TTL_S: "1" }); const t = rig(); const sig = pay();
+  assertEquals((await t.call(sig))[0], 200);
+  const codes: number[] = []; for (let i = 0; i < 100; i++) codes.push((await t.call(sig))[0]);
+  assert(codes.every((c) => c === 409 || c === 402)); assertEquals(t.n.fetch, 1); // same header: rejected, needs a new payment
+  const [c2, b2] = await t.call(pay()); assertEquals(c2, 200); assertEquals(t.n.fetch, 1); // new payment inside TTL: cached result, no new probe
+  assert(b2.attestation);
+  await new Promise((r) => setTimeout(r, 1100));
+  assertEquals((await t.call(pay()))[0], 200); assertEquals(t.n.fetch, 2); // after TTL: probed again
+});
+Deno.test("per-target outbound budget per minute: over budget -> 429 before settlement (not charged)", async () => {
+  await fresh({ OUTBOUND_PER_HOST_PER_MIN: "3" }); const t = rig();
+  for (let i = 0; i < 3; i++) assertEquals((await t.call(pay(), "https://t.example/p" + i))[0], 200);
+  const [c, b] = await t.call(pay(), "https://t.example/p9"); assertEquals([c, b.scope, b.charged], [429, "target", false]);
+  assertEquals([t.n.settle, t.n.fetch], [3, 3]);
+  assertEquals((await t.call(pay(), "https://other.example/p"))[0], 200); // other targets unaffected
+});
+Deno.test("bounded outbound concurrency: never more than N probes in flight", async () => {
+  await fresh(); configureOutbound(2); let live = 0, peak = 0;
+  const fetcher = async () => { live++; peak = Math.max(peak, live); await new Promise((r) => setTimeout(r, 30)); live--; return new Response("{}", { status: 402 }); };
+  const k = await crypto.subtle.generateKey({ name: "Ed25519" }, false, ["sign"]) as CryptoKeyPair;
+  const signer: Signer = { keyId: "0".repeat(16), sign: async (m) => new Uint8Array(await crypto.subtle.sign("Ed25519", k.privateKey, m as Uint8Array<ArrayBuffer>)) };
+  await Promise.all(Array.from({ length: 10 }, (_, i) => preflight("https://c" + i + ".example/", { resolver: async () => ["93.184.216.34"], fetcher: fetcher as any, signer, env })));
+  assertEquals(peak, 2); assertEquals(OUTBOUND.active, 0);
+  const s = new Semaphore(1, 1); const r1 = await s.acquire(); const p2 = s.acquire(50); let busy = false; try { await s.acquire(50); } catch { busy = true; } assert(busy, "queue bound");
+  r1(); (await p2)(); configureOutbound(4);
+});
+Deno.test("A8 target http://169.254.169.254/ -> rejected (target_url_allowed=false), not settled, not probed", async () => {
+  await fresh(); const t = rig();
+  for (const u of ["http://169.254.169.254/", "https://169.254.169.254/latest/meta-data/", "https://127.0.0.1/", "https://[::1]/"]) {
+    const [c, b] = await t.call(pay(), u); assertEquals([c, b.target_url_allowed, b.charged], [400, false, false], u);
+  }
+  assertEquals([t.n.settle, t.n.fetch], [0, 0]);
+});
+Deno.test("A9 target slower than 5 s -> 5 s timeout and checks_failed includes responds_within_5000ms", async () => {
+  await fresh();
+  const slow = (_u: string, init?: RequestInit) => new Promise<Response>((_, rej) => init!.signal!.addEventListener("abort", () => rej(init!.signal!.reason)));
+  const k = await crypto.subtle.generateKey({ name: "Ed25519" }, false, ["sign"]) as CryptoKeyPair;
+  const signer: Signer = { keyId: "0".repeat(16), sign: async (m) => new Uint8Array(await crypto.subtle.sign("Ed25519", k.privateKey, m as Uint8Array<ArrayBuffer>)) };
+  const t0 = performance.now();
+  const [c, b]: any = await preflight("https://slow.example/", { resolver: async () => ["93.184.216.34"], fetcher: slow as any, signer, env });
+  const ms = performance.now() - t0;
+  assertEquals(c, 200); assert(ms >= 4900 && ms < 6500, String(ms));
+  assertEquals(b.facts.reachability.error_class, "TimeoutError");
+  assert(b.attestation.claims.checks_failed.includes("responds_within_5000ms"));
+});
+async function snap(resource: string, payTo: string) {
+  const b = new IndexAssembler(); const D = new Date().toISOString().slice(0, 10);
+  b.add([{ resource, accepts: [{ payTo }], quality: { l30DaysUniquePayers: 1, l30DaysTotalCalls: 2 } }]);
+  await saveIndex(b.build(D)); clearIndexCache(); return D;
+}
+Deno.test("A10 402 payTo differs from the Bazaar snapshot -> pay_to_matches_snapshot false (fact, no verdict)", async () => {
+  await fresh(); await snap("https://m.example/x", "0x" + "33".repeat(20));
+  const k = await crypto.subtle.generateKey({ name: "Ed25519" }, false, ["sign"]) as CryptoKeyPair;
+  const signer: Signer = { keyId: "0".repeat(16), sign: async (m) => new Uint8Array(await crypto.subtle.sign("Ed25519", k.privateKey, m as Uint8Array<ArrayBuffer>)) };
+  const fetcher = async () => new Response("{}", { status: 402, headers: { "PAYMENT-REQUIRED": btoa(JSON.stringify(CH("0x" + "44".repeat(20)))) } });
+  const [, b]: any = await preflight("https://m.example/x", { resolver: async () => ["93.184.216.34"], fetcher: fetcher as any, signer, env });
+  assertEquals(b.attestation.claims.pay_to_matches_snapshot, false);
+  const ck = b.attestation.claims.checks.find((c: any) => c.id === "pay_to_matches_snapshot");
+  assertEquals(ck, { id: "pay_to_matches_snapshot", status: "fail", observed: { challenge: ["0x" + "44".repeat(20)], snapshot: ["0x" + "33".repeat(20)] } });
+  for (const w of ["verdict", "score", "safe", "scam", "recommend"]) assert(!JSON.stringify(b.attestation).toLowerCase().includes(w), w);
+});
+Deno.test("A11 tampered Bazaar snapshot: service detects the hash mismatch; verifier rejects a hash that differs from the published one", async () => {
+  await fresh(); const D = await snap("https://n.example/x", "0x" + "33".repeat(20));
+  const meta = (await readSnapMeta(D))!; assert(/^[0-9a-f]{64}$/.test(meta.sha256!));
+  const pub = await (await handler(new Request("http://h/bazaar/snapshots"), { env })).json();
+  assertEquals(pub.snapshots.find((x: any) => x.date === D).sha256, meta.sha256); // published per date
+  const k = await crypto.subtle.generateKey({ name: "Ed25519" }, true, ["sign"]) as CryptoKeyPair;
+  const raw = new Uint8Array(await crypto.subtle.exportKey("raw", k.publicKey));
+  const kid = Array.from(new Uint8Array(await crypto.subtle.digest("SHA-256", raw)), (x) => x.toString(16).padStart(2, "0")).join("").slice(0, 16);
+  const signer: Signer = { keyId: kid, sign: async (m) => new Uint8Array(await crypto.subtle.sign("Ed25519", k.privateKey, m as Uint8Array<ArrayBuffer>)) };
+  const fetcher = async () => new Response("{}", { status: 402, headers: { "PAYMENT-REQUIRED": btoa(JSON.stringify(CH("0x" + "33".repeat(20)))) } });
+  const [, ok]: any = await preflight("https://n.example/x", { resolver: async () => ["93.184.216.34"], fetcher: fetcher as any, signer, env });
+  assertEquals(ok.facts.bazaar.snapshot_sha256, meta.sha256);
+  assertEquals(verifySnapshotBinding(ok.attestation, pub)[0], true);
+  const forged = { snapshots: [{ ...pub.snapshots[0], sha256: "f".repeat(64) }] };
+  assertEquals(verifySnapshotBinding(ok.attestation, forged), [false, "snapshot hash does not match the published snapshot"]);
+  // tamper with a stored chunk: the service refuses to use it
+  const c0 = await (await kv()).get<Uint8Array>(["snap", D, meta.gen!, 0]); const bad = new Uint8Array(c0.value!); bad[bad.length - 9] ^= 0xff;
+  await (await kv()).set(["snap", D, meta.gen!, 0], bad); clearIndexCache();
+  const [, tam]: any = await preflight("https://n.example/x", { resolver: async () => ["93.184.216.34"], fetcher: fetcher as any, signer, env });
+  assertEquals([tam.facts.bazaar.available, tam.facts.bazaar.reason], [false, "snapshot_hash_mismatch"]);
+  // python verifier: same binding rule
+  const d = await Deno.makeTempDir();
+  await Deno.writeTextFile(d + "/a.json", JSON.stringify(ok)); await Deno.writeTextFile(d + "/s.json", JSON.stringify(forged)); await Deno.writeTextFile(d + "/s_ok.json", JSON.stringify(pub));
+  await Deno.writeTextFile(d + "/i.json", JSON.stringify({ keys: [{ key_id: kid, public_key_b64: btoa(String.fromCharCode(...raw)), status: "active" }] }));
+  const py = async (s: string) => (await new Deno.Command("python3", { args: [new URL("../../scripts/verify_attestation.py", import.meta.url).pathname, d + "/a.json", "--issuer", d + "/i.json", "--snapshots", d + s], stdout: "piped" }).output()).code;
+  assertEquals([await py("/s_ok.json"), await py("/s.json")], [0, 1]);
+  await Deno.remove(d, { recursive: true });
+});
+Deno.test("A12 an attestation from yesterday -> rejected (expires_at passed) by the library and both official verifiers", async () => {
+  await fresh();
+  const k = await crypto.subtle.generateKey({ name: "Ed25519" }, true, ["sign"]) as CryptoKeyPair;
+  const raw = new Uint8Array(await crypto.subtle.exportKey("raw", k.publicKey)); const pub = btoa(String.fromCharCode(...raw));
+  const kid = Array.from(new Uint8Array(await crypto.subtle.digest("SHA-256", raw)), (x) => x.toString(16).padStart(2, "0")).join("").slice(0, 16);
+  const signer: Signer = { keyId: kid, sign: async (m) => new Uint8Array(await crypto.subtle.sign("Ed25519", k.privateKey, m as Uint8Array<ArrayBuffer>)) };
+  const facts = { schema: "prepay-check/v1", target: "https://y.example/", checked_at: "x", disclaimer: "d", reachability: { reachable: false, error_class: "TimeoutError" }, challenge: { valid: false, problems: [], accepts: [] }, bazaar: { available: false, reason: "no_snapshot" } };
+  const y: any = await attest(facts, { signer, now: Date.now() - 86400_000 });
+  assertEquals((await verifyAttestation(y, pub)).reason, "expired");
+  const iss = { keys: [{ key_id: kid, public_key_b64: pub, status: "active" }] };
+  assert((await officialVerify(y, iss))[1].startsWith("expired at "));
+  const d = await Deno.makeTempDir(); await Deno.writeTextFile(d + "/a.json", JSON.stringify(y)); await Deno.writeTextFile(d + "/i.json", JSON.stringify(iss));
+  const py = await new Deno.Command("python3", { args: [new URL("../../scripts/verify_attestation.py", import.meta.url).pathname, d + "/a.json", "--issuer", d + "/i.json"], stdout: "piped" }).output();
+  assertEquals(py.code, 1); assert(new TextDecoder().decode(py.stdout).startsWith("FAIL expired at "));
+  await Deno.remove(d, { recursive: true });
+});

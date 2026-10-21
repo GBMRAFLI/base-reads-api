@@ -14,7 +14,7 @@ NOW = 1792558800  # 2026-10-21T05:00:00Z
 def facts(**o):
     f = {"schema": "prepay-check/v1", "target": "https://a.example/x", "checked_at": "2026-10-21T05:00:00Z", "disclaimer": "d",
          "reachability": {"reachable": True, "http_status": 402, "latency_ms": 5}, "challenge": {"valid": True, "problems": [], "accepts": [ACC]},
-         "bazaar": {"available": True, "snapshot_date": "2026-10-20", "listed": True}}
+         "bazaar": {"available": True, "snapshot_date": "2026-10-20", "listed": True, "listed_payTo": [ACC["payTo"]]}}
     f.update(o); return f
 def ephemeral():
     k = ECC.generate(curve="ed25519"); raw = k.public_key().export_key(format="raw"); kid = hashlib.sha256(raw).hexdigest()[:16]
@@ -49,10 +49,12 @@ class TA(unittest.TestCase):
         bad = facts(challenge={"valid": True, "problems": [], "accepts": [dict(ACC, network="eip155:1", asset="0x" + "11" * 20)]})
         e = AT.attest(bad, ephemeral()[0], rpc=lambda m, p: "0x6080", now=NOW)
         self.assertEqual(e["claims"]["checks_failed"], ["network_is_base", "asset_is_base_usdc", "payto_is_eoa"])
+        self.assertIs(e["claims"]["pay_to_matches_snapshot"], True)
         self.assertEqual(e["claims"]["payto_code"], [{"address": "0x" + "22" * 20, "kind": "contract", "code_bytes": 2}])
         down = facts(reachability={"reachable": False, "error_class": "TimeoutError"}, challenge={"valid": False, "problems": ["no_402_challenge"], "accepts": []}, bazaar={"available": False, "reason": "no_snapshot"})
         self.assertEqual(st(down, []), {"endpoint_reachable": "fail", "http_402_returned": "not_applicable", "challenge_well_formed": "fail", "network_is_base": "not_applicable",
-                                        "asset_is_base_usdc": "not_applicable", "payto_is_eoa": "not_applicable", "bazaar_snapshot_available": "fail", "listed_in_bazaar": "not_applicable"})
+                                        "asset_is_base_usdc": "not_applicable", "payto_is_eoa": "not_applicable", "bazaar_snapshot_available": "fail", "listed_in_bazaar": "not_applicable",
+                                        "responds_within_5000ms": "fail", "pay_to_matches_snapshot": "not_applicable"})
         def boom(m, p): raise OSError("x")
         self.assertEqual(AT.payto_code(["0x" + "22" * 20, "0x" + "22" * 20, "bad"], boom), [{"address": "0x" + "22" * 20, "kind": None, "code_bytes": None}])
         self.assertEqual(len(AT.payto_code(["0x%040x" % i for i in range(1, 9)], lambda m, p: "0x")), 4)
@@ -120,4 +122,21 @@ class TFix(unittest.TestCase):
              M.patch.object(PF, "check_url", lambda u, *a: (u, "93.184.216.34", None)), M.patch.object(AT, "attest", side_effect=OverflowError("x")):
             code, body = PF.preflight("https://a.example/x")
         self.assertEqual((code, body["attestation"], body["attestation_error"]), (200, None, "attestation_unavailable")); self.assertTrue(body["signature"]["value_b64"])
+class TAttack(unittest.TestCase):
+    def test_a9_a10_checks_parity(self):
+        slow = facts(reachability={"reachable": False, "error_class": "TimeoutError"})
+        e = AT.attest(slow, ephemeral()[0], now=NOW); self.assertIn("responds_within_5000ms", e["claims"]["checks_failed"])
+        other = facts(bazaar={"available": True, "snapshot_date": "2026-10-20", "listed": True, "listed_payTo": ["0x" + "33" * 20]})
+        e2 = AT.attest(other, ephemeral()[0], now=NOW); self.assertIs(e2["claims"]["pay_to_matches_snapshot"], False)
+        self.assertIn("pay_to_matches_snapshot", e2["claims"]["checks_failed"])
+        self.assertIsNone(AT.pay_to_matches_snapshot(facts(bazaar={"available": False})))
+        self.assertEqual(PF.probe.__defaults__[0], 5)
+    def test_a11_a12_python_verifier(self):
+        s, pub, iss = ephemeral()
+        e = AT.attest(facts(bazaar={"available": True, "snapshot_date": "2026-10-20", "listed": True, "listed_payTo": [ACC["payTo"]], "snapshot_sha256": "a" * 64}), s, now=NOW)
+        self.assertEqual(VA.verify_snapshot_binding(e, {"snapshots": [{"date": "2026-10-20", "sha256": "a" * 64}]})[0], True)
+        self.assertEqual(VA.verify_snapshot_binding(e, {"snapshots": [{"date": "2026-10-20", "sha256": "b" * 64}]}), (False, "snapshot hash does not match the published snapshot"))
+        self.assertFalse(VA.verify_snapshot_binding(e, {"snapshots": []})[0])
+        y = AT.attest(facts(), s, now=NOW - 86400)
+        self.assertEqual(VA.verify(y, iss, now=NOW)[1], "expired at 2026-10-20T05:15:00Z"); self.assertEqual(AT.verify(y, pub, now=NOW), (False, "expired"))
 if __name__ == "__main__": unittest.main()

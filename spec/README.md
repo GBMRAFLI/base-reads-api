@@ -38,7 +38,15 @@ The paid route `GET /x402/preflight?url=<endpoint>` (0.010 USDC, x402 v2, `PAYME
 | `signature` | `{alg: "Ed25519", key_id, value_b64}` |
 
 Check ids in v1.0: `endpoint_reachable`, `http_402_returned`, `challenge_well_formed`, `network_is_base` (expected `eip155:8453`),
-`asset_is_base_usdc` (expected `0x833589fcd6edb6e08f4c7c32d4f71b54bda02913`), `payto_is_eoa`, `bazaar_snapshot_available`, `listed_in_bazaar`.
+`asset_is_base_usdc` (expected `0x833589fcd6edb6e08f4c7c32d4f71b54bda02913`), `payto_is_eoa`, `bazaar_snapshot_available`, `listed_in_bazaar`,
+`responds_within_5000ms` (the probe times out at 5 s; a timeout is a `fail`), `pay_to_matches_snapshot` (payTo set in the live 402
+equals the payTo set recorded for the resource in the Bazaar snapshot; also given as `claims.pay_to_matches_snapshot`, `null` when not comparable).
+
+Snapshot binding: `claims.facts.bazaar.snapshot_sha256` is the sha256 of the stored snapshot the facts were read from. The same
+hash is published per date at `/bazaar/snapshots` and for the newest date in the signed `/.well-known/bazaar-snapshot.json`.
+The service re-checks the hash on every load and reports `snapshot_hash_mismatch` instead of using a modified snapshot.
+Both verifiers take `--snapshots FILE|URL` (the `/bazaar/snapshots` document) and reject an attestation whose snapshot hash differs
+from the published one.
 `payto_is_eoa` passes only for `eoa`. It fails for `contract` and for `eip7702_delegated` (an account whose code delegates
 execution to another address); `observed` then shows `kind` and `delegate`, so a reader can apply their own policy.
 `network` and `asset` values are reported only when they are JSON strings; anything else is reported as `null`.

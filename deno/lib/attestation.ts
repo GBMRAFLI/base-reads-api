@@ -68,6 +68,14 @@ export async function paytoCode(payTos: string[], rpc?: Rpc): Promise<PaytoCode[
   }));
 }
 
+const challengePayTos = (facts: any) => [...new Set(((facts.challenge?.accepts ?? []) as any[]).map((a) => a?.payTo).filter((x) => typeof x === "string").map((x: string) => x.toLowerCase()))].sort();
+/** true / false when the resource is listed in a usable snapshot with payTo values and the 402 named payTo values; else null. */
+export function payToMatchesSnapshot(facts: any): boolean | null {
+  const bz = facts.bazaar ?? {}; const live = challengePayTos(facts);
+  if (!bz.available || bz.listed !== true || !Array.isArray(bz.listed_payTo) || !bz.listed_payTo.length || !live.length) return null;
+  const snap = [...new Set(bz.listed_payTo.map((x: unknown) => String(x).toLowerCase()))].sort();
+  return snap.length === live.length && snap.every((x, i) => x === live[i]);
+}
 /** Raw-fact checks. Each states what was observed; there is no overall verdict or score. */
 export function buildChecks(facts: any, code: Awaited<ReturnType<typeof paytoCode>>): Check[] {
   const reach = facts.reachability ?? {}; const ch = facts.challenge ?? {}; const acc: any[] = ch.accepts ?? []; const bz = facts.bazaar ?? {};
@@ -85,6 +93,14 @@ export function buildChecks(facts: any, code: Awaited<ReturnType<typeof paytoCod
     observed: code.map((c) => c.kind === "eip7702_delegated" ? { address: c.address, kind: c.kind, delegate: c.delegate ?? null } : { address: c.address, kind: c.kind }) });
   out.push({ id: "bazaar_snapshot_available", status: bz.available ? "pass" : "fail", observed: bz.available ? (bz.snapshot_date ?? null) : (bz.reason ?? null) });
   out.push({ id: "listed_in_bazaar", status: !bz.available || bz.listed === null || bz.listed === undefined ? "not_applicable" : bz.listed ? "pass" : "fail", observed: bz.available ? (bz.listed ?? null) : null });
+  // A9: latency fact against a fixed 5 s budget (the probe itself times out at 5 s).
+  const lat = typeof reach.latency_ms === "number" ? reach.latency_ms : null;
+  out.push({ id: "responds_within_5000ms", status: reach.reachable ? (lat !== null && lat <= 5000 ? "pass" : "fail") : reach.error_class === "TimeoutError" ? "fail" : "not_applicable",
+    observed: reach.reachable ? lat : (reach.error_class ?? null), expected: "<= 5000 ms" });
+  // A10: payTo in the live 402 vs payTo recorded for this resource in the Bazaar snapshot (fact only).
+  const m = payToMatchesSnapshot(facts);
+  out.push({ id: "pay_to_matches_snapshot", status: m === null ? "not_applicable" : m ? "pass" : "fail",
+    observed: { challenge: challengePayTos(facts), snapshot: Array.isArray(bz.listed_payTo) ? [...new Set(bz.listed_payTo.map((x: unknown) => String(x).toLowerCase()))].sort() : null } });
   return out;
 }
 
@@ -97,7 +113,7 @@ export async function attest(facts: Record<string, any>, opts: { signer: Signer;
     issued_at: isoSec(now), expires_at: isoSec(now + ttl * 1000),
     issuer: { name: ISSUER_NAME, key_id: opts.signer.keyId, issuer_url: opts.issuerUrl ?? null, contact: CONTACT },
     subject: { type: "x402_endpoint", url: facts.target },
-    claims: { facts, payto_code: code, checks, checks_passed: checks.filter((c) => c.status === "pass").map((c) => c.id),
+    claims: { facts, payto_code: code, pay_to_matches_snapshot: payToMatchesSnapshot(facts), checks, checks_passed: checks.filter((c) => c.status === "pass").map((c) => c.id),
       checks_failed: checks.filter((c) => c.status === "fail").map((c) => c.id) },
   };
   const sig = await opts.signer.sign(signingBytes(env));

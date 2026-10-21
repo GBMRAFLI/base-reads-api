@@ -21,7 +21,7 @@ async function ephemeral(): Promise<{ signer: Signer; pubB64: string; issuer: an
 }
 const ACC = { scheme: "exact", network: "eip155:8453", amount: "10000", asset: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913", payTo: "0x" + "22".repeat(20) };
 const facts = (over: Record<string, unknown> = {}) => ({ schema: "prepay-check/v1", target: "https://a.example/x", checked_at: "2026-10-21T05:00:00Z", disclaimer: "d",
-  reachability: { reachable: true, http_status: 402, latency_ms: 5 }, challenge: { valid: true, problems: [], accepts: [ACC] }, bazaar: { available: true, snapshot_date: "2026-10-20", listed: true }, ...over });
+  reachability: { reachable: true, http_status: 402, latency_ms: 5 }, challenge: { valid: true, problems: [], accepts: [ACC] }, bazaar: { available: true, snapshot_date: "2026-10-20", listed: true, listed_payTo: [ACC.payTo] }, ...over });
 const NOW = Date.parse("2026-10-21T05:00:00Z");
 // Legacy {facts, signature} still uses the repo's pre-existing throwaway test key (fixtures/py_signed.json); attestations use ephemeral keys.
 const P = JSON.parse(Deno.readTextFileSync(new URL("./fixtures/py_signed.json", import.meta.url)));
@@ -56,17 +56,17 @@ Deno.test("envelope shape, TTL, signature, tamper and expiry", async () => {
 Deno.test("checks: raw facts, pass/fail/not_applicable, no verdict", async () => {
   const st = (f: any, code: any) => Object.fromEntries(buildChecks(f, code).map((c) => [c.id, c.status]));
   const eoa = [{ address: ACC.payTo, kind: "eoa" as const, code_bytes: 0 }];
-  assertEquals(st(facts(), eoa), { endpoint_reachable: "pass", http_402_returned: "pass", challenge_well_formed: "pass", network_is_base: "pass", asset_is_base_usdc: "pass", payto_is_eoa: "pass", bazaar_snapshot_available: "pass", listed_in_bazaar: "pass" });
+  assertEquals(st(facts(), eoa), { endpoint_reachable: "pass", http_402_returned: "pass", challenge_well_formed: "pass", network_is_base: "pass", asset_is_base_usdc: "pass", payto_is_eoa: "pass", bazaar_snapshot_available: "pass", listed_in_bazaar: "pass", responds_within_5000ms: "pass", pay_to_matches_snapshot: "pass" });
   const bad = facts({ challenge: { valid: true, problems: [], accepts: [{ ...ACC, network: "eip155:1", asset: "0x" + "11".repeat(20) }] } });
   const r = buildChecks(bad, [{ address: ACC.payTo, kind: "contract", code_bytes: 23 }]);
   assertEquals(r.find((c) => c.id === "network_is_base"), { id: "network_is_base", status: "fail", observed: ["eip155:1"], expected: "eip155:8453" });
   assertEquals(r.find((c) => c.id === "asset_is_base_usdc"), { id: "asset_is_base_usdc", status: "fail", observed: ["0x" + "11".repeat(20)], expected: BASE_USDC });
   assertEquals(r.find((c) => c.id === "payto_is_eoa")!.status, "fail");
   const down = facts({ reachability: { reachable: false, error_class: "TimeoutError" }, challenge: { valid: false, problems: ["no_402_challenge"], accepts: [] }, bazaar: { available: false, reason: "no_snapshot" } });
-  assertEquals(st(down, []), { endpoint_reachable: "fail", http_402_returned: "not_applicable", challenge_well_formed: "fail", network_is_base: "not_applicable", asset_is_base_usdc: "not_applicable", payto_is_eoa: "not_applicable", bazaar_snapshot_available: "fail", listed_in_bazaar: "not_applicable" });
+  assertEquals(st(down, []), { endpoint_reachable: "fail", http_402_returned: "not_applicable", challenge_well_formed: "fail", network_is_base: "not_applicable", asset_is_base_usdc: "not_applicable", payto_is_eoa: "not_applicable", bazaar_snapshot_available: "fail", listed_in_bazaar: "not_applicable", responds_within_5000ms: "fail", pay_to_matches_snapshot: "not_applicable" });
   assertEquals(st(facts({ bazaar: { available: true, listed: null } }), [{ address: ACC.payTo, kind: null, code_bytes: null }]).payto_is_eoa, "not_applicable");
   const e: any = await attest(bad, { signer: (await ephemeral()).signer, rpc: async () => "0x6080", now: NOW });
-  assertEquals(e.claims.checks_passed, ["endpoint_reachable", "http_402_returned", "challenge_well_formed", "bazaar_snapshot_available", "listed_in_bazaar"]);
+  assertEquals(e.claims.checks_passed, ["endpoint_reachable", "http_402_returned", "challenge_well_formed", "bazaar_snapshot_available", "listed_in_bazaar", "responds_within_5000ms", "pay_to_matches_snapshot"]);
   assertEquals(e.claims.checks_failed, ["network_is_base", "asset_is_base_usdc", "payto_is_eoa"]);
   for (const c of e.claims.checks) assert(SCHEMA.$defs.check_id.enum.includes(c.id));
 });
