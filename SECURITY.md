@@ -71,7 +71,7 @@ The Python server (`api/`) keeps its replay map, used-tx set and failed-settle c
 
 ## Re-audit hardening (paid Pre-pay Check)
 
-- Before settlement only a per target+payer limit applies (default 3/min, `PER_TARGET_PAYER_PER_MIN`). The global per-target budget (`OUTBOUND_PER_HOST_PER_MIN`) counts settled checks only; a settled check over that budget is queued (202) and served on retry, never refused.
+- Before settlement the service applies a per target+payer limit (default 3/min, `PER_TARGET_PAYER_PER_MIN`) and reserves both an outbound slot and one unit of the target's global budget (`OUTBOUND_PER_HOST_PER_MIN`). If either is unavailable the answer is 503 with `Retry-After` and `charged:false`; when the target is already full this happens before any facilitator call. A failed settlement returns the reserved unit, so failed settles never consume the budget; a successful settlement consumes it and the probe runs immediately. A buyer is never charged into a queue.
 - An outbound slot is reserved before settlement without waiting; if none is free the request gets 503 and is not charged. At most one probe per payer is in flight.
 - Rate-limit tables evict the oldest key when full instead of refusing new clients. IPv6 clients are limited per /64 and per /48 aggregate (`UNPAID_PER_48_PER_MIN`, default 600).
 - A pending (settled, not yet delivered) check stores the paid URL; retries probe that URL only, at most 3 attempts, under the same limits.
@@ -84,7 +84,7 @@ The Python code in `api/` is a reference implementation used for test vectors an
 
 ## Queued and expired paid checks
 
-- A settled check queued on the per-target budget is served on retry without consuming that budget again, and while any queued check for a target is waiting, new settles for that target queue behind it (first in, first out).
+- Pending is used only for a settlement not yet visible on-chain and for a probe that failed after settlement; a retry probes the paid URL and does not take another budget unit.
 - A pending check keeps a fixed 1-hour window from its first park. If it is not served in that window, a sweep (every 5 minutes) removes it atomically and logs a `pending_expired_unserved` incident with the settlement transaction. Refund path: the buyer contacts the issuer contact address with the transaction hash; the incident record is used to confirm the unserved payment and the amount is returned to the payer address.
 - Signed snapshot metadata is cached for 60 seconds.
 - Post-delivery re-check records are keyed by due time; a sweep lists only due records and removes each with a versionstamp-checked atomic delete before reporting.

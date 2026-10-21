@@ -17,6 +17,10 @@ export class WindowLimiter {
     if (e.n >= this.limit) return false;
     e.n++; return true;
   }
+  /** True if allow(key) would succeed now (no count taken). */
+  peek(key: string, now = Date.now()): boolean { const e = this.m.get(key); return !e || now - e.start >= this.windowMs || e.n < this.limit; }
+  /** Return one unit taken by allow(key) in the current window (a reservation that was not used). */
+  release(key: string, now = Date.now()) { const e = this.m.get(key); if (e && now - e.start < this.windowMs && e.n > 0) e.n--; }
   get size() { return this.m.size; }
   private prune(now: number) { for (const [k, e] of this.m) { if (now - e.start >= this.windowMs) this.m.delete(k); else break; } } // ordered by window start
   clear() { this.m.clear(); }
@@ -40,6 +44,8 @@ export class Semaphore {
     });
   }
   private releaser() { let done = false; return () => { if (done) return; done = true; this.active--; this.q.shift()?.(); }; }
+  /** True if tryAcquire() would succeed now. */
+  get free() { return this.active < this.max && this.q.length === 0; }
 }
 export class OutboundBusy extends Error { override name = "OutboundBusy"; }
 /** TTL cache keyed by payer + target; bounded (oldest evicted). */

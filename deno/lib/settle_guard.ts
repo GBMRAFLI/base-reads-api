@@ -82,21 +82,13 @@ export function nonceOf(p: Record<string, any>): string | null {
 }
 export const PENDING_TTL_MS = 3600_000;
 /** Park a settled, undelivered check. `until` is fixed at the first park; re-parking keeps it. The KV record outlives
- * `until` by a day so the expiry sweep can see it; ["pendexp", until, key] indexes it for that sweep, and a check queued
- * on the per-target budget is also listed in ["pq", host, key] so new settles for that target queue behind it (FIFO). */
+ * `until` by a day so the expiry sweep can see it; ["pendexp", until, key] indexes it for that sweep. */
 export async function setPending(key: string, rec: Record<string, any>, now = Date.now()) {
   const until = typeof rec.until === "number" ? rec.until : now + PENDING_TTL_MS; const r: Record<string, any> = { ...rec, until };
   const op = (await kv()).atomic().set(["pending", key], r, { expireIn: until - now + 86400_000 })
     .set(["pendexp", until, key], r.tx ?? null, { expireIn: until - now + 86400_000 });
-  if (r.queued && r.host) op.set(["pq", r.host, until, key], r.tx ?? null, { expireIn: until - now + 86400_000 });
   await op.commit();
 }
-/** True if a settled check for this target is waiting in the budget queue (new settles must queue behind it). */
-export async function queueHas(host: string, now = Date.now()): Promise<boolean> {
-  for await (const _ of (await kv()).list({ start: ["pq", host, now], end: ["pq", host, Number.MAX_SAFE_INTEGER] }, { limit: 1 })) return true;
-  return false;
-}
-export async function queueDel(host: string, until: number, key: string) { await (await kv()).delete(["pq", host, until, key]); }
 /** Pending records whose `until` passed without being served: atomically removed (versionstamp-checked), then reported. */
 export async function sweepExpiredPending(onExpired: (key: string, rec: any) => Promise<void>, now = Date.now(), limit = 100) {
   const k = await kv(); const out: string[] = [];
@@ -104,7 +96,6 @@ export async function sweepExpiredPending(onExpired: (key: string, rec: any) => 
     const key = String(ix.key[2]); const e = await k.get<any>(["pending", key]);
     if (e.versionstamp === null || e.value?.until !== ix.key[1]) { await k.atomic().check(ix).delete(ix.key).commit(); continue; } // served or re-parked
     const op = k.atomic().check(e).check(ix).delete(e.key).delete(ix.key);
-    if (e.value.queued && e.value.host) op.delete(["pq", e.value.host, e.value.until, key]);
     if ((await op.commit()).ok) { await onExpired(key, e.value); out.push(key); }
   }
   return out;

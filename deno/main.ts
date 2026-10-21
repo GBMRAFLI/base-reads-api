@@ -452,6 +452,7 @@ async function paid(path: string, q: Record<string, string>, qs: string, sig: st
     G.probing.add(who); let done = false;
     return () => { if (done) return; done = true; G.probing.delete(who); rel(); };
   };
+  const CAP503 = (): [number, unknown, Record<string, string>] => [503, { error: "target check capacity is full for this minute, retry later", scope: "target", charged: false }, { "Retry-After": "60" }];
   const BUSY503: [number, unknown, Record<string, string>] = [503, { error: "probe capacity busy, retry shortly", charged: false }, { "Retry-After": "5" }];
   /** Pending retry of a settled Pre-pay Check (L1): uses the url that was paid for, the per target+payer limit,
    * the global per-target budget, an outbound slot, and at most 3 attempts. */
@@ -465,23 +466,22 @@ async function paid(path: string, q: Record<string, string>, qs: string, sig: st
     }
     const cached = G.cache.get(cacheKey(u));
     if (!cached) {
+      // The per-target budget unit was reserved before settlement and consumed by it: a retry does not take another.
       if (!G.hostPayer.allow(hostOf(u) + "|" + who)) { await SG.setPending(key, pend); return [429, { error: "too many attempts for this target, retry later", scope: "target_payer", transaction: pend.tx }, { "Retry-After": "60" }]; }
-      // M1: a check already queued on the target budget skips the budget (it was settled first; served ahead of new settles)
-      if (!pend.queued && !G.perHost.allow(hostOf(u))) { await SG.setPending(key, pend); return [202, { status: "settled_queued_target_budget", transaction: pend.tx, retry: "repeat the same request after 60 s" }, payResp(N, true, pend.tx, who)]; }
     }
     const slot = cached ? () => {} : reserve();
     if (!slot) { await SG.setPending(key, pend); return [503, { error: "probe capacity busy, retry shortly", transaction: pend.tx }, { "Retry-After": "5" }]; }
     let code = 0, out: unknown = null;
     try { [code, out] = await runPreflight(u); } catch { code = 0; } finally { slot(); }
     if (code !== 200) { await SG.setPending(key, { ...pend, tries: tries + 1 }); return [502, { error: "upstream error, retry the same request", transaction: pend.tx, attempts_left: MAX_TRIES - tries - 1 }, {}]; }
-    if (pend.queued && pend.host) await SG.queueDel(pend.host, pend.until, key);
     log(pend.tx, oc, true, pend.times); return [200, out, payResp(N, true, pend.tx, who)];
   };
   const busy: [number, unknown, Record<string, string>] = [429, { error: "too many concurrent payments, retry shortly", scope: "concurrency" }, {}];
   const release = await SG.acquireSlots({ ip: ids.ip }); // per-IP slot now; per-payer slot only after verify (L1)
   if (!release) return busy;
-  const held: { payer: (() => Promise<void>) | null; slot: (() => void) | null } = { payer: null, slot: null };
-  try { return await paidLocked(); } finally { held.slot?.(); if (held.payer) await held.payer(); await release(); }
+  // budget: a per-target budget unit reserved before settlement; returned unless a settlement consumed it (H1).
+  const held: { payer: (() => Promise<void>) | null; slot: (() => void) | null; budget: string | null } = { payer: null, slot: null, budget: null };
+  try { return await paidLocked(); } finally { held.slot?.(); if (held.budget) G.perHost.release(held.budget); if (held.payer) await held.payer(); await release(); }
   async function paidLocked(): Promise<[number, unknown, Record<string, string>]> {
   const lim = await FAILS.blocked(ids); // checked while holding a slot: bursts cannot overshoot by more than the slot count
   if (lim) return [429, { error: "too many failed payments, retry later", scope: lim }, {}];
@@ -505,6 +505,11 @@ async function paid(path: string, q: Record<string, string>, qs: string, sig: st
   // so a rolled-back or restored KV can never let a spent authorization through again.
   if (await SG.authUsed(key)) return [402, { error: "payment authorization already used", hint: REUSE_HINT }, noPay("replay", N)];
   const body = { x402Version: 2, paymentPayload: withDiscovery(payload!, path, host, env), paymentRequirements: r };
+  if (settleFirst) {
+    // Rule: never charge without a result. Target capacity full -> 503 before any facilitator call (not charged).
+    const u0 = unquote(q.url ?? ""); let h0 = ""; try { h0 = new URL(u0).hostname.toLowerCase(); } catch { /* checked below */ }
+    if (h0 && !G.cache.get(cacheKey(u0)) && (!G.perHost.peek(hostOf(u0)) || !OUTBOUND.free)) { await SG.unclaim(key); return CAP503(); }
+  }
   const v = await fac("/verify", body); const tVer = iso(); logBazaar("verify", path, v);
   if (!v.isValid) { const why = facErr(v.invalidReason); await FAILS.fail({ ip: ids.ip }, "verify"); return [402, { error: why }, noPay(why, N)]; }
   held.payer = await SG.acquireSlots({ payer: who }); // L1: a forged `from` never reaches this line
@@ -522,9 +527,11 @@ async function paid(path: string, q: Record<string, string>, qs: string, sig: st
       if (!G.hostPayer.allow(hostOf(u) + "|" + who)) {
         await SG.unclaim(key); return [429, { error: "too many checks of this target by this payer in the last minute, retry later", scope: "target_payer", charged: false }, { "Retry-After": "60" }];
       }
-      // M1: reserve the outbound slot now; if none is free, refuse before settlement (not charged).
+      // Reserve the outbound slot AND one unit of the target's global budget before settlement; either missing -> 503, not charged.
       held.slot = reserve();
       if (!held.slot) { await SG.unclaim(key); return BUSY503; }
+      if (!G.perHost.allow(hostOf(u))) { held.slot(); held.slot = null; await SG.unclaim(key); return CAP503(); }
+      held.budget = hostOf(u);
     }
   } else {
     try { [code, out] = await run(); } catch (e) {
@@ -544,13 +551,7 @@ async function paid(path: string, q: Record<string, string>, qs: string, sig: st
   const deliver = async (tx: string, oc: any, times: [string, string, string]): Promise<[number, unknown, Record<string, string>]> => {
     if (settleFirst) {
       const u = unquote(q.url ?? "");
-      // H1: the global per-target budget is counted only after a successful settlement; over budget -> queue, never refuse.
-      // M1: FIFO: while settled checks for this target wait in the queue, a new settle queues behind them.
-      if (!G.cache.get(cacheKey(u)) && (await SG.queueHas(hostOf(u)) || !G.perHost.allow(hostOf(u)))) {
-        held.slot?.(); held.slot = null;
-        await SG.setPending(key, { path, tx, times, url: u, tries: 0, queued: true, host: hostOf(u) });
-        return [202, { status: "settled_queued_target_budget", transaction: tx, retry: "repeat the same request with the same payment header after 60 s" }, payResp(N, true, tx, who)];
-      }
+      held.budget = null; // settled: the reserved budget unit is consumed; the probe runs now on the reserved slot
       let ok = false;
       try { [code, out] = await runPreflight(u); ok = code === 200; } catch { ok = false; } finally { held.slot?.(); held.slot = null; }
       if (!ok) {
@@ -574,6 +575,7 @@ async function paid(path: string, q: Record<string, string>, qs: string, sig: st
     const why = facErr(st.errorReason); await FAILS.fail(ids, "settle");
     return [402, { error: why, hint: REUSE_HINT }, payResp(N, false, tx, who, why)]; // the authorization is spent
   }
+  held.budget = null; // the facilitator settled: the budget unit is consumed even if what follows fails
   if (!tx) { mismatch("settle_success_without_valid_tx_hash"); return [502, { error: "settlement response invalid, contact support with your payment" }, {}]; }
   if (!await SG.claimTx(tx)) { mismatch("settlement_tx_reused"); return [409, { error: "settlement transaction already used" }, noPay("replay", N)]; }
   const oc: any = await check(tx, r, who);

@@ -101,17 +101,15 @@ Deno.test("A7 pay once then 100 requests for the same target -> one probe; cache
   await new Promise((r) => setTimeout(r, 1100));
   assertEquals((await t.call(pay()))[0], 200); assertEquals(t.n.fetch, 2); // after TTL: probed again
 });
-Deno.test("H1 global per-target budget counts only settled checks; over budget after settlement -> queued (202), not refused", async () => {
+Deno.test("H1 global per-target budget: failed settles never consume it; full target -> 503 before settlement (not charged)", async () => {
   await fresh({ OUTBOUND_PER_HOST_PER_MIN: "3", PER_TARGET_PAYER_PER_MIN: "100" });
   const bad = rig({ settle: () => ({ success: false, errorReason: "unexpected_settle_error" }) });
-  for (let i = 0; i < 2; i++) assertEquals((await bad.call(pay(), "https://t.example/f" + i))[0], 402); // failed settles: no budget used
+  for (let i = 0; i < 2; i++) assertEquals((await bad.call(pay(), "https://t.example/f" + i))[0], 402); // reservation released each time
   const t = rig();
   for (let i = 0; i < 3; i++) assertEquals((await t.call(pay(), "https://t.example/p" + i))[0], 200);
-  const sig = pay(); const [c, b] = await t.call(sig, "https://t.example/p9");
-  assertEquals([c, b.status], [202, "settled_queued_target_budget"]); assertEquals([t.n.settle, t.n.fetch], [4, 3]);
+  const [c, b] = await t.call(pay(), "https://t.example/p9"); assertEquals([c, b.charged, b.scope], [503, false, "target"]);
+  assertEquals([t.n.verify, t.n.settle, t.n.fetch], [3, 3, 3]);
   assertEquals((await t.call(pay(), "https://other.example/p"))[0], 200); // other targets unaffected
-  abuse(env).perHost.allow("reset", 0); await resetGuards(); // budget window passes
-  const [c2, b2] = await t.call(sig, "https://t.example/p9"); assertEquals(c2, 200); assert(b2.attestation); assertEquals(t.n.settle, 5); // retry: no new settlement
 });
 Deno.test("H1 per target+payer limit before settlement: 3/min, then 429 not charged; other payers' budget unaffected", async () => {
   await fresh(); const t = rig();
@@ -255,27 +253,44 @@ Deno.test("A12 an attestation from yesterday -> rejected (expires_at passed) by 
   await Deno.remove(d, { recursive: true });
 });
 
-Deno.test("M1 (re-audit 2) attacker keeps the target budget used up: the honest queued buyer is still served, FIFO ahead of new settles", async () => {
+Deno.test("M1 (re-audit 3) target capacity full -> 503 + Retry-After, no facilitator call, not charged", async () => {
+  await fresh({ OUTBOUND_PER_HOST_PER_MIN: "1", PER_TARGET_PAYER_PER_MIN: "100" }); const t = rig();
+  assertEquals((await t.call(pay(), "https://full.example/a"))[0], 200);
+  const n0 = { ...t.n };
+  const res = await handler(new Request("http://h" + PATH + "?url=" + encodeURIComponent("https://full.example/b"), { headers: { "PAYMENT-SIGNATURE": pay() } }),
+    { env, fac: async () => { throw new Error("facilitator must not be called"); }, rpc: async () => "0x", resolver: async () => ["93.184.216.34"], fetcher: (async () => { throw new Error("no probe"); }) as any, check: async () => ({ settled: true }), background: () => {}, ip: "198.51.100.7" });
+  const b = await res.json(); assertEquals([res.status, b.charged, res.headers.get("Retry-After")], [503, false, "60"]);
+  assertEquals(t.n, n0);
+});
+Deno.test("M1 (re-audit 3) attacker keeps the target budget used up: the honest buyer is never charged without a result", async () => {
   await fresh({ OUTBOUND_PER_HOST_PER_MIN: "3", PER_TARGET_PAYER_PER_MIN: "1000" }); const t = rig();
-  for (let i = 0; i < 3; i++) assertEquals((await t.call(pay(), "https://v.example/a" + i))[0], 200); // attacker uses the budget
-  const honest = pay(); const [c0, b0] = await t.call(honest, "https://v.example/honest");
-  assertEquals([c0, b0.status], [202, "settled_queued_target_budget"]);
-  for (let m = 0; m < 3; m++) { // each new minute the attacker pays again first
-    await resetGuards();
-    const [ca, ba] = await t.call(pay(), "https://v.example/z" + m); assertEquals([ca, ba.status], [202, "settled_queued_target_budget"]); // queues behind
+  for (let m = 0; m < 3; m++) {
+    if (m) await resetGuards(); // each new minute the attacker pays first and uses the whole budget
+    for (let i = 0; i < 3; i++) assertEquals((await t.call(pay(), "https://v.example/a" + m + i))[0], 200);
+    const s0 = t.n.settle; const honest = pay();
+    const [c, b] = await t.call(honest, "https://v.example/honest");
+    assertEquals([c, b.charged], [503, false]); assertEquals(t.n.settle, s0); // refused BEFORE settlement: nothing paid
+    const [c2] = await t.call(honest, "https://v.example/honest"); assertEquals(c2, 503); // same authorization reusable, still unspent
   }
-  const [c1, b1] = await t.call(honest, "https://v.example/honest"); assertEquals(c1, 200); assert(b1.attestation); // served, budget still exhausted
-  assertEquals(await SG.queueHas("v.example"), true); // attacker's later checks still queued, in order
+  await resetGuards(); const honest = pay(); const [c3, b3] = await t.call(honest, "https://v.example/honest"); // capacity free: paid AND served
+  assertEquals(c3, 200); assert(b3.attestation);
+  for await (const _ of (await kv()).list({ prefix: ["pending"] })) throw new Error("no paid check may be left pending");
+});
+Deno.test("M1 (re-audit 3) a failed settle releases the reservation (budget and slot)", async () => {
+  await fresh({ OUTBOUND_PER_HOST_PER_MIN: "1", PER_TARGET_PAYER_PER_MIN: "100" });
+  const bad = rig({ settle: () => ({ success: false, errorReason: "unexpected_settle_error" }) });
+  assertEquals((await bad.call(pay(), "https://r1.example/a"))[0], 402); assertEquals(OUTBOUND.active, 0);
+  assert(abuse(env).perHost.peek("r1.example"));
+  const t = rig(); assertEquals((await t.call(pay(), "https://r1.example/b"))[0], 200); assert(!abuse(env).perHost.peek("r1.example"));
 });
 Deno.test("M1 (re-audit 2) a pending check that expires unserved -> atomically removed and logged as an incident", async () => {
   await fresh(); const now = Date.now();
-  await SG.setPending("k1", { path: PATH, tx: "0xabc", times: {}, url: "https://e.example/", tries: 0, queued: true, host: "e.example" }, now);
+  await SG.setPending("k1", { path: PATH, tx: "0xabc", times: {}, url: "https://e.example/", tries: 0 }, now);
   assertEquals((await pendingSweep(now + 60_000)).length, 0); // not yet expired
   assertEquals(await SG.takePending("k1", now + SG.PENDING_TTL_MS + 1), null); // expired: not served
   assertEquals(await pendingSweep(now + SG.PENDING_TTL_MS + 1), ["k1"]);
   assertEquals((await pendingSweep(now + SG.PENDING_TTL_MS + 2)).length, 0); // reported once
   const inc = (await rows("observations.jsonl")).filter((r: any) => r.inputHash === "incident"); assertEquals(inc.at(-1)?.note, "pending_expired_unserved");
-  assertEquals(await SG.queueHas("e.example", now), false);
 });
 Deno.test("L3 (re-audit 2) signed snapshot meta is cached for 60 s", async () => {
   await fresh(); const now = Date.now();
