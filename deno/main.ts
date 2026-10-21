@@ -149,7 +149,7 @@ export const VERIFY_STEPS = [
   "Prepend the UTF-8 bytes of signing_prefix (attestation: \"prepay-check-attestation/v1\" + LF, hex 7072657061792d636865636b2d6174746573746174696f6e2f76310a; snapshot meta: \"bazaar-snapshot-meta/v1\" + LF). Message = signing_prefix || JCS(payload). Without the prefix the signature does not verify.",
   "Find the key in keys[] whose key_id equals signature.key_id; key_id = first 16 lowercase hex chars of sha256(raw 32-byte public key); public_key_b64 is standard base64 of that raw key.",
   "Verify signature.value_b64 (standard base64, 64 bytes) over the message with Ed25519 (RFC 8032).",
-  "Reject if now > expires_at, if issued_at is more than 60 s in the future, or if the key was retired before issued_at.",
+  "Reject unless spec == \"prepay-check-attestation\", version == \"1.0\" and canonicalization == \"JCS\"; reject unless issued_at and expires_at are valid UTC timestamps with 0 <= expires_at - issued_at <= 86400 s; reject if now > expires_at, if issued_at is more than 60 s in the future, or if the key was retired before issued_at. Recommended: pin the expected key_id (or fingerprint) out of band instead of trusting any listed key.",
 ];
 /** Attestation issuer document: identity, contact and every signing key (active + retired) so old attestations stay verifiable. */
 export async function issuerDoc(env: Deps["env"]) {

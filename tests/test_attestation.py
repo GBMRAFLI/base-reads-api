@@ -139,8 +139,6 @@ class TAttack(unittest.TestCase):
         self.assertFalse(VA.verify_snapshot_binding(e, {"snapshots": []})[0])
         y = AT.attest(facts(), s, now=NOW - 86400)
         self.assertEqual(VA.verify(y, iss, now=NOW)[1], "expired at 2026-10-20T05:15:00Z"); self.assertEqual(AT.verify(y, pub, now=NOW), (False, "expired"))
-if __name__ == "__main__": unittest.main()
-
 class TIssuerDocDrift(unittest.TestCase):
     """Verify a real attestation and real snapshot meta using ONLY the rules read from the served issuer.json."""
     def _verify(self, iss, domain, payload, sig, use_prefix=True):
@@ -167,3 +165,5 @@ class TIssuerDocDrift(unittest.TestCase):
         m = json.loads(json.dumps(IX.snapshot_meta()))
         self.assertTrue(self._verify(iss, "snapshot_meta", m["metadata"], m["signature"]))
         self.assertFalse(self._verify(iss, "snapshot_meta", m["metadata"], m["signature"], use_prefix=False))
+
+if __name__ == "__main__": unittest.main()
