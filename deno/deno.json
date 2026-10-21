@@ -1,5 +1,11 @@
 {
-  "imports": { "@noble/hashes/": "npm:/@noble/hashes@1.4.0/" },
+  "imports": {
+    "@noble/hashes/": "npm:/@noble/hashes@1.4.0/",
+    "canonicalize": "npm:canonicalize@2.1.0"
+  },
   "unstable": ["kv", "cron"],
-  "tasks": { "start": "deno run -A main.ts", "test": "deno test -A tests/" }
+  "tasks": {
+    "start": "deno run -A main.ts",
+    "test": "deno test -A tests/"
+  }
 }

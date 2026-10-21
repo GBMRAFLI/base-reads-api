@@ -1,5 +1,6 @@
 // Port of api/preflight.py (facts, validation, Bazaar facts). Same facts schema and signatures.
-import { sign } from "./sign.ts";
+import { envSigner, sign } from "./sign.ts";
+import { attest, type Rpc, type Signer } from "./attestation.ts";
 import { kv } from "./store.ts";
 import { isoSec } from "./util.ts";
 export const SCHEMA = "prepay-check/v1", UA = "base-reads-prepay-check/1.0";
@@ -384,7 +385,8 @@ export async function bazaarFacts(url: string, paytoList: string[], maxTrend = 1
   return out;
 }
 
-export async function preflight(url: string, opts: { resolver?: Resolver; fetcher?: Fetcher; connect?: Connector; now?: number; env?: (k: string) => string | undefined } = {}): Promise<[number, unknown]> {
+export async function preflight(url: string, opts: { resolver?: Resolver; fetcher?: Fetcher; connect?: Connector; now?: number; env?: (k: string) => string | undefined;
+  rpc?: Rpc; signer?: Signer; issuerUrl?: string | null; ttlS?: number } = {}): Promise<[number, unknown]> {
   const { u, err, ips } = await checkUrl(url, opts.resolver);
   if (!u) return [400, { error: err }];
   const base = { schema: SCHEMA, target: url, checked_at: isSoc(opts.now), disclaimer: "Deterministic observations only. Not advice to pay, buy or sell." };
@@ -394,6 +396,9 @@ export async function preflight(url: string, opts: { resolver?: Resolver; fetche
   const [valid, problems, acc] = validateChallenge(ch);
   const facts = { ...base, reachability: reach, challenge: { valid, problems, accepts: acc },
     bazaar: await bazaarFacts(url, acc.map((a) => a.payTo as string).filter(Boolean)) };
-  return [200, await sign(facts, opts.env)];
+  // Legacy {facts, signature} kept for existing verifiers; "attestation" is the v1.0 envelope (JCS-signed).
+  const legacy = await sign(facts, opts.env);
+  const attestation = await attest(facts, { signer: opts.signer ?? await envSigner(opts.env), rpc: opts.rpc, now: opts.now, ttlS: opts.ttlS, issuerUrl: opts.issuerUrl });
+  return [200, { ...legacy, attestation }];
 }
 function isSoc(now?: number) { return isoSec(now ?? Date.now()); }

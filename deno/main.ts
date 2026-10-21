@@ -9,7 +9,9 @@ import { CDP_HOST, enabled as cdpEnabled, headers as cdpHeaders } from "./lib/cd
 import * as SG from "./lib/settle_guard.ts";
 import * as LG from "./lib/ledger.ts";
 import { SCHEMA, snapshotDates, loadIndex } from "./lib/preflight.ts";
-import { isoOrNull, keyHistory, loadKey, publicKeyInfo, sign, SigningUnavailable } from "./lib/sign.ts";
+import { isoOrNull, keyHistory, loadKey, publicKeyInfo, sign, signJcs, SigningUnavailable } from "./lib/sign.ts";
+import { CANON, CONTACT, ISSUER_NAME, SPEC, VERSION } from "./lib/attestation.ts";
+import ATT_SCHEMA from "../spec/prepay-check-attestation-v1.schema.json" with { type: "json" };
 import { scheduledSnapshot, latestSnapStatus, loadFail, mapErrorCode } from "./lib/snapshot.ts";
 import { EXPORT_FILES, kv, rows } from "./lib/store.ts";
 import { recordObservation, recordSale, verifyOnchain } from "./lib/stream.ts";
@@ -64,7 +66,7 @@ export const VERIFY_402INDEX_DEFAULT = "be918d4df21371f971ccaa589e4ed1adbe9a077a
 /** 402index ownership token: INDEX_VERIFY_TOKEN if set, else the built-in constant. Served with no trailing newline. */
 export const verifyToken = (env: Deps["env"]) => env("INDEX_VERIFY_TOKEN") || VERIFY_402INDEX_DEFAULT;
 export const FAVICON_B64 = "AAABAAEAEBAAAAEAIABoBAAAFgAAACgAAAAQAAAAIAAAAAEAIAAAAAAAQAQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA0lIA/9JSAP8AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAANJSAP/SUgD/0lIA/9JSAP/SUgD/0lIA/9JSAP/SUgD/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAANJSAP/SUgD/0lIA/9JSAP/SUgD/0lIA/9JSAP/SUgD/0lIA/9JSAP8AAAAAAAAAAAAAAAAAAAAAAAAAANJSAP/SUgD/0lIA/9JSAP/SUgD/0lIA/9JSAP/SUgD/0lIA/9JSAP/SUgD/0lIA/wAAAAAAAAAAAAAAANJSAP/SUgD/0lIA/9JSAP/SUgD/0lIA/9JSAP/SUgD/0lIA/9JSAP/SUgD/0lIA/9JSAP/SUgD/AAAAAAAAAADSUgD/0lIA/9JSAP/SUgD/0lIA///////////////////////SUgD/0lIA/9JSAP/SUgD/0lIA/wAAAAAAAAAA0lIA/9JSAP/SUgD/0lIA/9JSAP//////0lIA/9JSAP/SUgD//////9JSAP/SUgD/0lIA/9JSAP8AAAAA0lIA/9JSAP/SUgD/0lIA/9JSAP/SUgD//////9JSAP/SUgD/0lIA///////SUgD/0lIA/9JSAP/SUgD/0lIA/9JSAP/SUgD/0lIA/9JSAP/SUgD/0lIA///////////////////////SUgD/0lIA/9JSAP/SUgD/0lIA/9JSAP8AAAAA0lIA/9JSAP/SUgD/0lIA/9JSAP//////0lIA/9JSAP/SUgD//////9JSAP/SUgD/0lIA/9JSAP8AAAAAAAAAANJSAP/SUgD/0lIA/9JSAP/SUgD//////9JSAP/SUgD/0lIA///////SUgD/0lIA/9JSAP/SUgD/AAAAAAAAAADSUgD/0lIA/9JSAP/SUgD/0lIA///////////////////////SUgD/0lIA/9JSAP/SUgD/0lIA/wAAAAAAAAAAAAAAANJSAP/SUgD/0lIA/9JSAP/SUgD/0lIA/9JSAP/SUgD/0lIA/9JSAP/SUgD/0lIA/wAAAAAAAAAAAAAAAAAAAAAAAAAA0lIA/9JSAP/SUgD/0lIA/9JSAP/SUgD/0lIA/9JSAP/SUgD/0lIA/wAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAADSUgD/0lIA/9JSAP/SUgD/0lIA/9JSAP/SUgD/0lIA/wAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA0lIA/9JSAP8AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=="; // 16x16 ICO from scripts/gen_favicon.py
-export const FREE_PATHS = new Set(["/", "/index.json", "/favicon.ico", "/llms.txt", "/openapi.json", "/.well-known/402index-verify.txt", "/.well-known/x402-preflight", "/.well-known/x402-preflight-key-history.json", "/.well-known/bazaar-snapshot.json", "/x402/preflight/pubkey", "/bazaar/snapshots"]);
+export const FREE_PATHS = new Set(["/", "/index.json", "/favicon.ico", "/llms.txt", "/openapi.json", "/.well-known/402index-verify.txt", "/.well-known/x402-preflight", "/.well-known/x402-preflight-key-history.json", "/.well-known/issuer.json", "/.well-known/prepay-check-attestation-v1.schema.json", "/.well-known/bazaar-snapshot.json", "/x402/preflight/pubkey", "/bazaar/snapshots"]);
 /** OpenAPI 3.1 for the paid routes, generated from ROUTES + discovery.json so prices cannot drift from the 402 challenge. */
 export function openapi(env: Deps["env"]) {
   const c = cfg(env); const D = DISCOVERY as Record<string, any>; const paths: Record<string, unknown> = {};
@@ -97,26 +99,41 @@ export function llmsTxt(env: Deps["env"]) {
     "- /base/network and /base/usdc-balance responses list related_routes (path and price) for follow-up reads",
     "", "## Discovery (free)", "", "- / : service index with routes and prices", "- /openapi.json : OpenAPI 3.1 description of the paid routes with prices", "- /bazaar/snapshots : daily Bazaar snapshot summary",
     "- /.well-known/bazaar-snapshot.json : signed snapshot series metadata", "- /.well-known/x402-preflight : Pre-pay Check schema and signing key",
-    "- /.well-known/x402-preflight-key-history.json : signing key history", "- /x402/preflight/pubkey : Ed25519 public key for verifying signed facts",
+    "- /.well-known/x402-preflight-key-history.json : signing key history",
+    "- /.well-known/issuer.json : attestation issuer, contact and signing keys (active and retired)", "- /.well-known/prepay-check-attestation-v1.schema.json : JSON Schema of the signed attestation (CC0)", "- /x402/preflight/pubkey : Ed25519 public key for verifying signed facts",
     "- Each 402 challenge carries extensions.bazaar (input schema and output example) for x402 Bazaar listing", "", "Facts only, no investment advice.", ""];
   return L.join("\n");
 }
 export function root(env: Deps["env"]) {
   const c = cfg(env);
   return { service: "Base Reads", network: c.NETWORK, protocol: "x402 v2", facilitator: facilitatorInfo(env),
-    free: ["/llms.txt", "/openapi.json", "/.well-known/402index-verify.txt", "/.well-known/x402-preflight", "/.well-known/x402-preflight-key-history.json", "/.well-known/bazaar-snapshot.json", "/x402/preflight/pubkey", "/bazaar/snapshots"],
+    free: ["/llms.txt", "/openapi.json", "/.well-known/402index-verify.txt", "/.well-known/x402-preflight", "/.well-known/x402-preflight-key-history.json", "/.well-known/issuer.json", "/.well-known/prepay-check-attestation-v1.schema.json", "/.well-known/bazaar-snapshot.json", "/x402/preflight/pubkey", "/bazaar/snapshots"],
     routes: Object.fromEntries(Object.entries(ROUTES).map(([k, v]) => [k, { price_usdc: v[0] / 1e6, description: v[1] }])) };
 }
 export async function wellKnown(env: Deps["env"]) {
   const pub = await publicKeyInfo(env);
   return { service: "Base Reads", schema: SCHEMA, alg: "Ed25519", key_id: pub.key_id, public_key_b64: pub.public_key_b64,
     fingerprint: pub.fingerprint, fingerprint_short: pub.fingerprint_short, created_at: pub.created_at,
-    verify: ["Take the paid /x402/preflight response body: {facts, signature}.",
+    attestation: { spec: SPEC, version: VERSION, canonicalization: CANON, issuer: "/.well-known/issuer.json", schema: "/.well-known/prepay-check-attestation-v1.schema.json" },
+    verify: ["Take the paid /x402/preflight response body: {facts, signature} (legacy form; the v1.0 envelope is in \"attestation\", see /.well-known/issuer.json).",
       "Serialize facts as canonical JSON: keys sorted, separators (',', ':'), ASCII-only escapes (Python json.dumps(facts, sort_keys=True, separators=(',', ':'))).",
       "Verify signature.value_b64 (base64) over those bytes with Ed25519 (RFC 8032) and public_key_b64 (32-byte raw key).",
       "Check signature.key_id matches key_id here; key_id = first 16 hex chars of sha256(raw public key)."],
     facilitator: facilitatorInfo(env), repo: env("REPO_URL") ?? "https://github.com/GBMRAFLI/base-reads-api",
     routes: { pubkey: "/x402/preflight/pubkey", key_history: "/.well-known/x402-preflight-key-history.json", paid_check: "/x402/preflight", snapshots: "/bazaar/snapshots", snapshot_meta: "/.well-known/bazaar-snapshot.json" } };
+}
+/** Attestation issuer document: identity, contact and every signing key (active + retired) so old attestations stay verifiable. */
+export async function issuerDoc(env: Deps["env"]) {
+  const h = await keyHistory(env); const base = cfg(env).PUBLIC.replace(/\/+$/, "");
+  return { spec: SPEC, version: VERSION, issuer: { name: ISSUER_NAME, contact: CONTACT, issuer_url: base ? base + "/.well-known/issuer.json" : null },
+    canonicalization: CANON, signature_alg: "Ed25519", keys: [h.current, ...h.retired],
+    schema: "/.well-known/prepay-check-attestation-v1.schema.json",
+    key_policy: "Signing keys are generated and held only in the production server environment and are never published or exported. Rotation adds the new key as active and keeps old keys listed as retired with retired_at.",
+    verify: ["Remove the \"signature\" member from the attestation object.",
+      "Serialize the rest with RFC 8785 JSON Canonicalization Scheme (JCS) as UTF-8 bytes.",
+      "Find the key in keys[] whose key_id equals signature.key_id; key_id = first 16 hex chars of sha256(raw 32-byte public key).",
+      "Verify signature.value_b64 (base64) over those bytes with Ed25519 (RFC 8032).",
+      "Optionally reject if now > expires_at, or if the key was retired before issued_at."] };
 }
 /** Free, signed metadata about the daily Bazaar snapshot series (no snapshot contents). */
 export async function snapshotMeta(env: Deps["env"] = (k) => Deno.env.get(k)) {
@@ -142,8 +159,7 @@ export async function snapshotMeta(env: Deps["env"] = (k) => Deno.env.get(k)) {
   const meta = { version: 1, started_at: dates[0] ?? null, last_updated: last,
     last_attempt_at, total_snapshots: dates.length, covered_listings: covered,
     last_status: status, last_failed_pages: failed_pages, last_error };
-  const e = await sign(meta, env);
-  return { metadata: e.facts, signature: e.signature, pubkey_url: "/x402/preflight/pubkey" };
+  return { metadata: meta, signature: await signJcs(meta, env), pubkey_url: "/x402/preflight/pubkey" };
 }
 const SNAP_SUM = new Map<string, Record<string, unknown>>();
 export async function snapshotSummary(limit = 30) {
@@ -274,6 +290,10 @@ async function handleGet(req: Request, d: Deps): Promise<Response> {
     try { return send(200, await wellKnown(env)); } catch (e) { if (e instanceof SigningUnavailable) return send(503, { error: "signing key unavailable" }); throw e; }
   }
   if (path === "/bazaar/snapshots") return send(200, await snapshotSummary());
+  if (path === "/.well-known/prepay-check-attestation-v1.schema.json") return send(200, ATT_SCHEMA);
+  if (path === "/.well-known/issuer.json") {
+    try { return send(200, await issuerDoc(env)); } catch (e) { if (e instanceof SigningUnavailable) return send(503, { error: "signing key unavailable" }); throw e; }
+  }
   if (path === "/.well-known/bazaar-snapshot.json" || path === "/.well-known/x402-preflight-key-history.json") {
     try { return send(200, path.includes("bazaar") ? await snapshotMeta(env) : await keyHistory(env)); }
     catch (e) { if (e instanceof SigningUnavailable) return send(503, { error: "signing key unavailable" }); throw e; }
@@ -359,7 +379,9 @@ async function paid(path: string, q: Record<string, string>, qs: string, sig: st
   const run = async (): Promise<[number, unknown]> => {
     if (path === "/x402/preflight") {
       const u = unquote(q.url ?? "");
-      return u ? await preflight(u, { resolver: d.resolver, fetcher: d.fetcher, env }) : [400, { error: "give ?url=https://..." }];
+      const ttl = Number(env("ATTESTATION_TTL_S") ?? "");
+      return u ? await preflight(u, { resolver: d.resolver, fetcher: d.fetcher, env, rpc, ttlS: Number.isFinite(ttl) && ttl > 0 ? ttl : undefined,
+        issuerUrl: c.PUBLIC ? c.PUBLIC.replace(/\/+$/, "") + "/.well-known/issuer.json" : null }) : [400, { error: "give ?url=https://..." }];
     }
     return await new Chain(rpc, c.USDC).handle(path, q);
   };

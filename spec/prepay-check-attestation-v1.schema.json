@@ -1,0 +1,62 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "prepay-check-attestation-v1.schema.json",
+  "title": "Pre-pay Check Attestation v1.0",
+  "description": "Ed25519-signed envelope of deterministic facts about an x402 endpoint, observed before a buyer pays it. Facts only: no score, no verdict, no advice.",
+  "$comment": "License: CC0 1.0 Universal (public domain dedication), https://creativecommons.org/publicdomain/zero/1.0/",
+  "type": "object",
+  "required": ["spec", "version", "canonicalization", "attestation_id", "issued_at", "expires_at", "issuer", "subject", "claims", "signature"],
+  "additionalProperties": false,
+  "properties": {
+    "spec": { "const": "prepay-check-attestation" },
+    "version": { "const": "1.0" },
+    "canonicalization": { "const": "JCS", "description": "Signed bytes are RFC 8785 canonical JSON of this object without the signature member." },
+    "attestation_id": { "type": "string", "format": "uuid" },
+    "issued_at": { "$ref": "#/$defs/ts" },
+    "expires_at": { "$ref": "#/$defs/ts" },
+    "issuer": {
+      "type": "object", "required": ["name", "key_id", "issuer_url", "contact"], "additionalProperties": false,
+      "properties": {
+        "name": { "type": "string" },
+        "key_id": { "$ref": "#/$defs/key_id" },
+        "issuer_url": { "type": ["string", "null"], "description": "URL of the issuer document listing active and retired keys." },
+        "contact": { "type": "string" }
+      }
+    },
+    "subject": {
+      "type": "object", "required": ["type", "url"], "additionalProperties": false,
+      "properties": { "type": { "const": "x402_endpoint" }, "url": { "type": "string" } }
+    },
+    "claims": {
+      "type": "object", "required": ["facts", "payto_code", "checks", "checks_passed", "checks_failed"], "additionalProperties": false,
+      "properties": {
+        "facts": { "type": "object", "description": "The Pre-pay Check facts object (schema prepay-check/v1): target, checked_at, reachability, challenge, bazaar, disclaimer." },
+        "payto_code": {
+          "type": "array", "maxItems": 4,
+          "items": { "type": "object", "required": ["address", "kind", "code_bytes"], "additionalProperties": false,
+            "properties": { "address": { "type": "string", "pattern": "^0x[0-9a-f]{40}$" }, "kind": { "enum": ["eoa", "contract", null] }, "code_bytes": { "type": ["integer", "null"], "minimum": 0 } } }
+        },
+        "checks": {
+          "type": "array",
+          "items": { "type": "object", "required": ["id", "status", "observed"], "additionalProperties": false,
+            "properties": {
+              "id": { "enum": ["endpoint_reachable", "http_402_returned", "challenge_well_formed", "network_is_base", "asset_is_base_usdc", "payto_is_eoa", "bazaar_snapshot_available", "listed_in_bazaar"] },
+              "status": { "enum": ["pass", "fail", "not_applicable"] },
+              "observed": {},
+              "expected": {}
+            } }
+        },
+        "checks_passed": { "type": "array", "items": { "type": "string" } },
+        "checks_failed": { "type": "array", "items": { "type": "string" } }
+      }
+    },
+    "signature": {
+      "type": "object", "required": ["alg", "key_id", "value_b64"], "additionalProperties": false,
+      "properties": { "alg": { "const": "Ed25519" }, "key_id": { "$ref": "#/$defs/key_id" }, "value_b64": { "type": "string", "pattern": "^[A-Za-z0-9+/]{86}==$" } }
+    }
+  },
+  "$defs": {
+    "ts": { "type": "string", "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}Z$" },
+    "key_id": { "type": "string", "pattern": "^[0-9a-f]{16}$" }
+  }
+}

@@ -3,7 +3,8 @@
   "specifiers": {
     "jsr:@std/assert@1": "1.0.19",
     "jsr:@std/internal@^1.0.12": "1.0.14",
-    "npm:@noble/hashes@1.4.0": "1.4.0"
+    "npm:@noble/hashes@1.4.0": "1.4.0",
+    "npm:canonicalize@2.1.0": "2.1.0"
   },
   "jsr": {
     "@std/assert@1.0.19": {
@@ -19,11 +20,16 @@
   "npm": {
     "@noble/hashes@1.4.0": {
       "integrity": "sha512-V1JJ1WTRUqHHrOSh597hURcMqVKVGL/ea3kv0gSnEdsEZ0/+VyPghM1lMNGc00z7CIQorSvbKpuJkxvuHbvdbg=="
+    },
+    "canonicalize@2.1.0": {
+      "integrity": "sha512-F705O3xrsUtgt98j7leetNhTWPe+5S72rlL5O4jA1pKqBVQ/dT1O1D6PFxmSXvc0SUOinWS57DKx0I3CHrXJHQ==",
+      "bin": true
     }
   },
   "workspace": {
     "dependencies": [
-      "npm:@noble/hashes@1.4.0"
+      "npm:@noble/hashes@1.4.0",
+      "npm:canonicalize@2.1.0"
     ]
   }
 }

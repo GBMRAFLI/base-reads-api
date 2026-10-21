@@ -1,4 +1,4 @@
-# pip install --require-hashes -r requirements.txt  (hashes of every pycryptodome 3.24.1 file on PyPI)
+# pip install --require-hashes -r requirements.txt  (hashes of every pycryptodome 3.24.1 and rfc8785 0.1.4 file on PyPI)
 pycryptodome==3.24.1 \
     --hash=sha256:0003d83a044639d3f7442bb3282db83ab8cf0b3977bb44d4018aacc2f901e839 \
     --hash=sha256:03cc4a9be177c323425b1204884c1bae3195061d7348e27f6a150833a8e3bf1a \
@@ -43,3 +43,6 @@ pycryptodome==3.24.1 \
     --hash=sha256:ebe1534c29606232c8da2331718a6051012b8ed584a3ea5f53a5e88cbf8e93c9 \
     --hash=sha256:f4bdc3f6b34cf9d05fce5b7ef02c48b767edf75679301f2658bc8f13f328faeb \
     --hash=sha256:f9f3231051f23c3779206de45f40396d571a69eabde2905947d5e89421d23acd
+rfc8785==0.1.4 \
+    --hash=sha256:520d690b448ecf0703691c76e1a34a24ddcd4fc5bc41d589cb7c58ec651bcd48 \
+    --hash=sha256:e545841329fe0eee4f6a3b44e7034343100c12b4ec566dc06ca9735681deb4da

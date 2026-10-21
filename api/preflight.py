@@ -79,6 +79,16 @@ def sign(facts):
     k = load_or_create_key(); pub = public_key_info()
     sig = eddsa.new(k, "rfc8032").sign(canonical(facts))
     return {"facts": facts, "signature": {"alg": "Ed25519", "key_id": pub["key_id"], "public_key_b64": pub["public_key_b64"], "value_b64": base64.b64encode(sig).decode(), "signed_over": "canonical JSON of facts (sorted keys, no whitespace)"}}
+def env_signer():
+    """Attestation signer backed by the server-held key (never exported)."""
+    k = load_or_create_key(); return public_key_info()["key_id"], lambda m: eddsa.new(k, "rfc8032").sign(m)
+def sign_jcs(payload):
+    """JCS (RFC 8785) signature block for the free metadata endpoints."""
+    import attestation as AT
+    k = load_or_create_key(); pub = public_key_info()
+    return {"alg": "Ed25519", "key_id": pub["key_id"], "public_key_b64": pub["public_key_b64"],
+            "value_b64": base64.b64encode(eddsa.new(k, "rfc8032").sign(AT.jcs(payload))).decode(), "canonicalization": "JCS",
+            "signed_over": "RFC 8785 (JCS) canonical JSON of metadata"}
 def verify(envelope):
     s = envelope["signature"]; pk = eddsa.import_public_key(base64.b64decode(s["public_key_b64"]))
     try: eddsa.new(pk, "rfc8032").verify(canonical(envelope["facts"]), base64.b64decode(s["value_b64"])); return True
@@ -216,7 +226,7 @@ def bazaar_facts(url, payto_list, max_trend=14):
             "host_listing_count": idx["hosts"].get(h, 0), "payout_wallet_reuse": wl,
             "last_called_at": cur and cur["lastCalledAt"], "payer_trend": trend}
 
-def preflight(url, now=None):
+def preflight(url, now=None, rpc=None, ttl_s=None, issuer_url=None):
     now = now or time.time()
     u, ip, err = check_url(url)
     if u is None: return 400, {"error": err}
@@ -229,4 +239,6 @@ def preflight(url, now=None):
     valid, problems, acc = validate_challenge(ch)
     facts = dict(base, reachability=reach, challenge={"valid": valid, "problems": problems, "accepts": acc},
                  bazaar=bazaar_facts(url, [a["payTo"] for a in acc if a.get("payTo")]))
-    return 200, sign(facts)
+    import attestation as AT
+    legacy = sign(facts)
+    return 200, dict(legacy, attestation=AT.attest(facts, env_signer(), rpc=rpc, now=now, ttl_s=ttl_s, issuer_url=issuer_url))
