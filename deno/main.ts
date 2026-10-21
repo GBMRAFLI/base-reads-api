@@ -363,6 +363,8 @@ export async function pendingSweep(now = Date.now()) {
     await recordObservation(String(rec.path ?? "/x402/preflight"), "incident", 0, null, "pending_expired_unserved");
   }, now);
 }
+/** Probe slot extension at probe start: probe timeout (5 s) + attestation eth_getCode timeout (5 s, parallel) + signing, with margin. */
+export const SLOT_PROBE_MS = 20_000;
 export async function resetGuards() { await FAILS.clear(); ABUSE = null; META_CACHE = null; }
 export const MAINNET = "eip155:8453";
 /** MIN_CONFIRMATIONS clamped to 1..64 (non-numeric or empty -> 1). */
@@ -446,8 +448,6 @@ async function paid(path: string, q: Record<string, string>, qs: string, sig: st
   };
   /** Probe slot: one synchronous reservation bound to payer + payment nonce + target, 15 s TTL, one per payer. */
   const reserve = (u: string, pending = false): { id: string } | "payer_busy" | "full" => G.slots.reserve(who, nonce, hostOf(u), clock.now(), pending);
-  // Probe (5 s timeout) + attestation RPC (eth_getCode, up to 3 x 1 s with backoff) + signing, with margin.
-  const SLOT_PROBE_MS = 20_000;
   const PAYER429: [number, unknown, Record<string, string>] = [429, { error: "this wallet already has a check in progress", scope: "payer", charged: false }, { "Retry-After": "5" }];
   const CAP503 = (): [number, unknown, Record<string, string>] => [503, { error: "target check capacity is full for this minute, retry later", scope: "target", charged: false }, { "Retry-After": "60" }];
   const BUSY503: [number, unknown, Record<string, string>] = [503, { error: "probe capacity busy, retry shortly", charged: false }, { "Retry-After": "5" }];

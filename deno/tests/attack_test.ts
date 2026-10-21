@@ -1,7 +1,7 @@
 // Attack scenarios A1-A12 for the paid Pre-pay Check, plus outbound limits. Keys: repo throwaway test key (legacy
 // signature) and in-memory ephemeral keys; nothing here touches the network (resolver/fetcher/rpc/facilitator are stubs).
 import { assert, assertEquals } from "jsr:@std/assert@1";
-import { abuse, handler, pendingSweep, reorgSweep, reqFor, resetGuards, snapshotMeta } from "../main.ts";
+import { SLOT_PROBE_MS, abuse, handler, pendingSweep, reorgSweep, reqFor, resetGuards, snapshotMeta } from "../main.ts";
 import { sweepReorg, scheduleReorgCheck } from "../lib/reorg.ts";
 import * as SG from "../lib/settle_guard.ts";
 import { useKv, rows, kv } from "../lib/store.ts";
@@ -423,4 +423,11 @@ Deno.test("L2 (ef96fe0) cache expired between the pre-check and delivery: the fr
   const sig3 = pay(); const [c3] = await t3.call(sig3, "https://ce.example/b"); assertEquals(c3, 502);
   const [c4, b4] = await t3.call(sig3, "https://ce.example/b"); assertEquals([c4, b4.transaction !== undefined], [503, true]); // no unit: re-parked, not probed
   assertEquals(t3.n.fetch, 0);
+});
+Deno.test("L1 (0ed3bdd) the slot always covers probe timeout + attestation RPC timeout; a hung eth_getCode is cut at its timeout", async () => {
+  const { ATTEST_RPC_TIMEOUT_MS, paytoCode } = await import("../lib/attestation.ts"); const { PROBE_TIMEOUT_MS } = await import("../lib/preflight.ts");
+  assertEquals(ATTEST_RPC_TIMEOUT_MS, 5000); assert(PROBE_TIMEOUT_MS + ATTEST_RPC_TIMEOUT_MS + 2000 <= SLOT_PROBE_MS);
+  const t0 = performance.now();
+  const r = await paytoCode(["0x" + "12".repeat(20), "0x" + "34".repeat(20)], (() => new Promise(() => {})) as any, 50);
+  assert(performance.now() - t0 < 1000); assertEquals(r.map((x) => x.kind), [null, null]); // parallel, bounded, conservative null
 });

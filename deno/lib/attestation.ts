@@ -56,12 +56,16 @@ export function classifyCode(address: string, code: string): PaytoCode {
   if (n === 23 && code.toLowerCase().startsWith("0xef0100")) return { address, kind: "eip7702_delegated", code_bytes: 23, delegate: "0x" + code.slice(8).toLowerCase() };
   return { address, kind: "contract", code_bytes: n };
 }
-export async function paytoCode(payTos: string[], rpc?: Rpc): Promise<PaytoCode[]> {
+/** Each eth_getCode lookup is bounded (lookups run in parallel), so probe + RPC always fit inside the probe slot. */
+export const ATTEST_RPC_TIMEOUT_MS = 5000;
+export async function paytoCode(payTos: string[], rpc?: Rpc, timeoutMs = ATTEST_RPC_TIMEOUT_MS): Promise<PaytoCode[]> {
   const uniq = [...new Set(payTos.filter((a) => /^0x[0-9a-fA-F]{40}$/.test(a)).map((a) => a.toLowerCase()))].slice(0, MAX_PAYTO_CODE_LOOKUPS);
   return await Promise.all(uniq.map(async (address) => {
     if (!rpc) return { address, kind: null, code_bytes: null };
     try {
-      const code = await rpc("eth_getCode", [address, "latest"]);
+      let t: ReturnType<typeof setTimeout> | undefined;
+      const code = await Promise.race([rpc("eth_getCode", [address, "latest"]),
+        new Promise((_, rej) => { t = setTimeout(() => rej(new Error("rpc_timeout")), timeoutMs); })]).finally(() => clearTimeout(t));
       if (typeof code !== "string" || !/^0x[0-9a-fA-F]*$/.test(code)) return { address, kind: null, code_bytes: null };
       return classifyCode(address, code);
     } catch { return { address, kind: null, code_bytes: null }; }
