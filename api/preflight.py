@@ -39,11 +39,12 @@ def key_meta(raw, created_at=None):
             "created_at": created_at}
 ISO_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,9})?Z$")
 def iso_or_none(x):
-    """Strict ISO-8601 UTC (YYYY-MM-DDTHH:MM:SS[.fff]Z) that is a real date, else None."""
+    """Strict ISO-8601 UTC (YYYY-MM-DDTHH:MM:SS[.fff]Z) that is a real date, normalized to second precision
+    (YYYY-MM-DDTHH:MM:SSZ, fraction truncated) so published key timestamps match the verifiers; else None."""
     if not isinstance(x, str) or not ISO_RE.match(x): return None
     try: time.strptime(x[:19], "%Y-%m-%dT%H:%M:%S")
     except ValueError: return None
-    return x
+    return x[:19] + "Z"
 def startup_warnings(env=os.environ):
     """Non-fatal configuration problems, logged once at startup."""
     w = []; ca = env.get("SIGNING_KEY_CREATED_AT")

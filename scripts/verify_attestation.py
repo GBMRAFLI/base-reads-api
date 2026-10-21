@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """Official verifier for Pre-pay Check Attestation v1.0 (CC0).
-Usage: verify_attestation.py FILE|- [--issuer URL_OR_FILE] [--key-id KEY_ID] [--snapshots URL_OR_FILE] [--ignore-expiry]
+Usage: verify_attestation.py FILE|- --issuer URL_OR_FILE --key-id KEY_ID [--snapshots URL_OR_FILE] [--ignore-expiry]
+--issuer and --key-id are required: the issuer document and the key_id must come from a source you trust (for example
+the service's own /.well-known/issuer.json fetched once and pinned). issuer.issuer_url inside the attestation is never used,
+because whoever made the attestation also chose that URL.
 FILE is either the attestation object or a /x402/preflight response body that contains "attestation".
 Needs: pip install rfc8785 pycryptodome. Exit code 0 = signature valid (and not expired), 1 = invalid, 2 = usage/input error.
 Checks only the signature, key and validity window; it says nothing about whether to pay an endpoint."""
@@ -30,7 +33,12 @@ def load(src):
         return strict_loads(urllib.request.urlopen(req, timeout=15).read().decode("utf-8"))
     return strict_loads(sys.stdin.read() if src == "-" else open(src, encoding="utf-8").read())
 
-def verify(att, issuer, now=None, check_expiry=True, expected_key_id=None):
+def verify(att, issuer, now=None, check_expiry=True, *, expected_key_id, allow_unpinned=False):
+    """Verify one attestation against an issuer document.
+    WARNING: expected_key_id is mandatory. Take it, and the issuer document, from a source you trust (never from
+    issuer.issuer_url inside the attestation). allow_unpinned=True skips the pin and exists for tests only; without a
+    pin, anyone who can make you load their issuer document can make their own attestations verify."""
+    if expected_key_id is None and allow_unpinned is not True: return False, "no pinned key_id (expected_key_id is mandatory)"
     if not isinstance(att, dict) or not isinstance(issuer, dict): return False, "attestation and issuer must be JSON objects"
     if att.get("spec") != "prepay-check-attestation" or att.get("version") != "1.0" or att.get("canonicalization") != "JCS":
         return False, "unsupported spec/version/canonicalization"
@@ -47,9 +55,12 @@ def verify(att, issuer, now=None, check_expiry=True, expected_key_id=None):
     iat, exp = ts(att.get("issued_at")), ts(att.get("expires_at"))
     if iat is None or exp is None: return False, "issued_at/expires_at unparseable"
     if exp < iat or exp - iat > 86400: return False, "validity window must be 0..86400 s"
-    if k.get("status") == "retired":
+    if k.get("status") == "active":
+        if "retired_at" in k: return False, "active key must not carry retired_at"
+    elif k.get("status") == "retired":
         r = ts(k.get("retired_at"))
         if r is None or iat > r: return False, "issued after key was retired"
+    else: return False, "unknown key status"
     msg = DOMAIN + rfc8785.dumps({x: v for x, v in att.items() if x != "signature"})
     try: eddsa.new(eddsa.import_public_key(raw), "rfc8032").verify(msg, base64.b64decode(sig["value_b64"], validate=True))
     except Exception: return False, "bad signature"
@@ -82,8 +93,9 @@ def main(argv):
     except ValueError as e: print("FAIL " + str(e)); return 1
     att = body.get("attestation", body) if isinstance(body, dict) else body
     if not isinstance(att, dict): print("FAIL attestation is not an object"); return 1
-    issuer_src = issuer_src or (att.get("issuer") or {}).get("issuer_url")
-    if not issuer_src: print("no issuer document: pass --issuer"); return 2
+    # never fall back to att.issuer.issuer_url: an attacker controls it and could point it at their own issuer document
+    if not issuer_src: print("no issuer document: pass --issuer (the attestation's own issuer_url is never trusted)"); return 2
+    if not key_id: print("no pinned key: pass --key-id (pinning the expected key_id is mandatory)"); return 2
     try: iss = load(issuer_src)
     except ValueError as e: print("FAIL issuer: " + str(e)); return 1
     ok, why = verify(att, iss, check_expiry=check_expiry, expected_key_id=key_id)

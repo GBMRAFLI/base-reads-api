@@ -72,12 +72,13 @@ export function keyMeta(raw: Uint8Array, createdAt: string | null = null) {
   return { alg: "Ed25519", public_key_b64: b64e(raw), key_id: kid, fingerprint: "SHA256:" + b64e(d).replace(/=+$/, ""),
     fingerprint_short: kid.match(/.{4}/g)!.join(" "), created_at: createdAt };
 }
-/** Strict ISO-8601 UTC timestamp (YYYY-MM-DDTHH:MM:SS[.fff]Z) that is a real date; returns it or null. */
+/** Strict ISO-8601 UTC timestamp (YYYY-MM-DDTHH:MM:SS[.fff]Z) that is a real date; returns it as YYYY-MM-DDTHH:MM:SSZ, or null. */
 export const ISO_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,9})?Z$/;
 export function isoOrNull(x: unknown): string | null {
   if (typeof x !== "string" || !ISO_RE.test(x)) return null;
   const t = Date.parse(x); if (!Number.isFinite(t)) return null;
-  return new Date(t).toISOString().slice(0, 19) === x.slice(0, 19) ? x : null; // rejects 2026-02-30 etc.
+  // rejects 2026-02-30 etc.; normalized to second precision (fraction truncated) so published key timestamps match the verifiers
+  return new Date(t).toISOString().slice(0, 19) === x.slice(0, 19) ? x.slice(0, 19) + "Z" : null;
 }
 export async function publicKeyInfo(env: (k: string) => string | undefined = (k) => Deno.env.get(k)) {
   const { pubRaw } = await loadKey(env);

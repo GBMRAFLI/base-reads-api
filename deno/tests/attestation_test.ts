@@ -34,8 +34,8 @@ Deno.test("JCS vectors match Python rfc8785 byte for byte", () => {
 });
 Deno.test("Python-signed vector verifies in Deno (library and official script)", async () => {
   assertEquals((await verifyAttestation(V.signed.attestation, V.signed.public_key_b64, null)).ok, true);
-  assertEquals((await officialVerify(V.signed.attestation, V.signed.issuer, NOW))[0], true);
-  assertEquals((await officialVerify(V.signed.attestation, V.signed.issuer, NOW + 3600_000))[1], "expired at 2026-10-21T05:15:00Z");
+  assertEquals((await officialVerify(V.signed.attestation, V.signed.issuer, NOW, true, null, { allowUnpinned: true }))[0], true);
+  assertEquals((await officialVerify(V.signed.attestation, V.signed.issuer, NOW + 3600_000, true, null, { allowUnpinned: true }))[1], "expired at 2026-10-21T05:15:00Z");
 });
 Deno.test("envelope shape, TTL, signature, tamper and expiry", async () => {
   const k = await ephemeral(); const rpc = async () => "0x";
@@ -85,7 +85,7 @@ Deno.test("payTo eth_getCode: dedup, cap 4, rpc errors -> null, no rpc -> null",
 Deno.test("Deno-signed attestation verifies with the official Python script", async () => {
   const k = await ephemeral(); const e = await attest(facts(), { signer: k.signer, rpc: async () => "0x", now: Date.now() });
   const d = await Deno.makeTempDir(); await Deno.writeTextFile(d + "/a.json", JSON.stringify({ attestation: e })); await Deno.writeTextFile(d + "/i.json", JSON.stringify(k.issuer));
-  const run = async (f: string) => (await new Deno.Command("python3", { args: [new URL("../../scripts/verify_attestation.py", import.meta.url).pathname, f, "--issuer", d + "/i.json"], stdout: "piped" }).output()).code;
+  const run = async (f: string) => (await new Deno.Command("python3", { args: [new URL("../../scripts/verify_attestation.py", import.meta.url).pathname, f, "--issuer", d + "/i.json", "--key-id", k.signer.keyId], stdout: "piped" }).output()).code;
   assertEquals(await run(d + "/a.json"), 0);
   (e as any).claims.facts.target = "https://evil.example/"; await Deno.writeTextFile(d + "/b.json", JSON.stringify(e)); assertEquals(await run(d + "/b.json"), 1);
   await Deno.remove(d, { recursive: true });
@@ -131,7 +131,7 @@ Deno.test("M1 domain separation: attestation, snapshot-meta and legacy signature
   const legacySig = await sigOver(kp.privateKey, new TextEncoder().encode(canonical(body)));
   assertEquals((await verifyAttestation({ ...body, signature: { ...e.signature, value_b64: legacySig } }, pub, NOW)).reason, "bad_signature");
   assert(!await v(legacySig, domainBytes(DOMAIN_SNAPSHOT_META, body)));
-  assertEquals((await officialVerify({ ...body, signature: { ...e.signature, value_b64: metaSig } }, { keys: [{ key_id: keyId, public_key_b64: pub, status: "active" }] }, NOW))[1], "bad signature");
+  assertEquals((await officialVerify({ ...body, signature: { ...e.signature, value_b64: metaSig } }, { keys: [{ key_id: keyId, public_key_b64: pub, status: "active" }] }, NOW, true, null, { allowUnpinned: true }))[1], "bad signature");
   assert((await verifyAttestation(e, pub, NOW)).ok);
 });
 Deno.test("L2 verifiers pin key_id and reject bad dates / windows", async () => {
@@ -140,16 +140,16 @@ Deno.test("L2 verifiers pin key_id and reject bad dates / windows", async () => 
   assertEquals((await verifyAttestation(e, other.pubB64, NOW)).reason, "key_id_mismatch");
   assertEquals((await verifyAttestation(e, k.pubB64, NOW, "0".repeat(16))).reason, "key_id_mismatch");
   assertEquals((await officialVerify(e, k.issuer, NOW, true, "0".repeat(16)))[0], false);
-  assertEquals((await officialVerify(e, { keys: [...k.issuer.keys, ...k.issuer.keys] }, NOW))[0], false);
+  assertEquals((await officialVerify(e, { keys: [...k.issuer.keys, ...k.issuer.keys] }, NOW, true, null, { allowUnpinned: true }))[0], false);
   const resign = async (o: any) => { o.signature.value_b64 = await k.signer.sign(signingBytes(o)).then(b64e); return o; };
   for (const [patch, why] of [[{ issued_at: "not-a-date" }, "bad_dates"], [{ expires_at: "2026-02-30T00:00:00Z" }, "bad_dates"],
     [{ expires_at: "2026-10-23T05:00:01Z" }, "bad_validity_window"], [{ expires_at: "2026-10-21T04:59:59Z" }, "bad_validity_window"]] as const) {
     const o = await resign({ ...structuredClone(e), ...patch }); assertEquals((await verifyAttestation(o, k.pubB64, NOW)).reason, why);
-    assertEquals((await officialVerify(o, k.issuer, NOW))[0], false);
+    assertEquals((await officialVerify(o, k.issuer, NOW, true, null, { allowUnpinned: true }))[0], false);
   }
   const fut = await resign({ ...structuredClone(e), issued_at: "2026-10-21T05:02:00Z", expires_at: "2026-10-21T05:10:00Z" });
   assertEquals((await verifyAttestation(fut, k.pubB64, NOW)).reason, "issued_in_future");
-  assertEquals((await officialVerify(fut, k.issuer, NOW))[1], "issued_at is in the future");
+  assertEquals((await officialVerify(fut, k.issuer, NOW, true, null, { allowUnpinned: true }))[1], "issued_at is in the future");
   const skew = await resign({ ...structuredClone(e), issued_at: "2026-10-21T05:00:59Z", expires_at: "2026-10-21T05:10:00Z" });
   assert((await verifyAttestation(skew, k.pubB64, NOW)).ok);
   const badIss = await resign({ ...structuredClone(e), issuer: { ...e.issuer, key_id: "f".repeat(16) } });
@@ -181,33 +181,118 @@ Deno.test("L1 huge-integer network in a 402: summary null, attestation still pro
   assertEquals([c2, r2.attestation, r2.attestation_error, !!r2.signature], [200, null, "attestation_unavailable", true]);
 });
 
-// Docs-drift guard: verify a real attestation and real snapshot meta using ONLY the rules read from the served issuer.json.
-async function verifyByIssuerDoc(iss: any, domain: string, payload: unknown, sig: { key_id: string; value_b64: string }, usePrefix = true) {
-  const s = iss.signing; const d = s.domains[domain];
-  assertEquals([s.algorithm, s.canonicalization, s.canonicalization_ref, s.text_encoding, s.message], ["Ed25519", "JCS", "RFC 8785", "UTF-8", "signing_prefix || JCS(payload)"]);
-  assertEquals(Array.from(new TextEncoder().encode(d.signing_prefix), (b) => b.toString(16).padStart(2, "0")).join(""), d.signing_prefix_hex);
-  const key = iss.keys.find((k: any) => k.key_id === sig.key_id); assert(key, "key listed");
-  const raw = Uint8Array.from(atob(key.public_key_b64), (c) => c.charCodeAt(0)); assertEquals(raw.length, 32);
-  assertEquals(hex(await crypto.subtle.digest("SHA-256", raw)).slice(0, 16), key.key_id);
-  const msg = new TextEncoder().encode((usePrefix ? d.signing_prefix : "") + jcs(payload));
-  const pk = await crypto.subtle.importKey("raw", raw, { name: s.algorithm }, false, ["verify"]);
-  return crypto.subtle.verify(s.algorithm, pk, Uint8Array.from(atob(sig.value_b64), (c) => c.charCodeAt(0)), msg);
+// Docs-drift guard: verify real attestations and real snapshot meta using ONLY the rules read from the served issuer.json.
+const C = JSON.parse(Deno.readTextFileSync(new URL("./fixtures/contract.json", import.meta.url)));
+const tsSec = (x: unknown) => typeof x === "string" && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$/.test(x) ? Date.parse(x) / 1000 : null;
+const b64d = (x: string) => Uint8Array.from(atob(x), (c) => c.charCodeAt(0));
+/** One function per name in issuer.json signing.check_order; returns the first failing check name, or "valid". */
+async function verifyByIssuerDoc(iss: any, a: any, o: { now: number; pinned?: string; prefix?: boolean }) {
+  const s = iss.signing; const d = s.domains.attestation; let key: any;
+  const C8: Record<string, () => boolean | Promise<boolean>> = {
+    spec_version_canonicalization: () => a.spec === "prepay-check-attestation" && a.version === "1.0" && a.canonicalization === s.canonicalization,
+    signature_block: () => a.signature?.alg === s.algorithm && typeof a.signature?.value_b64 === "string",
+    pinned_key_id: () => typeof o.pinned === "string" && a.signature.key_id === o.pinned, // mandatory
+    issuer_key_id_match: () => a.issuer?.key_id === a.signature.key_id,
+    key_lookup: () => { const k = iss.keys.filter((k: any) => k.key_id === a.signature.key_id); key = k[0]; return k.length === 1; },
+    key_integrity: async () => { const raw = b64d(key.public_key_b64); return raw.length === 32 && hex(await crypto.subtle.digest("SHA-256", raw)).slice(0, 16) === key.key_id; },
+    validity_window: () => { const i = tsSec(a.issued_at), e = tsSec(a.expires_at); return i !== null && e !== null && e - i >= 0 && e - i <= 86400; },
+    key_not_retired: () => key.status === "active" ? !("retired_at" in key) : key.status === "retired" && tsSec(key.retired_at) !== null && tsSec(a.issued_at)! <= tsSec(key.retired_at)!,
+    signature: async () => { const { signature: _s, ...p } = a;
+      const pk = await crypto.subtle.importKey("raw", b64d(key.public_key_b64), { name: s.algorithm }, false, ["verify"]); // never signature.public_key_b64
+      return crypto.subtle.verify(s.algorithm, pk, b64d(a.signature.value_b64), new TextEncoder().encode((o.prefix === false ? "" : d.signing_prefix) + jcs(p))); },
+    not_future: () => tsSec(a.issued_at)! <= o.now + 60,
+    not_expired: () => o.now <= tsSec(a.expires_at)!,
+  };
+  assertEquals(Object.keys(C8), s.check_order, "every documented check is implemented, in the documented order");
+  for (const name of s.check_order) if (!await C8[name]()) return name;
+  return "valid";
 }
-Deno.test("issuer.json signing rules alone verify a real attestation and snapshot meta; no prefix -> fail", async () => {
+async function verifyMetaByIssuerDoc(iss: any, m: any, prefix = true) {
+  const s = iss.signing; const key = iss.keys.find((k: any) => k.key_id === m.signature.key_id);
+  const pk = await crypto.subtle.importKey("raw", b64d(key.public_key_b64), { name: s.algorithm }, false, ["verify"]);
+  return crypto.subtle.verify(s.algorithm, pk, b64d(m.signature.value_b64), new TextEncoder().encode((prefix ? s.domains.snapshot_meta.signing_prefix : "") + jcs(m.metadata)));
+}
+Deno.test("issuer.json rules alone verify real attestations; every documented check rejects its negative case", async (t) => {
   useKv(await Deno.openKv(":memory:"));
   const iss = await (await handler(new Request("http://h.example/.well-known/issuer.json"), { env })).json();
-  assertEquals(iss.signing.domains.attestation.signing_prefix, "prepay-check-attestation/v1\n");
-  assertEquals(iss.signing.domains.snapshot_meta.signing_prefix, "bazaar-snapshot-meta/v1\n");
-  assert(iss.verify.some((x: string) => x.includes("7072657061792d636865636b2d6174746573746174696f6e2f76310a")));
-  // Real attestation signed with the served (throwaway test) key, through the production signer path.
+  assertEquals({ signing: iss.signing, verify: iss.verify }, C.issuer_rules, "Deno issuer rules identical to Python");
+  const s = iss.signing;
+  assertEquals([s.algorithm, s.canonicalization, s.canonicalization_ref, s.text_encoding, s.message], ["Ed25519", "JCS", "RFC 8785", "UTF-8", "signing_prefix || JCS(payload)"]);
+  assertEquals(s.domains.attestation.signing_prefix, "prepay-check-attestation/v1\n");
+  assertEquals(s.domains.snapshot_meta.signing_prefix, "bazaar-snapshot-meta/v1\n");
+  for (const d of Object.values(s.domains) as any[]) assertEquals(Array.from(new TextEncoder().encode(d.signing_prefix), (b) => b.toString(16).padStart(2, "0")).join(""), d.signing_prefix_hex);
+  assertEquals(iss.verify.length, s.check_order.length + 1);
+  s.check_order.forEach((n: string, i: number) => assert(iss.verify[i + 1].startsWith(`${i + 1} ${n}:`), n));
   const { envSigner } = await import("../lib/sign.ts");
   const e: any = await attest(facts(), { signer: await envSigner(env), now: NOW });
-  const { signature, ...payload } = e;
-  assert(await verifyByIssuerDoc(iss, "attestation", payload, signature));
-  assert(!await verifyByIssuerDoc(iss, "attestation", payload, signature, false), "must fail without prefix");
-  assert(!await verifyByIssuerDoc(iss, "snapshot_meta", payload, signature), "wrong domain must fail");
-  assert(!await verifyByIssuerDoc(iss, "attestation", { ...payload, version: "9" }, signature), "tamper must fail");
+  const now = NOW / 1000; const kid = e.signature.key_id;
+  const VB = (i: any, x: any, o: { now: number; pinned?: string; prefix?: boolean }) => verifyByIssuerDoc(i, x, { pinned: kid, ...o });
+  await t.step("01 expect valid", async () => { assertEquals(await VB(iss, e, { now, pinned: kid }), "valid"); });
+  // signature.public_key_b64 is informational: a wrong value there does not matter, keys[] is used.
+  await t.step("02 expect valid", async () => { assertEquals(await VB(iss, { ...e, signature: { ...e.signature, public_key_b64: "AAAA" } }, { now }), "valid"); });
+  // negatives, one per check
+  await t.step("03 expect spec_version_canonicalization", async () => { assertEquals(await VB(iss, { ...e, version: "2.0" }, { now }), "spec_version_canonicalization"); });
+  await t.step("04 expect signature_block", async () => { assertEquals(await VB(iss, { ...e, signature: { ...e.signature, alg: "RS256" } }, { now }), "signature_block"); });
+  await t.step("05b expect pinned_key_id (no pin given)", async () => { assertEquals(await VB(iss, e, { now, pinned: undefined }), "pinned_key_id"); });
+  await t.step("05 expect pinned_key_id", async () => { assertEquals(await VB(iss, e, { now, pinned: "0".repeat(16) }), "pinned_key_id"); });
+  await t.step("06 expect issuer_key_id_match", async () => { assertEquals(await VB(iss, { ...e, issuer: { ...e.issuer, key_id: "0".repeat(16) } }, { now }), "issuer_key_id_match"); });
+  await t.step("07 expect key_lookup", async () => { assertEquals(await VB({ ...iss, keys: [] }, e, { now }), "key_lookup"); });
+  await t.step("08 expect key_integrity", async () => { assertEquals(await VB({ ...iss, keys: [{ ...iss.keys[0], public_key_b64: btoa("x".repeat(32)) }] }, e, { now }), "key_integrity"); });
+  await t.step("09 expect validity_window", async () => { assertEquals(await VB(iss, { ...e, expires_at: "2026-10-23T05:00:00Z" }, { now }), "validity_window"); });
+  const retired = (at: string | undefined) => ({ ...iss, keys: [{ ...iss.keys[0], status: "retired", ...(at === undefined ? {} : { retired_at: at }) }] });
+  await t.step("10 expect key_not_retired", async () => { assertEquals(await VB(retired("2026-10-21T04:59:59Z"), e, { now }), "key_not_retired"); });
+  await t.step("11 expect key_not_retired", async () => { assertEquals(await VB(retired(undefined), e, { now }), "key_not_retired"); });
+  await t.step("12 expect valid", async () => { assertEquals(await VB(retired(e.issued_at), e, { now }), "valid", "issued_at == retired_at is accepted"); });
+  await t.step("13 expect signature", async () => { assertEquals(await VB(iss, e, { now, prefix: false }), "signature", "no prefix -> fail"); });
+  await t.step("14 expect signature", async () => { assertEquals(await VB(iss, { ...e, subject: { ...e.subject, url: "https://evil.example/" } }, { now }), "signature"); });
+  await t.step("15 expect not_future", async () => { assertEquals(await VB(iss, e, { now: now - 120 }), "not_future"); });
+  await t.step("16 expect not_expired", async () => { assertEquals(await VB(iss, e, { now: now + 901 }), "not_expired"); });
+  // The official verifier agrees on the retired boundary and the key_id mismatch.
+  assertEquals((await officialVerify(e, retired(e.issued_at), NOW, true, null, { allowUnpinned: true }))[0], true);
+  assertEquals((await officialVerify(e, retired("2026-10-21T04:59:59Z"), NOW, true, null, { allowUnpinned: true }))[0], false);
+  assertEquals((await officialVerify({ ...e, issuer: { ...e.issuer, key_id: "0".repeat(16) } }, iss, NOW, true, null, { allowUnpinned: true }))[0], false);
   const m: any = await (await handler(new Request("http://h.example/.well-known/bazaar-snapshot.json"), { env })).json();
-  assert(await verifyByIssuerDoc(iss, "snapshot_meta", m.metadata, m.signature));
-  assert(!await verifyByIssuerDoc(iss, "snapshot_meta", m.metadata, m.signature, false));
+  assert(await verifyMetaByIssuerDoc(iss, m)); assert(!await verifyMetaByIssuerDoc(iss, m, false));
+});
+Deno.test("L2: published key timestamps are normalized to second precision and verify with the official verifier", async () => {
+  const { keyHistory, envSigner } = await import("../lib/sign.ts");
+  const raw = new Uint8Array(32).fill(7);
+  const h = await keyHistory((k) => k === "SIGNING_KEY_HISTORY" ? JSON.stringify([{ public_key_b64: b64e(raw), created_at: "2026-01-01T00:00:00.5Z", retired_at: "2026-10-21T05:00:00.999Z" }]) : env(k));
+  assertEquals([h.retired[0].created_at, h.retired[0].retired_at], ["2026-01-01T00:00:00Z", "2026-10-21T05:00:00Z"]);
+  const e: any = await attest(facts(), { signer: await envSigner(env), now: NOW });
+  // the current key retired at "...05:00:00.999Z" is published as "...05:00:00Z"; the official verifier accepts it (issued_at == retired_at)
+  const cur = (await keyHistory(env)).current;
+  const h2 = await keyHistory((k) => k === "SIGNING_KEY_HISTORY" ? JSON.stringify([{ public_key_b64: cur.public_key_b64, retired_at: "2026-10-21T05:00:00.999Z" }]) : env(k));
+  const iss = { keys: [h2.retired[0]] }; assertEquals(iss.keys[0].retired_at, "2026-10-21T05:00:00Z");
+  assertEquals((await officialVerify(e, iss, NOW, true, null, { allowUnpinned: true }))[0], true);
+});
+Deno.test("L1: official verifier rejects an unknown key status and an active key with retired_at", async () => {
+  const { keyHistory, envSigner } = await import("../lib/sign.ts");
+  const e: any = await attest(facts(), { signer: await envSigner(env), now: NOW }); const cur = (await keyHistory(env)).current;
+  assertEquals(await officialVerify(e, { keys: [cur] }, NOW, true, null, { allowUnpinned: true }), [true, `valid: key_id ${cur.key_id}, issued ${e.issued_at}, expires ${e.expires_at}`]);
+  assertEquals((await officialVerify(e, { keys: [{ ...cur, status: "revoked" }] }, NOW, true, null, { allowUnpinned: true }))[1], "unknown key status");
+  assertEquals((await officialVerify(e, { keys: [{ ...cur, retired_at: "2026-10-22T00:00:00Z" }] }, NOW, true, null, { allowUnpinned: true }))[1], "active key must not carry retired_at");
+});
+Deno.test("MEDIUM: attacker-hosted issuer + attestation signed with the attacker's key is rejected", async () => {
+  const legit = (await (await handler(new Request("http://h.example/.well-known/issuer.json"), { env })).json());
+  const legitKid = legit.keys[0].key_id;
+  const evil = await ephemeral(); const d = await Deno.makeTempDir();
+  await Deno.writeTextFile(d + "/evil_issuer.json", JSON.stringify(evil.issuer));
+  const e: any = await attest(facts(), { signer: evil.signer, now: Date.now(), issuerUrl: d + "/evil_issuer.json" }); // issuer_url points at the attacker
+  await Deno.writeTextFile(d + "/a.json", JSON.stringify({ attestation: e }));
+  const cli = async (cmd: string, args: string[]) => (await new Deno.Command(cmd, { args, stdout: "piped" }).output()).code;
+  const PY = new URL("../../scripts/verify_attestation.py", import.meta.url).pathname, TS = new URL("../../scripts/verify_attestation.ts", import.meta.url).pathname;
+  const ts = (x: string[]) => cli("deno", ["run", "--allow-read", "--config", new URL("../deno.json", import.meta.url).pathname, TS, ...x]);
+  for (const run of [(x: string[]) => cli("python3", [PY, ...x]), ts]) {
+    assertEquals(await run([d + "/a.json"]), 2, "no --issuer: the attestation's issuer_url is not used");
+    assertEquals(await run([d + "/a.json", "--issuer", d + "/evil_issuer.json"]), 2, "no --key-id: pin is mandatory");
+    assertEquals(await run([d + "/a.json", "--issuer", d + "/evil_issuer.json", "--key-id", legitKid]), 1, "attacker issuer + pinned legit key_id -> FAIL");
+  }
+  assertEquals((await officialVerify(e, legit, Date.now(), true, legitKid))[0], false);
+  await Deno.remove(d, { recursive: true });
+});
+Deno.test("L1: library verify() refuses without a pinned key_id unless allowUnpinned (tests only)", async () => {
+  const k = await ephemeral(); const e: any = await attest(facts(), { signer: k.signer, now: NOW });
+  assertEquals(await officialVerify(e, k.issuer, NOW, true, null), [false, "no pinned key_id (expectedKeyId is mandatory)"]);
+  assertEquals((await officialVerify(e, k.issuer, NOW, true, k.signer.keyId))[0], true);
 });

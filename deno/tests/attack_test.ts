@@ -221,7 +221,7 @@ Deno.test("A11 tampered Bazaar snapshot: service detects the hash mismatch; veri
   const d = await Deno.makeTempDir();
   await Deno.writeTextFile(d + "/a.json", JSON.stringify(ok)); await Deno.writeTextFile(d + "/s.json", JSON.stringify(forged)); await Deno.writeTextFile(d + "/s_ok.json", JSON.stringify(pub));
   await Deno.writeTextFile(d + "/i.json", JSON.stringify({ keys: [{ key_id: kid, public_key_b64: btoa(String.fromCharCode(...raw)), status: "active" }] }));
-  const py = async (s: string) => (await new Deno.Command("python3", { args: [new URL("../../scripts/verify_attestation.py", import.meta.url).pathname, d + "/a.json", "--issuer", d + "/i.json", "--snapshots", d + s], stdout: "piped" }).output()).code;
+  const py = async (s: string) => (await new Deno.Command("python3", { args: [new URL("../../scripts/verify_attestation.py", import.meta.url).pathname, d + "/a.json", "--issuer", d + "/i.json", "--key-id", kid, "--snapshots", d + s], stdout: "piped" }).output()).code;
   assertEquals([await py("/s_ok.json"), await py("/s.json")], [0, 1]);
   await Deno.remove(d, { recursive: true });
 });
@@ -235,9 +235,9 @@ Deno.test("A12 an attestation from yesterday -> rejected (expires_at passed) by 
   const y: any = await attest(facts, { signer, now: Date.now() - 86400_000 });
   assertEquals((await verifyAttestation(y, pub)).reason, "expired");
   const iss = { keys: [{ key_id: kid, public_key_b64: pub, status: "active" }] };
-  assert((await officialVerify(y, iss))[1].startsWith("expired at "));
+  assert((await officialVerify(y, iss, Date.now(), true, null, { allowUnpinned: true }))[1].startsWith("expired at "));
   const d = await Deno.makeTempDir(); await Deno.writeTextFile(d + "/a.json", JSON.stringify(y)); await Deno.writeTextFile(d + "/i.json", JSON.stringify(iss));
-  const py = await new Deno.Command("python3", { args: [new URL("../../scripts/verify_attestation.py", import.meta.url).pathname, d + "/a.json", "--issuer", d + "/i.json"], stdout: "piped" }).output();
+  const py = await new Deno.Command("python3", { args: [new URL("../../scripts/verify_attestation.py", import.meta.url).pathname, d + "/a.json", "--issuer", d + "/i.json", "--key-id", kid], stdout: "piped" }).output();
   assertEquals(py.code, 1); assert(new TextDecoder().decode(py.stdout).startsWith("FAIL expired at "));
   await Deno.remove(d, { recursive: true });
 });

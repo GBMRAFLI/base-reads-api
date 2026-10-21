@@ -445,7 +445,7 @@ Deno.test("A9 signing key is imported non-extractable", async () => {
 });
 Deno.test("A10 env is passed through; CREATED_AT / HISTORY dates must be strict ISO-8601 UTC", async () => {
   const { isoOrNull } = await import("../lib/sign.ts");
-  assertEquals(isoOrNull("2026-10-14T12:00:21Z"), "2026-10-14T12:00:21Z"); assertEquals(isoOrNull("2026-10-14T12:00:21.251Z"), "2026-10-14T12:00:21.251Z");
+  assertEquals(isoOrNull("2026-10-14T12:00:21Z"), "2026-10-14T12:00:21Z"); assertEquals(isoOrNull("2026-10-14T12:00:21.251Z"), "2026-10-14T12:00:21Z");
   for (const bad of ["2026-10-14", "2026-10-14 12:00:21", "2026-02-30T00:00:00Z", "2026-10-14T12:00:21+07:00", "<b>", 5, null]) assertEquals(isoOrNull(bad), null);
   resetKey(); const E: Record<string, string> = { ...ENV, SIGNING_KEY_CREATED_AT: "2026-10-14T12:00:21Z",
     SIGNING_KEY_HISTORY: JSON.stringify([{ public_key_b64: btoa("k".repeat(32)), created_at: "yesterday", retired_at: "2026-10-01T00:00:00Z" }]) };
