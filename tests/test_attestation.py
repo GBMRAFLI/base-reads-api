@@ -37,7 +37,7 @@ class TA(unittest.TestCase):
         self.assertTrue(VA.verify(e, iss, now=NOW)[0])
         retired = {"keys": [dict(iss["keys"][0], status="retired", retired_at="2026-10-01T00:00:00Z")]}
         self.assertEqual(VA.verify(e, retired, now=NOW), (False, "issued after key was retired"))
-        self.assertEqual(VA.verify(e, {"keys": []}, now=NOW), (False, "signature.key_id not listed by issuer"))
+        self.assertEqual(VA.verify(e, {"keys": []}, now=NOW), (False, "signature.key_id not listed exactly once by issuer"))
         try: import jsonschema
         except ImportError: jsonschema = None
         if jsonschema: jsonschema.validate(e, SCHEMA)
@@ -58,7 +58,8 @@ class TA(unittest.TestCase):
         self.assertEqual(len(AT.payto_code(["0x%040x" % i for i in range(1, 9)], lambda m, p: "0x")), 4)
         d = "0x" + "ab" * 20
         self.assertEqual(AT.payto_code([ACC["payTo"]], lambda m, p: "0xef0100" + d[2:]), [{"address": ACC["payTo"], "kind": "eip7702_delegated", "code_bytes": 23, "delegate": d}])
-        self.assertEqual(st(facts(), [{"address": ACC["payTo"], "kind": "eip7702_delegated", "code_bytes": 23, "delegate": d}])["payto_is_eoa"], "pass")
+        self.assertEqual([c for c in AT.build_checks(facts(), [{"address": ACC["payTo"], "kind": "eip7702_delegated", "code_bytes": 23, "delegate": d}]) if c["id"] == "payto_is_eoa"],
+                         [{"id": "payto_is_eoa", "status": "fail", "observed": [{"address": ACC["payTo"], "kind": "eip7702_delegated", "delegate": d}]}])  # M2
     def test_python_signed_verifies_with_deno_script(self):
         s, pub, iss = ephemeral(); e = AT.attest(facts(), s, rpc=lambda m, p: "0x")
         d = tempfile.mkdtemp(); json.dump({"attestation": e}, open(d + "/a.json", "w")); json.dump(iss, open(d + "/i.json", "w"))
@@ -70,6 +71,53 @@ class TA(unittest.TestCase):
         self.assertNotIn("private", json.dumps(iss).lower())
         self.assertEqual(IX.ATT_SCHEMA, SCHEMA)
         m = IX.snapshot_meta(); self.assertEqual(m["signature"]["canonicalization"], "JCS")
-        eddsa.new(eddsa.import_public_key(base64.b64decode(m["signature"]["public_key_b64"])), "rfc8032").verify(AT.jcs(m["metadata"]), base64.b64decode(m["signature"]["value_b64"]))
+        eddsa.new(eddsa.import_public_key(base64.b64decode(m["signature"]["public_key_b64"])), "rfc8032").verify(AT.domain_bytes(AT.DOMAIN_SNAPSHOT_META, m["metadata"]), base64.b64decode(m["signature"]["value_b64"]))
         self.assertIn("/.well-known/issuer.json", IX.FREE_PATHS); self.assertIn("/.well-known/issuer.json", IX.llms_txt())
+class TFix(unittest.TestCase):
+    def test_m1_domain_separation(self):
+        k = ECC.generate(curve="ed25519"); raw = k.public_key().export_key(format="raw"); kid = hashlib.sha256(raw).hexdigest()[:16]; pub = base64.b64encode(raw).decode()
+        sg = lambda m: eddsa.new(k, "rfc8032").sign(m)
+        e = AT.attest(facts(), (kid, sg), now=NOW); body = {x: v for x, v in e.items() if x != "signature"}
+        self.assertTrue(AT.signing_bytes(e).startswith(b"prepay-check-attestation/v1\n"))
+        ver = lambda sig, msg: eddsa.new(eddsa.import_public_key(raw), "rfc8032").verify(msg, sig)
+        a_sig = base64.b64decode(e["signature"]["value_b64"])
+        for msg in (AT.domain_bytes(AT.DOMAIN_SNAPSHOT_META, body), AT.jcs(body), PF.canonical(body)): self.assertRaises(ValueError, ver, a_sig, msg)
+        meta_sig = sg(AT.domain_bytes(AT.DOMAIN_SNAPSHOT_META, body)); legacy_sig = sg(PF.canonical(body))
+        for s_ in (meta_sig, legacy_sig):
+            forged = dict(body, signature=dict(e["signature"], value_b64=base64.b64encode(s_).decode()))
+            self.assertEqual(AT.verify(forged, pub, now=NOW), (False, "bad_signature"))
+            self.assertEqual(VA.verify(forged, {"keys": [{"key_id": kid, "public_key_b64": pub, "status": "active"}]}, now=NOW), (False, "bad signature"))
+        self.assertRaises(ValueError, ver, legacy_sig, AT.domain_bytes(AT.DOMAIN_SNAPSHOT_META, body))
+    def test_l2_pinning_and_dates(self):
+        s, pub, iss = ephemeral(); _, pub2, _ = ephemeral(); kid, sg = s
+        e = AT.attest(facts(), s, now=NOW)
+        self.assertEqual(AT.verify(e, pub2, now=NOW), (False, "key_id_mismatch")); self.assertEqual(AT.verify(e, pub, now=NOW, expected_key_id="0" * 16), (False, "key_id_mismatch"))
+        self.assertFalse(VA.verify(e, iss, now=NOW, expected_key_id="0" * 16)[0]); self.assertFalse(VA.verify(e, {"keys": iss["keys"] * 2}, now=NOW)[0])
+        def resign(**p):
+            o = json.loads(json.dumps(e)); o.update(p); o["signature"]["value_b64"] = base64.b64encode(sg(AT.signing_bytes(o))).decode(); return o
+        for p_, why in (({"issued_at": "nan"}, "bad_dates"), ({"expires_at": "2026-02-30T00:00:00Z"}, "bad_dates"),
+                        ({"expires_at": "2026-10-23T05:00:01Z"}, "bad_validity_window"), ({"expires_at": "2026-10-21T04:59:59Z"}, "bad_validity_window")):
+            o = resign(**p_); self.assertEqual(AT.verify(o, pub, now=NOW), (False, why)); self.assertFalse(VA.verify(o, iss, now=NOW)[0])
+        fut = resign(issued_at="2026-10-21T05:02:00Z", expires_at="2026-10-21T05:10:00Z")
+        self.assertEqual(AT.verify(fut, pub, now=NOW), (False, "issued_in_future")); self.assertEqual(VA.verify(fut, iss, now=NOW)[1], "issued_at is in the future")
+        self.assertTrue(AT.verify(resign(issued_at="2026-10-21T05:00:59Z", expires_at="2026-10-21T05:10:00Z"), pub, now=NOW)[0])
+    def test_l3_ttl(self):
+        self.assertEqual([AT.norm_ttl(x) for x in (1, 600, 10 ** 9, 0, -5, 1.5, float("nan"), "600", None, True)], [1, 600, 86400, 900, 900, 900, 900, 900, 900, 900])
+    def test_l4_strict_json_and_schema(self):
+        self.assertEqual(VA.strict_loads('{"a":[{"b":1}]}'), {"a": [{"b": 1}]})
+        for bad in ('{"a":1,"a":2}', '{"x":{"spec":1,"spec":2}}', '{"a":NaN}', '{"a":Infinity}'): self.assertRaises(ValueError, VA.strict_loads, bad)
+        self.assertEqual(SCHEMA["properties"]["claims"]["properties"]["checks_passed"]["items"], {"$ref": "#/$defs/check_id"})
+        import jsonschema
+        e = AT.attest(facts(), ephemeral()[0], now=NOW); e["claims"]["checks_failed"] = ["made_up"]
+        self.assertRaises(jsonschema.ValidationError, jsonschema.validate, e, SCHEMA)
+    def test_l1_huge_int_network(self):
+        ch = {"x402Version": 2, "accepts": [dict(ACC, network=10 ** 400, asset=10 ** 30)]}
+        ok, probs, acc = PF.validate_challenge(ch); self.assertEqual((acc[0]["network"], acc[0]["asset"]), (None, None))
+        f = facts(challenge={"valid": ok, "problems": probs, "accepts": acc})
+        s, pub, _ = ephemeral(); e = AT.attest(f, s, now=NOW); self.assertTrue(AT.verify(e, pub, now=NOW)[0])
+        import unittest.mock as M
+        with M.patch.object(PF, "probe", lambda u, ip, *a, **k: ({"reachable": True, "http_status": 402, "latency_ms": 1}, ch)), \
+             M.patch.object(PF, "check_url", lambda u, *a: (u, "93.184.216.34", None)), M.patch.object(AT, "attest", side_effect=OverflowError("x")):
+            code, body = PF.preflight("https://a.example/x")
+        self.assertEqual((code, body["attestation"], body["attestation_error"]), (200, None, "attestation_unavailable")); self.assertTrue(body["signature"]["value_b64"])
 if __name__ == "__main__": unittest.main()

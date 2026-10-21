@@ -109,14 +109,15 @@ export async function envSigner(env: (k: string) => string | undefined = (k) => 
 }
 /** JCS-signed (RFC 8785) payload used by the free metadata endpoints. */
 export async function signJcs(payload: Record<string, unknown>, env: (k: string) => string | undefined = (k) => Deno.env.get(k)) {
-  const { jcs } = await import("./attestation.ts");
+  const { domainBytes, DOMAIN_SNAPSHOT_META } = await import("./attestation.ts");
   const { priv } = await loadKey(env); const pub = await publicKeyInfo(env);
-  const sig = new Uint8Array(await crypto.subtle.sign("Ed25519", priv, new TextEncoder().encode(jcs(payload))));
+  const sig = new Uint8Array(await crypto.subtle.sign("Ed25519", priv, domainBytes(DOMAIN_SNAPSHOT_META, payload) as Uint8Array<ArrayBuffer>));
   return { alg: "Ed25519", key_id: pub.key_id, public_key_b64: pub.public_key_b64, value_b64: b64e(sig), canonicalization: "JCS",
-    signed_over: "RFC 8785 (JCS) canonical JSON of metadata" };
+    domain: "bazaar-snapshot-meta/v1",
+    signed_over: "UTF-8 of 'bazaar-snapshot-meta/v1' + LF + RFC 8785 (JCS) canonical JSON of metadata" };
 }
 export async function verifyJcs(payload: unknown, s: { public_key_b64: string; value_b64: string }) {
-  const { jcs } = await import("./attestation.ts");
+  const { domainBytes, DOMAIN_SNAPSHOT_META } = await import("./attestation.ts");
   const pk = await crypto.subtle.importKey("raw", b64d(s.public_key_b64), { name: "Ed25519" }, false, ["verify"]);
-  return crypto.subtle.verify("Ed25519", pk, b64d(s.value_b64), new TextEncoder().encode(jcs(payload)));
+  return crypto.subtle.verify("Ed25519", pk, b64d(s.value_b64), domainBytes(DOMAIN_SNAPSHOT_META, payload) as Uint8Array<ArrayBuffer>);
 }

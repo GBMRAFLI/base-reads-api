@@ -379,8 +379,8 @@ async function paid(path: string, q: Record<string, string>, qs: string, sig: st
   const run = async (): Promise<[number, unknown]> => {
     if (path === "/x402/preflight") {
       const u = unquote(q.url ?? "");
-      const ttl = Number(env("ATTESTATION_TTL_S") ?? "");
-      return u ? await preflight(u, { resolver: d.resolver, fetcher: d.fetcher, env, rpc, ttlS: Number.isFinite(ttl) && ttl > 0 ? ttl : undefined,
+      const ttlRaw = env("ATTESTATION_TTL_S") ?? ""; const ttl = /^[0-9]{1,6}$/.test(ttlRaw) ? Number(ttlRaw) : undefined; // normTtl: int >= 1 else 900
+      return u ? await preflight(u, { resolver: d.resolver, fetcher: d.fetcher, env, rpc, ttlS: ttl,
         issuerUrl: c.PUBLIC ? c.PUBLIC.replace(/\/+$/, "") + "/.well-known/issuer.json" : null }) : [400, { error: "give ?url=https://..." }];
     }
     return await new Chain(rpc, c.USDC).handle(path, q);

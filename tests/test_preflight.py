@@ -560,7 +560,10 @@ class T9(unittest.TestCase):
         BS.write([{"resource": "https://a.example/x", "accepts": [], "quality": {}}, {"resource": "https://b.example/y", "accepts": [], "quality": {}}], "2026-01-03")
         m = IX.snapshot_meta(); md = m["metadata"]
         self.assertEqual(set(md), {"version", "started_at", "last_updated", "total_snapshots", "covered_listings"})
-        self.assertEqual(m["pubkey_url"], "/x402/preflight/pubkey"); self.assertTrue(PF.verify({"facts": md, "signature": m["signature"]}))
+        self.assertEqual(m["pubkey_url"], "/x402/preflight/pubkey"); self.assertFalse(PF.verify({"facts": md, "signature": m["signature"]}))  # domain-separated: never verifies as legacy facts
+        import attestation as AT; from Crypto.Signature import eddsa
+        vm = lambda o: eddsa.new(eddsa.import_public_key(base64.b64decode(m["signature"]["public_key_b64"])), "rfc8032").verify(AT.domain_bytes(AT.DOMAIN_SNAPSHOT_META, o), base64.b64decode(m["signature"]["value_b64"]))
+        vm(md)
         self.assertGreaterEqual(md["total_snapshots"], 1); self.assertNotIn("resources", json.dumps(m))
-        md["covered_listings"] += 1; self.assertFalse(PF.verify({"facts": md, "signature": m["signature"]}))
+        md["covered_listings"] += 1; self.assertRaises(ValueError, vm, md)
 if __name__ == "__main__": unittest.main(verbosity=2)

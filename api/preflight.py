@@ -87,8 +87,8 @@ def sign_jcs(payload):
     import attestation as AT
     k = load_or_create_key(); pub = public_key_info()
     return {"alg": "Ed25519", "key_id": pub["key_id"], "public_key_b64": pub["public_key_b64"],
-            "value_b64": base64.b64encode(eddsa.new(k, "rfc8032").sign(AT.jcs(payload))).decode(), "canonicalization": "JCS",
-            "signed_over": "RFC 8785 (JCS) canonical JSON of metadata"}
+            "value_b64": base64.b64encode(eddsa.new(k, "rfc8032").sign(AT.domain_bytes(AT.DOMAIN_SNAPSHOT_META, payload))).decode(), "canonicalization": "JCS",
+            "domain": "bazaar-snapshot-meta/v1", "signed_over": "UTF-8 of 'bazaar-snapshot-meta/v1' + LF + RFC 8785 (JCS) canonical JSON of metadata"}
 def verify(envelope):
     s = envelope["signature"]; pk = eddsa.import_public_key(base64.b64decode(s["public_key_b64"]))
     try: eddsa.new(pk, "rfc8032").verify(canonical(envelope["facts"]), base64.b64decode(s["value_b64"])); return True
@@ -183,7 +183,8 @@ def validate_challenge(ch, now=None):
                       ("payTo", isinstance(a.get("payTo"), str) and bool(ADDR.match(a.get("payTo", "")))),
                       ("maxTimeoutSeconds", isinstance(a.get("maxTimeoutSeconds"), int) and 0 < a.get("maxTimeoutSeconds", 0) <= 3600)):
             if not ok: p.append(f"accepts[{i}].{f}_invalid")
-        out.append({"scheme": a.get("scheme"), "network": a.get("network"), "amount": amt, "asset": a.get("asset"), "payTo": a.get("payTo")})
+        st = lambda x: x if isinstance(x, str) else None  # summary: strings only (huge ints/objects -> None)
+        out.append({"scheme": st(a.get("scheme")), "network": st(a.get("network")), "amount": st(amt), "asset": st(a.get("asset")), "payTo": st(a.get("payTo"))})
     return not p, p, out
 
 # ---------- Bazaar snapshots ----------
@@ -241,4 +242,8 @@ def preflight(url, now=None, rpc=None, ttl_s=None, issuer_url=None):
                  bazaar=bazaar_facts(url, [a["payTo"] for a in acc if a.get("payTo")]))
     import attestation as AT
     legacy = sign(facts)
-    return 200, dict(legacy, attestation=AT.attest(facts, env_signer(), rpc=rpc, now=now, ttl_s=ttl_s, issuer_url=issuer_url))
+    try: att = AT.attest(facts, env_signer(), rpc=rpc, now=now, ttl_s=ttl_s, issuer_url=issuer_url)
+    except Exception as e:  # never break the paid response: legacy facts still served
+        print("attestation failed:", type(e).__name__, flush=True)
+        return 200, dict(legacy, attestation=None, attestation_error="attestation_unavailable")
+    return 200, dict(legacy, attestation=att)

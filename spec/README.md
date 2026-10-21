@@ -28,7 +28,7 @@ The paid route `GET /x402/preflight?url=<endpoint>` (0.010 USDC, x402 v2, `PAYME
 | `version` | `"1.0"` |
 | `canonicalization` | `"JCS"` (RFC 8785) |
 | `attestation_id` | random UUID v4 |
-| `issued_at`, `expires_at` | UTC, second precision; validity window (default 900 s, at most 24 h) |
+| `issued_at`, `expires_at` | UTC, `YYYY-MM-DDTHH:MM:SSZ`; validity window is an integer number of seconds, default 900, at most 86400 |
 | `issuer` | `{name, key_id, issuer_url, contact}` |
 | `subject` | `{type: "x402_endpoint", url}` |
 | `claims.facts` | the Pre-pay Check facts (schema `prepay-check/v1`): reachability, 402 challenge, Bazaar snapshot facts |
@@ -39,12 +39,19 @@ The paid route `GET /x402/preflight?url=<endpoint>` (0.010 USDC, x402 v2, `PAYME
 
 Check ids in v1.0: `endpoint_reachable`, `http_402_returned`, `challenge_well_formed`, `network_is_base` (expected `eip155:8453`),
 `asset_is_base_usdc` (expected `0x833589fcd6edb6e08f4c7c32d4f71b54bda02913`), `payto_is_eoa`, `bazaar_snapshot_available`, `listed_in_bazaar`.
-`payto_is_eoa` passes for `eoa` and `eip7702_delegated` (an externally owned account with delegated code; see `claims.payto_code` for the delegate) and fails for `contract`.
+`payto_is_eoa` passes only for `eoa`. It fails for `contract` and for `eip7702_delegated` (an account whose code delegates
+execution to another address); `observed` then shows `kind` and `delegate`, so a reader can apply their own policy.
+`network` and `asset` values are reported only when they are JSON strings; anything else is reported as `null`.
 `not_applicable` means the input needed for the check was not observed (for example no 402 challenge, or an RPC lookup failed).
 
 ## Signing
 
-Signed bytes = UTF-8 of the RFC 8785 canonical form of the envelope with the `signature` member removed.
+Signed bytes = UTF-8 of the domain prefix `prepay-check-attestation/v1` followed by a line feed (`\n`), then the
+RFC 8785 canonical form of the envelope with the `signature` member removed.
+
+Domain separation: the free snapshot metadata (`/.well-known/bazaar-snapshot.json`) is signed over
+`bazaar-snapshot-meta/v1` + `\n` + JCS(metadata) with the same key, and the legacy `{facts, signature}` form is signed over
+sorted-key JSON of `facts` with no prefix. A signature from one of these can never verify as another.
 Signature = Ed25519 (RFC 8032), standard base64. `key_id` = first 16 hex characters of sha256(raw 32-byte public key).
 
 Signing keys are generated and held only in the production server environment. They are never committed to this
@@ -63,7 +70,12 @@ python3 scripts/verify_attestation.py response.json            # uses issuer.iss
 deno run --allow-net --allow-read scripts/verify_attestation.ts response.json --issuer issuer.json
 ```
 
-Steps: remove `signature`; JCS-canonicalize; find the key by `key_id` in the issuer document and check its
-`key_id` derivation; verify Ed25519; optionally reject when now is after `expires_at`.
+Steps (both official verifiers do all of them):
+1. Parse JSON strictly (duplicate object keys are rejected).
+2. `signature.key_id` must equal `issuer.key_id`, must be listed exactly once in the issuer document (and equal `--key-id` if given),
+   and must equal the first 16 hex chars of sha256 of that listed public key.
+3. `issued_at` and `expires_at` must be valid timestamps; `0 <= expires_at - issued_at <= 86400` s; `issued_at <= now + 60` s.
+4. Remove `signature`, build `prepay-check-attestation/v1\n` + JCS, verify Ed25519.
+5. Reject when now is after `expires_at` (unless explicitly ignored), or when the key was retired before `issued_at`.
 
 `test-vectors.json` holds JCS cases and one signed attestation (public key only) for cross-implementation tests.

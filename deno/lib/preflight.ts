@@ -160,7 +160,8 @@ export function validateChallenge(ch: any): [boolean, string[], Record<string, u
       ["asset", typeof a.asset === "string" && ADDR.test(a.asset)], ["payTo", typeof a.payTo === "string" && ADDR.test(a.payTo)],
       ["maxTimeoutSeconds", isInt(a.maxTimeoutSeconds) && a.maxTimeoutSeconds > 0 && a.maxTimeoutSeconds <= 3600]];
     for (const [f, ok] of checks) if (!ok) p.push(`accepts[${i}].${f}_invalid`);
-    out.push({ scheme: a.scheme ?? null, network: a.network ?? null, amount: amt ?? null, asset: a.asset ?? null, payTo: a.payTo ?? null });
+    const str = (x: unknown) => typeof x === "string" ? x : null; // summary: strings only (huge ints/objects -> null)
+    out.push({ scheme: str(a.scheme), network: str(a.network), amount: str(amt), asset: str(a.asset), payTo: str(a.payTo) });
   });
   return [p.length === 0, p, out];
 }
@@ -398,7 +399,10 @@ export async function preflight(url: string, opts: { resolver?: Resolver; fetche
     bazaar: await bazaarFacts(url, acc.map((a) => a.payTo as string).filter(Boolean)) };
   // Legacy {facts, signature} kept for existing verifiers; "attestation" is the v1.0 envelope (JCS-signed).
   const legacy = await sign(facts, opts.env);
-  const attestation = await attest(facts, { signer: opts.signer ?? await envSigner(opts.env), rpc: opts.rpc, now: opts.now, ttlS: opts.ttlS, issuerUrl: opts.issuerUrl });
-  return [200, { ...legacy, attestation }];
+  // Attestation failures never break the paid response: legacy facts are still served, attestation is null.
+  let attestation: unknown = null;
+  try { attestation = await attest(facts, { signer: opts.signer ?? await envSigner(opts.env), rpc: opts.rpc, now: opts.now, ttlS: opts.ttlS, issuerUrl: opts.issuerUrl }); }
+  catch (e) { console.log("attestation failed:", (e as Error).name); }
+  return [200, attestation ? { ...legacy, attestation } : { ...legacy, attestation: null, attestation_error: "attestation_unavailable" }];
 }
 function isSoc(now?: number) { return isoSec(now ?? Date.now()); }

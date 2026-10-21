@@ -26,9 +26,25 @@ export function jcs(v: unknown): string {
   if (typeof s !== "string") throw new Error("value cannot be canonicalized");
   return s;
 }
+/** Domain-separation prefixes: a signature from one domain never verifies in another (or as legacy facts). */
+export const DOMAIN_ATTESTATION = "prepay-check-attestation/v1\n";
+export const DOMAIN_SNAPSHOT_META = "bazaar-snapshot-meta/v1\n";
+export const domainBytes = (domain: string, v: unknown) => new TextEncoder().encode(domain + jcs(v));
 export const signingBytes = (envelope: Record<string, unknown>) => {
-  const { signature: _s, ...rest } = envelope; return new TextEncoder().encode(jcs(rest));
+  const { signature: _s, ...rest } = envelope; return domainBytes(DOMAIN_ATTESTATION, rest);
 };
+const ISO_SEC = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$/;
+/** Strict second-precision UTC timestamp -> ms, or null (unparseable, NaN, or not a real date). */
+export function parseIsoSec(x: unknown): number | null {
+  if (typeof x !== "string" || !ISO_SEC.test(x)) return null;
+  const t = Date.parse(x); if (!Number.isFinite(t)) return null;
+  return new Date(t).toISOString().replace(".000Z", "Z") === x ? t : null;
+}
+export const MAX_VALIDITY_S = 86400, CLOCK_SKEW_S = 60;
+/** TTL: integer >= 1 (capped at 24 h), anything else -> default 900 s. */
+export function normTtl(x: unknown): number {
+  return typeof x === "number" && Number.isInteger(x) && x >= 1 ? Math.min(x, MAX_VALIDITY_S) : DEFAULT_TTL_S;
+}
 const isoSec = (ms: number) => new Date(Math.floor(ms / 1000) * 1000).toISOString().replace(".000Z", "Z");
 
 export type PaytoCode = { address: string; kind: "eoa" | "eip7702_delegated" | "contract" | null; code_bytes: number | null; delegate?: string };
@@ -59,20 +75,21 @@ export function buildChecks(facts: any, code: Awaited<ReturnType<typeof paytoCod
   out.push({ id: "endpoint_reachable", status: reach.reachable ? "pass" : "fail", observed: reach.reachable ? (reach.http_status ?? null) : (reach.error_class ?? null) });
   out.push({ id: "http_402_returned", status: !reach.reachable ? "not_applicable" : reach.http_status === 402 ? "pass" : "fail", observed: reach.http_status ?? null, expected: 402 });
   out.push({ id: "challenge_well_formed", status: ch.valid ? "pass" : "fail", observed: ch.problems ?? [] });
-  const nets = acc.map((a) => a.network ?? null);
-  out.push({ id: "network_is_base", status: !acc.length ? "not_applicable" : nets.every((n) => BASE_NETWORKS.includes(n)) ? "pass" : "fail", observed: nets, expected: "eip155:8453" });
-  const assets = acc.map((a) => typeof a.asset === "string" ? a.asset.toLowerCase() : null);
+  const str = (x: unknown) => typeof x === "string" ? x : null; // summary carries strings only (anything else -> null)
+  const nets = acc.map((a) => str(a?.network));
+  out.push({ id: "network_is_base", status: !acc.length ? "not_applicable" : nets.every((n) => (n !== null && BASE_NETWORKS.includes(n))) ? "pass" : "fail", observed: nets, expected: "eip155:8453" });
+  const assets = acc.map((a) => str(a?.asset)?.toLowerCase() ?? null);
   out.push({ id: "asset_is_base_usdc", status: !acc.length ? "not_applicable" : assets.every((x) => x === BASE_USDC) ? "pass" : "fail", observed: assets, expected: BASE_USDC });
   const known = code.filter((c) => c.kind !== null);
-  out.push({ id: "payto_is_eoa", status: !code.length || known.length < code.length ? "not_applicable" : known.every((c) => c.kind === "eoa" || c.kind === "eip7702_delegated") ? "pass" : "fail",
-    observed: code.map((c) => ({ address: c.address, kind: c.kind })) });
+  out.push({ id: "payto_is_eoa", status: !code.length || known.length < code.length ? "not_applicable" : known.every((c) => c.kind === "eoa") ? "pass" : "fail",
+    observed: code.map((c) => c.kind === "eip7702_delegated" ? { address: c.address, kind: c.kind, delegate: c.delegate ?? null } : { address: c.address, kind: c.kind }) });
   out.push({ id: "bazaar_snapshot_available", status: bz.available ? "pass" : "fail", observed: bz.available ? (bz.snapshot_date ?? null) : (bz.reason ?? null) });
   out.push({ id: "listed_in_bazaar", status: !bz.available || bz.listed === null || bz.listed === undefined ? "not_applicable" : bz.listed ? "pass" : "fail", observed: bz.available ? (bz.listed ?? null) : null });
   return out;
 }
 
 export async function attest(facts: Record<string, any>, opts: { signer: Signer; rpc?: Rpc; now?: number; ttlS?: number; issuerUrl?: string | null }) {
-  const now = opts.now ?? Date.now(); const ttl = opts.ttlS && opts.ttlS > 0 ? Math.min(Math.floor(opts.ttlS), 86400) : DEFAULT_TTL_S;
+  const now = opts.now ?? Date.now(); const ttl = normTtl(opts.ttlS);
   const code = await paytoCode((facts.challenge?.accepts ?? []).map((a: any) => a.payTo).filter(Boolean), opts.rpc);
   const checks = buildChecks(facts, code);
   const env: Record<string, unknown> = {
@@ -88,12 +105,29 @@ export async function attest(facts: Record<string, any>, opts: { signer: Signer;
   return env;
 }
 
-/** Verify signature (+ optional expiry) with a raw 32-byte public key given as base64. */
-export async function verifyAttestation(envelope: any, publicKeyB64: string, now: number | null = Date.now()): Promise<{ ok: boolean; reason?: string }> {
-  if (envelope?.spec !== SPEC || envelope?.canonicalization !== CANON) return { ok: false, reason: "unsupported_spec" };
-  const s = envelope.signature; if (!s || s.alg !== "Ed25519") return { ok: false, reason: "bad_signature_block" };
-  const pk = await crypto.subtle.importKey("raw", b64d(publicKeyB64), { name: "Ed25519" }, false, ["verify"]);
-  if (!await crypto.subtle.verify("Ed25519", pk, b64d(s.value_b64), signingBytes(envelope))) return { ok: false, reason: "bad_signature" };
-  if (now !== null && Date.parse(envelope.expires_at) < now) return { ok: false, reason: "expired" };
+/** key_id = first 16 hex chars of sha256(raw 32-byte public key). */
+export async function keyIdOf(raw: Uint8Array): Promise<string> {
+  return Array.from(new Uint8Array(await crypto.subtle.digest("SHA-256", raw as Uint8Array<ArrayBuffer>)), (x) => x.toString(16).padStart(2, "0")).join("").slice(0, 16);
+}
+/** Verify with a raw 32-byte public key (base64). Pins signature.key_id and issuer.key_id to that key (and to
+ * expectedKeyId if given), checks dates are strict, issued_at <= now + 60 s, 0 <= expires_at - issued_at <= 86400 s,
+ * and (unless now is null) that it has not expired. */
+export async function verifyAttestation(envelope: any, publicKeyB64: string, now: number | null = Date.now(), expectedKeyId?: string): Promise<{ ok: boolean; reason?: string }> {
+  if (envelope === null || typeof envelope !== "object" || Array.isArray(envelope)) return { ok: false, reason: "not_an_object" };
+  if (envelope.spec !== SPEC || envelope.version !== VERSION || envelope.canonicalization !== CANON) return { ok: false, reason: "unsupported_spec" };
+  const s = envelope.signature; if (!s || s.alg !== "Ed25519" || typeof s.value_b64 !== "string") return { ok: false, reason: "bad_signature_block" };
+  let raw: Uint8Array; try { raw = b64d(publicKeyB64); } catch { return { ok: false, reason: "bad_public_key" }; }
+  if (raw.length !== 32) return { ok: false, reason: "bad_public_key" };
+  const kid = await keyIdOf(raw);
+  if (s.key_id !== kid || envelope.issuer?.key_id !== kid || (expectedKeyId !== undefined && expectedKeyId !== kid)) return { ok: false, reason: "key_id_mismatch" };
+  const iat = parseIsoSec(envelope.issued_at), exp = parseIsoSec(envelope.expires_at);
+  if (iat === null || exp === null) return { ok: false, reason: "bad_dates" };
+  if (exp < iat || exp - iat > MAX_VALIDITY_S * 1000) return { ok: false, reason: "bad_validity_window" };
+  let sig: Uint8Array; try { sig = b64d(s.value_b64); } catch { return { ok: false, reason: "bad_signature" }; }
+  const pk = await crypto.subtle.importKey("raw", raw as Uint8Array<ArrayBuffer>, { name: "Ed25519" }, false, ["verify"]);
+  let good = false; try { good = await crypto.subtle.verify("Ed25519", pk, sig as Uint8Array<ArrayBuffer>, signingBytes(envelope) as Uint8Array<ArrayBuffer>); } catch { good = false; }
+  if (!good) return { ok: false, reason: "bad_signature" };
+  if (now !== null && iat > now + CLOCK_SKEW_S * 1000) return { ok: false, reason: "issued_in_future" };
+  if (now !== null && exp < now) return { ok: false, reason: "expired" };
   return { ok: true };
 }

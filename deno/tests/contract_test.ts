@@ -9,7 +9,7 @@ import { useKv, rows } from "../lib/store.ts";
 import { recordSale, verifyOnchain, TRANSFER } from "../lib/stream.ts";
 import { bazaar, facClient, handler, reqFor, required, resetGuards, root, snapshotMeta, wellKnown } from "../main.ts";
 import * as SG from "../lib/settle_guard.ts";
-import { keyHistory } from "../lib/sign.ts";
+import { keyHistory, verifyJcs } from "../lib/sign.ts";
 import { AUTH_USED } from "../lib/stream.ts";
 import { headers as cdpHeaders, jwt as cdpJwt } from "../lib/cdp_auth.ts";
 
@@ -270,7 +270,8 @@ Deno.test("well-known, key history, fingerprints, signed snapshot metadata, faci
   const h: any = await keyHistory(hist);
   assertEquals([h.current.status, h.current.created_at, h.retired.length, h.retired[0].status], ["active", "2026-10-14T11:00:00Z", 1, "retired"]);
   const m: any = await snapshotMeta(); assertEquals(Object.keys(m.metadata).sort(), ["covered_listings", "last_attempt_at", "last_error", "last_failed_pages", "last_status", "last_updated", "started_at", "total_snapshots", "version"]);
-  assertEquals(m.pubkey_url, "/x402/preflight/pubkey"); assert(await verify({ facts: m.metadata, signature: m.signature }));
+  assertEquals(m.pubkey_url, "/x402/preflight/pubkey"); assert(await verifyJcs(m.metadata, m.signature));
+  assert(!await verify({ facts: m.metadata, signature: m.signature })); // domain-separated from the legacy facts form
   for (const p of ["/.well-known/x402-preflight", "/.well-known/bazaar-snapshot.json", "/.well-known/x402-preflight-key-history.json", "/bazaar/snapshots"]) {
     const res = await handler(new Request("http://h" + p), { env }); assertEquals(res.status, 200, p); await res.body?.cancel();
   }

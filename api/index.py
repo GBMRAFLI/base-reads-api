@@ -52,10 +52,9 @@ def handle(path, q):
     if path == "/x402/preflight":
         u = urllib.parse.unquote(q.get("url", ""))
         if not u: return 400, {"error": "give ?url=https://..."}
-        try: ttl = float(os.environ.get("ATTESTATION_TTL_S", ""))
-        except ValueError: ttl = None
+        t = os.environ.get("ATTESTATION_TTL_S", ""); ttl = int(t) if re.fullmatch(r"[0-9]{1,6}", t) else None  # int >= 1 else 900
         base = os.environ.get("PUBLIC_URL", "").rstrip("/")
-        return PF.preflight(u, rpc=rpc, ttl_s=ttl if ttl and ttl > 0 else None, issuer_url=base + "/.well-known/issuer.json" if base else None)
+        return PF.preflight(u, rpc=rpc, ttl_s=ttl, issuer_url=base + "/.well-known/issuer.json" if base else None)
     if path == "/base/address-intel":
         a = q.get("address", "")
         if not ADDR.match(a): return 400, {"error": "address must be 0x + 40 hex"}

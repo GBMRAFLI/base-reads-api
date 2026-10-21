@@ -50,9 +50,9 @@
   }
  ],
  "signed": {
-  "public_key_b64": "g8dwFAHY3ZFD5/1BRNpAxoZyJIMf0Rs9Rnlq7WNQpwY=",
-  "key_id": "f2419a87210df28a",
-  "signing_bytes_utf8": "{\"attestation_id\":\"00000000-0000-4000-8000-000000000001\",\"canonicalization\":\"JCS\",\"claims\":{\"checks\":[{\"id\":\"endpoint_reachable\",\"observed\":402,\"status\":\"pass\"},{\"expected\":402,\"id\":\"http_402_returned\",\"observed\":402,\"status\":\"pass\"},{\"id\":\"challenge_well_formed\",\"observed\":[],\"status\":\"pass\"},{\"expected\":\"eip155:8453\",\"id\":\"network_is_base\",\"observed\":[\"eip155:8453\"],\"status\":\"pass\"},{\"expected\":\"0x833589fcd6edb6e08f4c7c32d4f71b54bda02913\",\"id\":\"asset_is_base_usdc\",\"observed\":[\"0x833589fcd6edb6e08f4c7c32d4f71b54bda02913\"],\"status\":\"pass\"},{\"id\":\"payto_is_eoa\",\"observed\":[{\"address\":\"0x2222222222222222222222222222222222222222\",\"kind\":\"eoa\"}],\"status\":\"pass\"},{\"id\":\"bazaar_snapshot_available\",\"observed\":\"no_snapshot\",\"status\":\"fail\"},{\"id\":\"listed_in_bazaar\",\"observed\":null,\"status\":\"not_applicable\"}],\"checks_failed\":[\"bazaar_snapshot_available\"],\"checks_passed\":[\"endpoint_reachable\",\"http_402_returned\",\"challenge_well_formed\",\"network_is_base\",\"asset_is_base_usdc\",\"payto_is_eoa\"],\"facts\":{\"bazaar\":{\"available\":false,\"reason\":\"no_snapshot\"},\"challenge\":{\"accepts\":[{\"amount\":\"10000\",\"asset\":\"0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913\",\"network\":\"eip155:8453\",\"payTo\":\"0x2222222222222222222222222222222222222222\",\"scheme\":\"exact\"}],\"problems\":[],\"valid\":true},\"checked_at\":\"2026-10-21T05:00:00Z\",\"disclaimer\":\"Deterministic observations only. Not advice to pay, buy or sell.\",\"reachability\":{\"http_status\":402,\"latency_ms\":120,\"reachable\":true},\"schema\":\"prepay-check/v1\",\"target\":\"https://a.example/x\"},\"payto_code\":[{\"address\":\"0x2222222222222222222222222222222222222222\",\"code_bytes\":0,\"kind\":\"eoa\"}]},\"expires_at\":\"2026-10-21T05:15:00Z\",\"issued_at\":\"2026-10-21T05:00:00Z\",\"issuer\":{\"contact\":\"gbmrafli@agentmail.to\",\"issuer_url\":\"https://issuer.example/.well-known/issuer.json\",\"key_id\":\"f2419a87210df28a\",\"name\":\"Base Reads Pre-pay Check\"},\"spec\":\"prepay-check-attestation\",\"subject\":{\"type\":\"x402_endpoint\",\"url\":\"https://a.example/x\"},\"version\":\"1.0\"}",
+  "public_key_b64": "rEQ1j7OmLTh9dEmMUpsdv6ykIPiQguFkeJeVfI0mbKY=",
+  "key_id": "7321db2a4733688f",
+  "signing_bytes_utf8": "prepay-check-attestation/v1\n{\"attestation_id\":\"00000000-0000-4000-8000-000000000001\",\"canonicalization\":\"JCS\",\"claims\":{\"checks\":[{\"id\":\"endpoint_reachable\",\"observed\":402,\"status\":\"pass\"},{\"expected\":402,\"id\":\"http_402_returned\",\"observed\":402,\"status\":\"pass\"},{\"id\":\"challenge_well_formed\",\"observed\":[],\"status\":\"pass\"},{\"expected\":\"eip155:8453\",\"id\":\"network_is_base\",\"observed\":[\"eip155:8453\"],\"status\":\"pass\"},{\"expected\":\"0x833589fcd6edb6e08f4c7c32d4f71b54bda02913\",\"id\":\"asset_is_base_usdc\",\"observed\":[\"0x833589fcd6edb6e08f4c7c32d4f71b54bda02913\"],\"status\":\"pass\"},{\"id\":\"payto_is_eoa\",\"observed\":[{\"address\":\"0x2222222222222222222222222222222222222222\",\"kind\":\"eoa\"}],\"status\":\"pass\"},{\"id\":\"bazaar_snapshot_available\",\"observed\":\"no_snapshot\",\"status\":\"fail\"},{\"id\":\"listed_in_bazaar\",\"observed\":null,\"status\":\"not_applicable\"}],\"checks_failed\":[\"bazaar_snapshot_available\"],\"checks_passed\":[\"endpoint_reachable\",\"http_402_returned\",\"challenge_well_formed\",\"network_is_base\",\"asset_is_base_usdc\",\"payto_is_eoa\"],\"facts\":{\"bazaar\":{\"available\":false,\"reason\":\"no_snapshot\"},\"challenge\":{\"accepts\":[{\"amount\":\"10000\",\"asset\":\"0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913\",\"network\":\"eip155:8453\",\"payTo\":\"0x2222222222222222222222222222222222222222\",\"scheme\":\"exact\"}],\"problems\":[],\"valid\":true},\"checked_at\":\"2026-10-21T05:00:00Z\",\"disclaimer\":\"Deterministic observations only. Not advice to pay, buy or sell.\",\"reachability\":{\"http_status\":402,\"latency_ms\":120,\"reachable\":true},\"schema\":\"prepay-check/v1\",\"target\":\"https://a.example/x\"},\"payto_code\":[{\"address\":\"0x2222222222222222222222222222222222222222\",\"code_bytes\":0,\"kind\":\"eoa\"}]},\"expires_at\":\"2026-10-21T05:15:00Z\",\"issued_at\":\"2026-10-21T05:00:00Z\",\"issuer\":{\"contact\":\"gbmrafli@agentmail.to\",\"issuer_url\":\"https://issuer.example/.well-known/issuer.json\",\"key_id\":\"7321db2a4733688f\",\"name\":\"Base Reads Pre-pay Check\"},\"spec\":\"prepay-check-attestation\",\"subject\":{\"type\":\"x402_endpoint\",\"url\":\"https://a.example/x\"},\"version\":\"1.0\"}",
   "attestation": {
    "spec": "prepay-check-attestation",
    "version": "1.0",
@@ -62,7 +62,7 @@
    "expires_at": "2026-10-21T05:15:00Z",
    "issuer": {
     "name": "Base Reads Pre-pay Check",
-    "key_id": "f2419a87210df28a",
+    "key_id": "7321db2a4733688f",
     "issuer_url": "https://issuer.example/.well-known/issuer.json",
     "contact": "gbmrafli@agentmail.to"
    },
@@ -174,16 +174,16 @@
    },
    "signature": {
     "alg": "Ed25519",
-    "key_id": "f2419a87210df28a",
-    "value_b64": "Ng/lh1TNU9snQ3qONmdYgy6Ee12PdKqOQxgDomGM9xtG+JExRIYr8bLLly8wdUhQ3Jmu72bjVeG9+9md6+GlCg=="
+    "key_id": "7321db2a4733688f",
+    "value_b64": "UoFVsU95nLKND2t/o+FPalvrwiJxazgykhWXZx4lqgJTzz8OM+JHKdSeZqn3xZMpiDLFTVUHQmiR2VQaRhs+Cg=="
    }
   },
   "issuer": {
    "keys": [
     {
      "alg": "Ed25519",
-     "key_id": "f2419a87210df28a",
-     "public_key_b64": "g8dwFAHY3ZFD5/1BRNpAxoZyJIMf0Rs9Rnlq7WNQpwY=",
+     "key_id": "7321db2a4733688f",
+     "public_key_b64": "rEQ1j7OmLTh9dEmMUpsdv6ykIPiQguFkeJeVfI0mbKY=",
      "status": "active"
     }
    ]
