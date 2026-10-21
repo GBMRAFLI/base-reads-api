@@ -60,6 +60,8 @@ RFC 8785 canonical form of the envelope with the `signature` member removed.
 Domain separation: the free snapshot metadata (`/.well-known/bazaar-snapshot.json`) is signed over
 `bazaar-snapshot-meta/v1` + `\n` + JCS(metadata) with the same key, and the legacy `{facts, signature}` form is signed over
 sorted-key JSON of `facts` with no prefix. A signature from one of these can never verify as another.
+The prefix bytes are `7072657061792d636865636b2d6174746573746174696f6e2f76310a` (attestation) and the UTF-8 of
+`bazaar-snapshot-meta/v1\n` (snapshot metadata); `/.well-known/issuer.json` publishes both under `signing.domains`.
 Signature = Ed25519 (RFC 8032), standard base64. `key_id` = first 16 hex characters of sha256(raw 32-byte public key).
 
 Signing keys are generated and held only in the production server environment. They are never committed to this

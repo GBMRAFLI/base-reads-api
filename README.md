@@ -69,6 +69,13 @@ Ed25519PublicKey.from_public_bytes(base64.b64decode(body["signature"]["public_ke
 ```
 Then check `signature.key_id` against `GET /.well-known/x402-preflight` (or pin the fingerprint). `key_id` is the first
 16 hex characters of SHA-256 of the raw public key; `fingerprint` is `SHA256:` + base64 of the same digest.
+### Verify a v1.0 attestation (`attestation` member)
+Signed message = UTF-8 bytes of `prepay-check-attestation/v1` + LF (`\n`, hex `0a`) followed by the RFC 8785 (JCS)
+canonical JSON of the attestation with its `signature` member removed; signature = Ed25519 (RFC 8032), standard base64.
+The snapshot metadata (`/.well-known/bazaar-snapshot.json`) uses the prefix `bazaar-snapshot-meta/v1` + LF over JCS(`metadata`).
+`/.well-known/issuer.json` publishes the same rules machine-readably (`signing.domains.*.signing_prefix`) plus the keys;
+`scripts/verify_attestation.{py,ts}` implement them. Details: `spec/README.md`.
+
 Hook examples for the official clients: `examples/ts/preflight-hook.ts`, `examples/python/preflight_hook.py`.
 
 ## Facilitator
