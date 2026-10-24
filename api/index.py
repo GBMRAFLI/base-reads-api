@@ -138,8 +138,8 @@ def export(auth, q):
     given = auth[7:] if auth.startswith("Bearer ") else ""
     if len(tok) < 32 or not hmac.compare_digest(given.encode(), tok.encode()): return 401, {"error": "unauthorized"}
     since = urllib.parse.unquote(q.get("since", ""))
-    out = {n.split(".")[0]: [r for r in MS.rows(n) if not since or (r.get("startedAt") or r.get("verifiedAt") or r.get("observedAt") or r.get("incurredAt") or "") >= since] for n in EXPORT_FILES}
-    MS.reconcile(out, PAY_TO)
+    allr = MS.reconcile({n.split(".")[0]: MS.rows(n) for n in EXPORT_FILES}, PAY_TO)  # maps built from ALL rows, then filtered
+    out = {k: [r for r in v if not since or (r.get("startedAt") or r.get("verifiedAt") or r.get("observedAt") or r.get("incurredAt") or "") >= since] for k, v in allr.items()}
     return 200, {"payTo": PAY_TO, "network": NETWORK, "asset": USDC, "exportedAt": MS.iso(), "records": out}
 REPO_URL = os.environ.get("REPO_URL", "https://github.com/GBMRAFLI/base-reads-api")
 def root():

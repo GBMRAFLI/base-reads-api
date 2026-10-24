@@ -300,9 +300,10 @@ function timingSafeEq(a: string, b: string) {
 export async function exportRecords(auth: string, q: Record<string, string>, env: Deps["env"]): Promise<[number, unknown]> {
   const tok = env("EXPORT_TOKEN") ?? ""; const given = auth.startsWith("Bearer ") ? auth.slice(7) : "";
   if (tok.length < 32 || !timingSafeEq(given, tok)) return [401, { error: "unauthorized" }];
-  const since = unquote(q.since ?? ""); const c = cfg(env); const out: Record<string, unknown[]> = {};
-  for (const n of EXPORT_FILES) out[n.split(".")[0]] = (await rows(n)).filter((r: any) => !since || ((r.startedAt || r.verifiedAt || r.observedAt || r.incurredAt || "") >= since));
-  reconcile(out as Record<string, any[]>, c.PAY_TO, env);
+  const since = unquote(q.since ?? ""); const c = cfg(env); const all: Record<string, any[]> = {}; const out: Record<string, unknown[]> = {};
+  for (const n of EXPORT_FILES) all[n.split(".")[0]] = await rows(n);
+  reconcile(all, c.PAY_TO, env); // maps built from ALL rows, then filtered
+  for (const [k, v] of Object.entries(all)) out[k] = v.filter((r: any) => !since || ((r.startedAt || r.verifiedAt || r.observedAt || r.incurredAt || "") >= since));
   return [200, { payTo: c.PAY_TO, network: c.NETWORK, asset: c.USDC, exportedAt: iso(), records: out }];
 }
 const HDRS = { "Content-Type": "application/json", "X-Content-Type-Options": "nosniff", "Access-Control-Allow-Origin": "*", "Access-Control-Expose-Headers": "PAYMENT-REQUIRED, PAYMENT-RESPONSE" };

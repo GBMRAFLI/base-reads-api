@@ -49,13 +49,15 @@ def reclassify(out, pay_to):
     return o
 def reconcile(recs, pay_to):
     """Export view, in place: reclassify outcomes, then set each cost's revenue from its outcome
-    (amount only when verified_success, else 0). Costs without a matching outcome are left unchanged."""
+    (amount only when verified_success, else 0). Costs without a matching outcome get revenue 0 and revenueUnmatched=True.
+    Pass ALL rows (before any time filter) so cross-references resolve."""
     recs["outcomes"] = [reclassify(o, pay_to) for o in recs.get("outcomes", [])]
     st = {o.get("executionRef"): o.get("status") for o in recs["outcomes"]}
     amt = {e.get("id"): e.get("amount") for e in recs.get("executions", [])}
     for c in recs.get("costs", []):
         ref = c.get("executionRef")
         if ref in st: c["revenue"] = int(amt[ref]) / 1e6 if st[ref] == "verified_success" and amt.get(ref) is not None else 0.0
+        else: c["revenue"], c["revenueUnmatched"] = 0.0, True
     return recs
 
 def verify_onchain(rpc, tx, asset, pay_to, amount, payer, network="eip155:8453", attempts=4, wait=2.0, sleep=time.sleep, nonce=None):

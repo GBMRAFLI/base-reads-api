@@ -39,13 +39,14 @@ export function reclassify(out: Record<string, any>, payTo: string, env = (k: st
   return o;
 }
 /** Export view, in place: reclassify outcomes, then set each cost's revenue from its outcome
- * (amount only when verified_success, else 0). Costs without a matching outcome are left unchanged. */
+ * (amount only when verified_success, else 0). Costs without a matching outcome get revenue 0 and revenueUnmatched=true.
+ * Pass ALL rows (before any time filter) so cross-references resolve. */
 export function reconcile(recs: Record<string, any[]>, payTo: string, env = (k: string) => Deno.env.get(k)) {
   recs.outcomes = (recs.outcomes ?? []).map((o) => reclassify(o, payTo, env));
   const st = new Map(recs.outcomes.map((o) => [o.executionRef, o.status]));
   const amt = new Map((recs.executions ?? []).map((e) => [e.id, e.amount]));
   for (const c of recs.costs ?? []) {
-    if (!st.has(c.executionRef)) continue;
+    if (!st.has(c.executionRef)) { c.revenue = 0.0; c.revenueUnmatched = true; continue; }
     const a = amt.get(c.executionRef);
     c.revenue = st.get(c.executionRef) === "verified_success" && a != null ? parseInt(a) / 1e6 : 0.0;
   }
