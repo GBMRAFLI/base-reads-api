@@ -58,6 +58,46 @@ class T1(unittest.TestCase):
         oc = MS.verify_onchain(lambda m, p: self._rc(me, req["payTo"], 1000), "0x" + "ee" * 32, req["asset"], req["payTo"], "1000", me)
         out = MS.record_sale("/base/network", req, {"success": True, "payer": me, "transaction": "0x" + "ee" * 32}, ("a", "b", "c"), oc)
         self.assertEqual((out["status"], out["reason"], out["category"]), ("excluded", "self_payer", "chain_reads"))
+    def test_payer_classes(self):
+        MS = IX.MS; req = IX.req_for("/base/network"); me, mon = "0x" + "77" * 20, "0x" + "55" * 20
+        oc = {"settled": True}
+        os.environ["MONITOR_WALLETS"] = mon
+        try:
+            self.assertEqual(MS.payer_class(me.upper().replace("X", "x"), req["payTo"]), "self")
+            self.assertEqual(MS.payer_class(req["payTo"], req["payTo"]), "self")
+            self.assertEqual(MS.payer_class(mon, req["payTo"]), "monitor")
+            self.assertEqual(MS.payer_class(W2, req["payTo"], "SettledScout/1.2"), "monitor")
+            self.assertEqual(MS.payer_class(W2, req["payTo"], "vet402-probe"), "monitor")
+            self.assertEqual(MS.payer_class(W2, req["payTo"], "curl/8"), "external")
+            self.assertIsNone(MS.payer_class(None, req["payTo"]))
+            o = MS.record_sale("/base/network", req, {"success": True, "payer": mon, "transaction": "0x" + "a1" * 32}, ("a", "b", "c"), oc)
+            self.assertEqual((o["status"], o["reason"], o["payerClass"], o["externalPayer"]), ("excluded", "monitor_payer", "monitor", False))
+            o = MS.record_sale("/base/network", req, {"success": True, "payer": W2, "transaction": "0x" + "a2" * 32}, ("a", "b", "c"), oc, ua="SettledScout")
+            self.assertEqual(o["payerClass"], "monitor")
+            o = MS.record_sale("/base/network", req, {"success": True, "payer": W2, "transaction": "0x" + "a3" * 32}, ("a", "b", "c"), oc)
+            self.assertEqual((o["status"], o["payerClass"], o["externalPayer"]), ("verified_success", "external", True))
+            old = {"payer": me, "status": "verified_success", "reason": None, "externalPayer": True}
+            self.assertEqual(MS.reclassify(old, req["payTo"]), {"payer": me, "status": "excluded", "reason": "self_payer", "externalPayer": False, "payerClass": "self"})
+            self.assertEqual(MS.reclassify({"payer": W2, "payerClass": "monitor", "status": "excluded"}, req["payTo"])["payerClass"], "monitor")
+            self.assertEqual(MS.reclassify({"payer": W2, "status": "verified_success"}, req["payTo"])["externalPayer"], True)
+            os.environ["MONITOR_UA"] = ""
+            self.assertEqual(MS.payer_class(W2, req["payTo"], "SettledScout"), "monitor")  # empty = defaults
+            del os.environ["MONITOR_UA"]
+            # wallet removed from config: excluded self row returns to verified_success; unsettled one to verified_failure
+            ok = {"payer": W2, "status": "excluded", "reason": "self_payer", "onchain": {"settled": True}, "outcome": "resource_delivered"}
+            self.assertEqual((MS.reclassify(ok, req["payTo"])["status"], MS.reclassify(ok, req["payTo"])["reason"]), ("verified_success", None))
+            bad = dict(ok, onchain={"settled": False, "reason": "tx_reverted"})
+            self.assertEqual(MS.reclassify(bad, req["payTo"])["status"], "verified_failure")
+            # export reconcile: revenue follows the outcome
+            recs = {"executions": [{"id": "e1", "amount": "1000"}, {"id": "e2", "amount": "2000"}, {"id": "e3", "amount": "3000"}],
+                    "outcomes": [{"executionRef": "e1", "payer": me, "status": "verified_success"},
+                                 {"executionRef": "e2", "payer": W2, "status": "verified_success"},
+                                 dict(ok, executionRef="e3")],
+                    "costs": [{"executionRef": "e1", "revenue": 0.001}, {"executionRef": "e2", "revenue": 0.002}, {"executionRef": "e3", "revenue": 0.0}, {"executionRef": "zz", "revenue": 0.5}]}
+            MS.reconcile(recs, req["payTo"])
+            self.assertEqual([c["revenue"] for c in recs["costs"]], [0.0, 0.002, 0.003, 0.0])
+            self.assertEqual(recs["outcomes"][0]["status"], "excluded")
+        finally: os.environ.pop("MONITOR_WALLETS", None); os.environ.pop("MONITOR_UA", None)
     def test_onchain_failures(self):
         MS = IX.MS; req = IX.req_for("/base/network"); f = lambda r: MS.verify_onchain(lambda m, p: r, "0x" + "ab" * 32, req["asset"], req["payTo"], "1000", W2, sleep=lambda x: None)
         self.assertEqual(f(self._rc(W2, req["payTo"], 999))["reason"], "no_matching_usdc_transfer")
@@ -203,6 +243,43 @@ class T2(unittest.TestCase):
         IX.snapshot_loop(run_once=lambda: runs.append(1), sleep=sleeps.append, now=lambda: 1760400000.0, stop=lambda: next(n))
         self.assertEqual(len(runs), 3); self.assertTrue(all(0 < x <= 86400 for x in sleeps))
         self.assertEqual(IX.next_run_delay(86400 * 10), 900); self.assertEqual(IX.next_run_delay(86400 * 10 + 900), 86400)
+ME_R, EXT_R, P_R = "0x" + "77" * 20, "0x" + "02" * 20, "0x" + "01" * 20
+def _recs():
+    return {"executions": [{"id": "e1", "amount": "1000"}, {"id": "e2", "amount": "2000"}, {"id": "e3", "amount": "3000"}],
+            "outcomes": [{"executionRef": "e1", "payer": ME_R, "status": "verified_success"}, {"executionRef": "e2", "payer": EXT_R, "status": "verified_success"},
+                         {"executionRef": "e3", "payer": EXT_R, "status": "excluded", "reason": "self_payer", "onchain": {"settled": True}, "outcome": "resource_delivered"}],
+            "costs": [{"executionRef": "e1", "revenue": 0.001}, {"executionRef": "e2", "revenue": 0.002}, {"executionRef": "e3", "revenue": 0.0}, {"executionRef": "zz", "revenue": 0.5}]}
+class TReconcile(unittest.TestCase):
+    def test_self_zeroed(self):
+        r = IX.MS.reconcile(_recs(), P_R); self.assertEqual((r["costs"][0]["revenue"], r["outcomes"][0]["status"]), (0.0, "excluded"))
+    def test_external_kept(self):
+        r = IX.MS.reconcile(_recs(), P_R); self.assertEqual(r["costs"][1]["revenue"], 0.002); self.assertNotIn("revenueUnmatched", r["costs"][1])
+    def test_unexclude_restores(self):
+        r = IX.MS.reconcile(_recs(), P_R); self.assertEqual((r["outcomes"][2]["status"], r["costs"][2]["revenue"]), ("verified_success", 0.003))
+    def test_unmatched_cost(self):
+        r = IX.MS.reconcile(_recs(), P_R); self.assertEqual((r["costs"][3]["revenue"], r["costs"][3]["revenueUnmatched"]), (0.0, True))
+    def test_status_sync(self):
+        b = {"payer": EXT_R, "status": "excluded", "reason": "self_payer", "onchain": {"settled": True}, "outcome": "resource_delivered"}
+        self.assertEqual(IX.MS.reclassify(b, P_R)["status"], "verified_success")
+        f = IX.MS.reclassify(dict(b, outcome="not_delivered"), P_R); self.assertEqual((f["status"], f["reason"]), ("verified_failure", "resource_not_delivered"))
+        self.assertEqual(IX.MS.reclassify(dict(b, payer=ME_R, reason="monitor_payer"), P_R)["reason"], "self_payer")
+    def _since(self, tag, ex_t, oc_t):
+        ex = "exec-" + tag; A = IX.MS.append
+        A("executions.jsonl", {"id": ex, "amount": "1000", "payer": ME_R, "startedAt": ex_t})
+        A("outcomes.jsonl", {"id": "out-" + tag, "executionRef": ex, "payer": ME_R, "status": "verified_success", "verifiedAt": oc_t})
+        A("costs.jsonl", {"id": "cost-" + tag, "executionRef": ex, "revenue": 0.001, "incurredAt": oc_t})
+        return IX.export("Bearer " + "t" * 40, {"since": "2026-10-15"})[1]["records"]
+    def test_since_execution_outside_window(self):
+        r = self._since("s1", "2026-10-14T00:00:00Z", "2026-10-16T00:00:00Z")
+        self.assertNotIn("exec-s1", [e["id"] for e in r["executions"]])
+        c = next(x for x in r["costs"] if x["id"] == "cost-s1"); self.assertEqual(c["revenue"], 0.0); self.assertNotIn("revenueUnmatched", c)
+        self.assertEqual(next(x for x in r["outcomes"] if x["id"] == "out-s1")["status"], "excluded")
+    def test_since_outcome_outside_window(self):
+        r = self._since("s2", "2026-10-14T00:00:00Z", "2026-10-14T00:00:00Z"); self.assertNotIn("out-s2", [x["id"] for x in r["outcomes"]])
+        IX.MS.append("costs.jsonl", {"id": "cost-s2b", "executionRef": "exec-s2", "revenue": 0.001, "incurredAt": "2026-10-16T00:00:00Z"})
+        c = next(x for x in IX.export("Bearer " + "t" * 40, {"since": "2026-10-15"})[1]["records"]["costs"] if x["id"] == "cost-s2b")
+        self.assertEqual(c["revenue"], 0.0); self.assertNotIn("revenueUnmatched", c)
+
 class T3(unittest.TestCase):
     def test_export_auth(self):
         self.assertEqual(IX.export("", {})[0], 401); self.assertEqual(IX.export("Bearer wrong", {})[0], 401)

@@ -5,9 +5,9 @@ import { decryptPem, publicKeyInfo, resetKey, sign, verify } from "../lib/sign.t
 import { checkUrl, IndexAssembler, validateChallenge, preflight, saveIndex, bazaarFacts, clearIndexCache } from "../lib/preflight.ts";
 import { ROUTES } from "../lib/routes.ts";
 import { rid } from "../lib/util.ts";
-import { useKv, rows } from "../lib/store.ts";
-import { recordSale, verifyOnchain, TRANSFER } from "../lib/stream.ts";
-import { bazaar, facClient, handler, reqFor, required, resetGuards, root, snapshotMeta, snapshotSummary, wellKnown } from "../main.ts";
+import { useKv, rows, append } from "../lib/store.ts";
+import { payerClass, reclassify, reconcile, recordSale, verifyOnchain, TRANSFER } from "../lib/stream.ts";
+import { bazaar, exportRecords, facClient, handler, reqFor, required, resetGuards, root, snapshotMeta, snapshotSummary, wellKnown } from "../main.ts";
 import * as SG from "../lib/settle_guard.ts";
 import { keyHistory, verifyJcs } from "../lib/sign.ts";
 import { AUTH_USED } from "../lib/stream.ts";
@@ -153,6 +153,33 @@ Deno.test("on-chain check and outcome statuses match Python rules", async () => 
   assertEquals([self.status, self.reason, self.category], ["excluded", "self_payer", "endpoint_check"]);
   const inc = await recordSale("/base/network", req, { success: true, payer: W, transaction: "0x" + "ab".repeat(32) }, ["a", "b", "c"], await f(null), true, env) as any;
   assertEquals(inc.status, "inconclusive");
+});
+Deno.test("payer classes: self, monitor (wallet or UA), external; export reclassifies old rows", async () => {
+  const req = reqFor("/base/network", env); const W = "0x" + "02".repeat(20), ME = "0x" + "77".repeat(20), MON = "0x" + "55".repeat(20);
+  const e2 = (k: string) => k === "MONITOR_WALLETS" ? MON : env(k);
+  assertEquals(payerClass(ME, req.payTo, e2), "self"); assertEquals(payerClass(req.payTo, req.payTo, e2), "self");
+  assertEquals(payerClass(MON, req.payTo, e2), "monitor"); assertEquals(payerClass(W, req.payTo, e2, "SettledScout/1.2"), "monitor");
+  assertEquals(payerClass(W, req.payTo, e2, "vet402-probe"), "monitor"); assertEquals(payerClass(W, req.payTo, e2, "curl/8"), "external");
+  assertEquals(payerClass(null, req.payTo, e2), null);
+  let o = await recordSale("/base/network", req, { success: true, payer: MON, transaction: "0x" + "a1".repeat(32) }, ["a", "b", "c"], { settled: true }, true, e2) as any;
+  assertEquals([o.status, o.reason, o.payerClass, o.externalPayer], ["excluded", "monitor_payer", "monitor", false]);
+  o = await recordSale("/base/network", req, { success: true, payer: W, transaction: "0x" + "a2".repeat(32) }, ["a", "b", "c"], { settled: true }, true, e2, null, "SettledScout") as any;
+  assertEquals(o.payerClass, "monitor");
+  o = await recordSale("/base/network", req, { success: true, payer: W, transaction: "0x" + "a3".repeat(32) }, ["a", "b", "c"], { settled: true }, true, e2) as any;
+  assertEquals([o.status, o.payerClass, o.externalPayer], ["verified_success", "external", true]);
+  assertEquals(reclassify({ payer: ME, status: "verified_success", reason: null, externalPayer: true }, req.payTo, e2),
+    { payer: ME, status: "excluded", reason: "self_payer", externalPayer: false, payerClass: "self" });
+  assertEquals(reclassify({ payer: W, payerClass: "monitor", status: "excluded" }, req.payTo, e2).payerClass, "monitor");
+  assertEquals(reclassify({ payer: W, status: "verified_success" }, req.payTo, e2).externalPayer, true);
+  assertEquals(payerClass(W, req.payTo, (k) => k === "MONITOR_UA" ? "" : env(k), "SettledScout"), "monitor"); // empty = defaults
+  const ok = { payer: W, status: "excluded", reason: "self_payer", onchain: { settled: true }, outcome: "resource_delivered" };
+  const back = reclassify(ok, req.payTo, e2); assertEquals([back.status, back.reason], ["verified_success", null]);
+  assertEquals(reclassify({ ...ok, onchain: { settled: false, reason: "tx_reverted" } }, req.payTo, e2).status, "verified_failure");
+  const recs: Record<string, any[]> = { executions: [{ id: "e1", amount: "1000" }, { id: "e2", amount: "2000" }, { id: "e3", amount: "3000" }],
+    outcomes: [{ executionRef: "e1", payer: ME, status: "verified_success" }, { executionRef: "e2", payer: W, status: "verified_success" }, { ...ok, executionRef: "e3" }],
+    costs: [{ executionRef: "e1", revenue: 0.001 }, { executionRef: "e2", revenue: 0.002 }, { executionRef: "e3", revenue: 0 }, { executionRef: "zz", revenue: 0.5 }] };
+  reconcile(recs, req.payTo, e2);
+  assertEquals(recs.costs.map((c) => c.revenue), [0, 0.002, 0.003, 0]); assertEquals(recs.outcomes[0].status, "excluded");
 });
 Deno.test("pyDumps matches Python spacing", () => { assertEquals(pyDumps({ a: [1, "x"], b: { c: null } }), '{"a": [1, "x"], "b": {"c": null}}'); });
 
@@ -1106,4 +1133,43 @@ Deno.test("full snapshot: complete only on a short page; page cap and time budge
   const r5: any = await S.runSnapshot(feed(9000), 50, "2031-01-05", S.TIME_BUDGET_MS, clock);
   assertEquals([r5.status, r5.index.coverage.stopped, calls], ["partial", "time_budget", 2]);
   const PF = await import("../lib/preflight.ts"); assertEquals(PF.IDX_CACHE_MAX, 3);
+});
+
+const ME_R = "0x" + "77".repeat(20), EXT_R = "0x" + "02".repeat(20);
+const recsR = (): Record<string, any[]> => ({
+  executions: [{ id: "e1", amount: "1000" }, { id: "e2", amount: "2000" }, { id: "e3", amount: "3000" }],
+  outcomes: [{ executionRef: "e1", payer: ME_R, status: "verified_success" }, { executionRef: "e2", payer: EXT_R, status: "verified_success" },
+    { executionRef: "e3", payer: EXT_R, status: "excluded", reason: "self_payer", onchain: { settled: true }, outcome: "resource_delivered" }],
+  costs: [{ executionRef: "e1", revenue: 0.001 }, { executionRef: "e2", revenue: 0.002 }, { executionRef: "e3", revenue: 0 }, { executionRef: "zz", revenue: 0.5 }] });
+Deno.test("reconcile: self revenue zeroed", () => { const r = reconcile(recsR(), "0x" + "01".repeat(20), env); assertEquals([r.costs[0].revenue, r.outcomes[0].status], [0, "excluded"]); });
+Deno.test("reconcile: external revenue kept", () => { const r = reconcile(recsR(), "0x" + "01".repeat(20), env); assertEquals([r.costs[1].revenue, r.costs[1].revenueUnmatched], [0.002, undefined]); });
+Deno.test("reconcile: un-excluded row restores revenue", () => { const r = reconcile(recsR(), "0x" + "01".repeat(20), env); assertEquals([r.outcomes[2].status, r.costs[2].revenue], ["verified_success", 0.003]); });
+Deno.test("reconcile: unmatched cost gets 0 and flag", () => { const r = reconcile(recsR(), "0x" + "01".repeat(20), env); assertEquals([r.costs[3].revenue, r.costs[3].revenueUnmatched], [0, true]); });
+Deno.test("status sync: wallet removed -> verified_success or verified_failure; self<->monitor reason", () => {
+  const P = "0x" + "01".repeat(20), base = { payer: EXT_R, status: "excluded", reason: "self_payer", onchain: { settled: true }, outcome: "resource_delivered" };
+  assertEquals(reclassify(base, P, env).status, "verified_success");
+  assertEquals([reclassify({ ...base, outcome: "not_delivered" }, P, env).status, reclassify({ ...base, outcome: "not_delivered" }, P, env).reason], ["verified_failure", "resource_not_delivered"]);
+  assertEquals(reclassify({ ...base, payer: ME_R, reason: "monitor_payer" }, P, env).reason, "self_payer");
+});
+async function sinceCase(tag: string, exT: string, ocT: string) {
+  const ex = `exec-${tag}`, tx = "0x" + tag;
+  await append("executions.jsonl", { id: ex, amount: "1000", payer: ME_R, startedAt: exT });
+  await append("outcomes.jsonl", { id: `out-${tag}`, executionRef: ex, payer: ME_R, status: "verified_success", verifiedAt: ocT });
+  await append("costs.jsonl", { id: `cost-${tag}`, executionRef: ex, revenue: 0.001, incurredAt: ocT, evidenceRef: tx });
+  const [, o] = await exportRecords("Bearer " + TOKEN, { since: "2026-10-15" }, env) as any;
+  return o.records;
+}
+Deno.test("export since: execution outside window, outcome+cost inside -> still reconciled", async () => {
+  const r = await sinceCase("s1", "2026-10-14T00:00:00Z", "2026-10-16T00:00:00Z");
+  assertEquals(r.executions.some((e: any) => e.id === "exec-s1"), false);
+  const c = r.costs.find((x: any) => x.id === "cost-s1"); assertEquals([c.revenue, c.revenueUnmatched], [0, undefined]);
+  assertEquals(r.outcomes.find((x: any) => x.id === "out-s1").status, "excluded");
+});
+Deno.test("export since: outcome outside window, cost inside -> matched via all rows", async () => {
+  const r = await sinceCase("s2", "2026-10-14T00:00:00Z", "2026-10-14T00:00:00Z");
+  assertEquals(r.outcomes.some((x: any) => x.id === "out-s2"), false);
+  // move only the cost into the window
+  await append("costs.jsonl", { id: "cost-s2b", executionRef: "exec-s2", revenue: 0.001, incurredAt: "2026-10-16T00:00:00Z" });
+  const [, o] = await exportRecords("Bearer " + TOKEN, { since: "2026-10-15" }, env) as any;
+  const c = o.records.costs.find((x: any) => x.id === "cost-s2b"); assertEquals([c.revenue, c.revenueUnmatched], [0, undefined]);
 });
