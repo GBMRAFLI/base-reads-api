@@ -6,7 +6,7 @@ import { checkUrl, IndexAssembler, validateChallenge, preflight, saveIndex, baza
 import { ROUTES } from "../lib/routes.ts";
 import { rid } from "../lib/util.ts";
 import { useKv, rows } from "../lib/store.ts";
-import { payerClass, reclassify, recordSale, verifyOnchain, TRANSFER } from "../lib/stream.ts";
+import { payerClass, reclassify, reconcile, recordSale, verifyOnchain, TRANSFER } from "../lib/stream.ts";
 import { bazaar, facClient, handler, reqFor, required, resetGuards, root, snapshotMeta, snapshotSummary, wellKnown } from "../main.ts";
 import * as SG from "../lib/settle_guard.ts";
 import { keyHistory, verifyJcs } from "../lib/sign.ts";
@@ -171,6 +171,15 @@ Deno.test("payer classes: self, monitor (wallet or UA), external; export reclass
     { payer: ME, status: "excluded", reason: "self_payer", externalPayer: false, payerClass: "self" });
   assertEquals(reclassify({ payer: W, payerClass: "monitor", status: "excluded" }, req.payTo, e2).payerClass, "monitor");
   assertEquals(reclassify({ payer: W, status: "verified_success" }, req.payTo, e2).externalPayer, true);
+  assertEquals(payerClass(W, req.payTo, (k) => k === "MONITOR_UA" ? "" : env(k), "SettledScout"), "monitor"); // empty = defaults
+  const ok = { payer: W, status: "excluded", reason: "self_payer", onchain: { settled: true }, outcome: "resource_delivered" };
+  const back = reclassify(ok, req.payTo, e2); assertEquals([back.status, back.reason], ["verified_success", null]);
+  assertEquals(reclassify({ ...ok, onchain: { settled: false, reason: "tx_reverted" } }, req.payTo, e2).status, "verified_failure");
+  const recs: Record<string, any[]> = { executions: [{ id: "e1", amount: "1000" }, { id: "e2", amount: "2000" }, { id: "e3", amount: "3000" }],
+    outcomes: [{ executionRef: "e1", payer: ME, status: "verified_success" }, { executionRef: "e2", payer: W, status: "verified_success" }, { ...ok, executionRef: "e3" }],
+    costs: [{ executionRef: "e1", revenue: 0.001 }, { executionRef: "e2", revenue: 0.002 }, { executionRef: "e3", revenue: 0 }, { executionRef: "zz", revenue: 0.5 }] };
+  reconcile(recs, req.payTo, e2);
+  assertEquals(recs.costs.map((c) => c.revenue), [0, 0.002, 0.003, 0.5]); assertEquals(recs.outcomes[0].status, "excluded");
 });
 Deno.test("pyDumps matches Python spacing", () => { assertEquals(pyDumps({ a: [1, "x"], b: { c: null } }), '{"a": [1, "x"], "b": {"c": null}}'); });
 

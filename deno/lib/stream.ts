@@ -21,7 +21,7 @@ export function payerClass(payer: string | null, payTo: string, env = (k: string
   if (selfWallets(payTo, env).has(p)) return "self";
   if (csv(env("MONITOR_WALLETS")).has(p)) return "monitor";
   const u = (ua ?? "").toLowerCase();
-  if (u && [...csv(env("MONITOR_UA") ?? MONITOR_UA_DEFAULT)].some((t) => u.includes(t))) return "monitor";
+  if (u && [...(csv(env("MONITOR_UA")).size ? csv(env("MONITOR_UA")) : csv(MONITOR_UA_DEFAULT))].some((t) => u.includes(t))) return "monitor";
   return "external";
 }
 /** Export-time view: re-apply the current wallet config to a stored outcome (older rows predate payerClass). */
@@ -29,8 +29,27 @@ export function reclassify(out: Record<string, any>, payTo: string, env = (k: st
   const o = { ...out }; let cls = payerClass(o.payer ?? null, payTo, env);
   if (o.payerClass === "monitor" && cls === "external") cls = "monitor"; // UA-based tag is only known at record time
   o.payerClass = cls; o.externalPayer = cls === "external";
-  if (o.status === "verified_success" && (cls === "self" || cls === "monitor")) { o.status = "excluded"; o.reason = cls + "_payer"; }
+  const own = cls === "self" || cls === "monitor";
+  if (o.status === "verified_success" && own) { o.status = "excluded"; o.reason = cls + "_payer"; }
+  else if (o.status === "excluded" && (o.reason === "self_payer" || o.reason === "monitor_payer")) {
+    if (own) o.reason = cls + "_payer";
+    else if (cls === "external" && o.onchain?.settled === true && o.outcome === "resource_delivered") { o.status = "verified_success"; o.reason = null; }
+    else if (cls === "external") { o.status = "verified_failure"; o.reason = o.onchain?.reason || "resource_not_delivered"; }
+  }
   return o;
+}
+/** Export view, in place: reclassify outcomes, then set each cost's revenue from its outcome
+ * (amount only when verified_success, else 0). Costs without a matching outcome are left unchanged. */
+export function reconcile(recs: Record<string, any[]>, payTo: string, env = (k: string) => Deno.env.get(k)) {
+  recs.outcomes = (recs.outcomes ?? []).map((o) => reclassify(o, payTo, env));
+  const st = new Map(recs.outcomes.map((o) => [o.executionRef, o.status]));
+  const amt = new Map((recs.executions ?? []).map((e) => [e.id, e.amount]));
+  for (const c of recs.costs ?? []) {
+    if (!st.has(c.executionRef)) continue;
+    const a = amt.get(c.executionRef);
+    c.revenue = st.get(c.executionRef) === "verified_success" && a != null ? parseInt(a) / 1e6 : 0.0;
+  }
+  return recs;
 }
 export async function verifyOnchain(rpc: Rpc, tx: string | undefined, asset: string, payTo: string, amount: string, payer: string | undefined,
   network = "eip155:8453", attempts = 4, wait = 2000, sleep = (ms: number) => new Promise((r) => setTimeout(r, ms)), nonce?: string | null, minConf = 1) {

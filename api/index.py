@@ -138,7 +138,8 @@ def export(auth, q):
     given = auth[7:] if auth.startswith("Bearer ") else ""
     if len(tok) < 32 or not hmac.compare_digest(given.encode(), tok.encode()): return 401, {"error": "unauthorized"}
     since = urllib.parse.unquote(q.get("since", ""))
-    out = {n.split(".")[0]: [MS.reclassify(r, PAY_TO) if n == "outcomes.jsonl" else r for r in MS.rows(n) if not since or (r.get("startedAt") or r.get("verifiedAt") or r.get("observedAt") or r.get("incurredAt") or "") >= since] for n in EXPORT_FILES}
+    out = {n.split(".")[0]: [r for r in MS.rows(n) if not since or (r.get("startedAt") or r.get("verifiedAt") or r.get("observedAt") or r.get("incurredAt") or "") >= since] for n in EXPORT_FILES}
+    MS.reconcile(out, PAY_TO)
     return 200, {"payTo": PAY_TO, "network": NETWORK, "asset": USDC, "exportedAt": MS.iso(), "records": out}
 REPO_URL = os.environ.get("REPO_URL", "https://github.com/GBMRAFLI/base-reads-api")
 def root():
@@ -386,9 +387,11 @@ def deliver_pending(key, pend, path, q, qs, r, check, who):
     if code != 200: REPLAY.set_pending(key, pend); return code, out, {}
     log_sale(path, r, st, pend["times"], oc, qs, True)
     return 200, out, pay_resp(True, pend["tx"], who)
+import threading
+_REQ = threading.local()  # per-request User-Agent for payer classification (not stored)
 def log_sale(path, r, st, times, oc, qs, served):
     try:
-        MS.record_sale(path, r, st, times, oc, served, ref=clean_ref(qs))
+        MS.record_sale(path, r, st, times, oc, served, ref=clean_ref(qs), ua=getattr(_REQ, "ua", None))
         MS.record_observation(path, __import__("hashlib").sha256(strip_ref(qs).encode()).hexdigest()[:16], 200 if served else 402, None)
     except Exception as e: print("sales log write failed:", type(e).__name__, flush=True)
 def log_mismatch(path, why):
@@ -433,6 +436,7 @@ class handler(BaseHTTPRequestHandler):
         t_req = iso(time.time())
         sig = s.headers.get("PAYMENT-SIGNATURE") or s.headers.get("X-PAYMENT")
         if not sig: pr = required(path, s.headers.get("Host", "")); return s._send(402, pr, {"PAYMENT-REQUIRED": b64(pr)})
+        _REQ.ua = s.headers.get("User-Agent")
         code, out, hd = paid(path, q, qs, sig, t_req, ip=s.client_address[0])
         return s._send(code, out, hd)
     def _send(s, code, obj, hd={}, ctype="application/json"):

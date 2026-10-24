@@ -33,7 +33,7 @@ def payer_class(payer, pay_to, ua=None):
     if p in self_wallets(pay_to): return "self"
     if p in _csv("MONITOR_WALLETS"): return "monitor"
     u = (ua or "").lower()
-    if u and any(t in u for t in _csv("MONITOR_UA", MONITOR_UA_DEFAULT)): return "monitor"
+    if u and any(t in u for t in (_csv("MONITOR_UA") or set(MONITOR_UA_DEFAULT.split(",")))): return "monitor"
     return "external"
 def reclassify(out, pay_to):
     """Export-time view: re-apply the current wallet config to a stored outcome (older rows predate payerClass)."""
@@ -42,7 +42,21 @@ def reclassify(out, pay_to):
     if stored == "monitor" and cls == "external": cls = "monitor"  # UA-based tag is only known at record time
     o["payerClass"], o["externalPayer"] = cls, cls == "external"
     if o.get("status") == "verified_success" and cls in ("self", "monitor"): o["status"], o["reason"] = "excluded", cls + "_payer"
+    elif o.get("status") == "excluded" and o.get("reason") in ("self_payer", "monitor_payer"):
+        if cls in ("self", "monitor"): o["reason"] = cls + "_payer"
+        elif cls == "external" and (o.get("onchain") or {}).get("settled") is True and o.get("outcome") == "resource_delivered": o["status"], o["reason"] = "verified_success", None
+        elif cls == "external": o["status"], o["reason"] = "verified_failure", (o.get("onchain") or {}).get("reason") or "resource_not_delivered"
     return o
+def reconcile(recs, pay_to):
+    """Export view, in place: reclassify outcomes, then set each cost's revenue from its outcome
+    (amount only when verified_success, else 0). Costs without a matching outcome are left unchanged."""
+    recs["outcomes"] = [reclassify(o, pay_to) for o in recs.get("outcomes", [])]
+    st = {o.get("executionRef"): o.get("status") for o in recs["outcomes"]}
+    amt = {e.get("id"): e.get("amount") for e in recs.get("executions", [])}
+    for c in recs.get("costs", []):
+        ref = c.get("executionRef")
+        if ref in st: c["revenue"] = int(amt[ref]) / 1e6 if st[ref] == "verified_success" and amt.get(ref) is not None else 0.0
+    return recs
 
 def verify_onchain(rpc, tx, asset, pay_to, amount, payer, network="eip155:8453", attempts=4, wait=2.0, sleep=time.sleep, nonce=None):
     """Read-only Base check: receipt status=1 and a USDC Transfer(payer -> pay_to, value >= amount) in the tx logs.

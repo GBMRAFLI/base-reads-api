@@ -128,7 +128,7 @@ Fetched 3 free public Bazaar pages (3000 listings, `bazaar_total≈38204`) and b
 The Python reference (`api/`) does **not** yet apply the page cap, status model, or tiering — Deno Deploy is production.
 
 Entry point `deno/main.ts`; env: `SIGNING_KEY_PASSPHRASE`, `SIGNING_KEY_ENC_B64`, `EXPORT_TOKEN` (+ optional `PAY_TO_ADDRESS`,
-`SELF_WALLETS`, `MONITOR_WALLETS`, `MONITOR_UA`, `PUBLIC_URL`, `RPC`, `FACILITATOR`, `NETWORK`, `SNAPSHOT_MAX_PAGES`). Contract fixtures come from the Python reference
+`SELF_WALLETS`, `PUBLIC_URL`, `RPC`, `FACILITATOR`, `NETWORK`, `SNAPSHOT_MAX_PAGES`). Contract fixtures come from the Python reference
 (`python scripts/gen_contract_fixture.py`); `tests/fixtures/py_signed.json` holds a public THROWAWAY test key only.
 
 ## Bazaar discovery and the CDP facilitator (optional)

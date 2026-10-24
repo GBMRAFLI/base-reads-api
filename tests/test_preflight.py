@@ -80,7 +80,24 @@ class T1(unittest.TestCase):
             self.assertEqual(MS.reclassify(old, req["payTo"]), {"payer": me, "status": "excluded", "reason": "self_payer", "externalPayer": False, "payerClass": "self"})
             self.assertEqual(MS.reclassify({"payer": W2, "payerClass": "monitor", "status": "excluded"}, req["payTo"])["payerClass"], "monitor")
             self.assertEqual(MS.reclassify({"payer": W2, "status": "verified_success"}, req["payTo"])["externalPayer"], True)
-        finally: del os.environ["MONITOR_WALLETS"]
+            os.environ["MONITOR_UA"] = ""
+            self.assertEqual(MS.payer_class(W2, req["payTo"], "SettledScout"), "monitor")  # empty = defaults
+            del os.environ["MONITOR_UA"]
+            # wallet removed from config: excluded self row returns to verified_success; unsettled one to verified_failure
+            ok = {"payer": W2, "status": "excluded", "reason": "self_payer", "onchain": {"settled": True}, "outcome": "resource_delivered"}
+            self.assertEqual((MS.reclassify(ok, req["payTo"])["status"], MS.reclassify(ok, req["payTo"])["reason"]), ("verified_success", None))
+            bad = dict(ok, onchain={"settled": False, "reason": "tx_reverted"})
+            self.assertEqual(MS.reclassify(bad, req["payTo"])["status"], "verified_failure")
+            # export reconcile: revenue follows the outcome
+            recs = {"executions": [{"id": "e1", "amount": "1000"}, {"id": "e2", "amount": "2000"}, {"id": "e3", "amount": "3000"}],
+                    "outcomes": [{"executionRef": "e1", "payer": me, "status": "verified_success"},
+                                 {"executionRef": "e2", "payer": W2, "status": "verified_success"},
+                                 dict(ok, executionRef="e3")],
+                    "costs": [{"executionRef": "e1", "revenue": 0.001}, {"executionRef": "e2", "revenue": 0.002}, {"executionRef": "e3", "revenue": 0.0}, {"executionRef": "zz", "revenue": 0.5}]}
+            MS.reconcile(recs, req["payTo"])
+            self.assertEqual([c["revenue"] for c in recs["costs"]], [0.0, 0.002, 0.003, 0.5])
+            self.assertEqual(recs["outcomes"][0]["status"], "excluded")
+        finally: os.environ.pop("MONITOR_WALLETS", None); os.environ.pop("MONITOR_UA", None)
     def test_onchain_failures(self):
         MS = IX.MS; req = IX.req_for("/base/network"); f = lambda r: MS.verify_onchain(lambda m, p: r, "0x" + "ab" * 32, req["asset"], req["payTo"], "1000", W2, sleep=lambda x: None)
         self.assertEqual(f(self._rc(W2, req["payTo"], 999))["reason"], "no_matching_usdc_transfer")
