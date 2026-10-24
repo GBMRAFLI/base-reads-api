@@ -16,13 +16,13 @@ import { CANON, CONTACT, DOMAIN_ATTESTATION, DOMAIN_SNAPSHOT_META, ISSUER_NAME, 
 import ATT_SCHEMA from "../spec/prepay-check-attestation-v1.schema.json" with { type: "json" };
 import { scheduledSnapshot, latestSnapStatus, loadFail, mapErrorCode } from "./lib/snapshot.ts";
 import { EXPORT_FILES, kv, rows } from "./lib/store.ts";
-import { recordObservation, recordSale, verifyOnchain } from "./lib/stream.ts";
+import { recordObservation, recordSale, reclassify, verifyOnchain } from "./lib/stream.ts";
 import { ADDR, b64json, iso, pyQuery, sha256hex, unquote } from "./lib/util.ts";
 
 const USDCS: Record<string, string> = { "eip155:8453": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913", "eip155:84532": "0x036CbD53842c5426634e7929541eC2318f3dCF7e" };
 export type Deps = { env: (k: string) => string | undefined; rpc?: Rpc; fac?: (p: string, body: unknown) => Promise<any>;
   resolver?: Resolver; fetcher?: Fetcher; background?: (p: Promise<unknown>) => void;
-  check?: (tx: string, r: any, payer: string | undefined) => Promise<any>; ip?: string;
+  check?: (tx: string, r: any, payer: string | undefined) => Promise<any>; ip?: string; ua?: string | null;
  };
 const cfg = (env: Deps["env"]) => {
   const NETWORK = env("NETWORK") || "eip155:8453"; // empty NETWORK= means mainnet
@@ -301,7 +301,7 @@ export async function exportRecords(auth: string, q: Record<string, string>, env
   const tok = env("EXPORT_TOKEN") ?? ""; const given = auth.startsWith("Bearer ") ? auth.slice(7) : "";
   if (tok.length < 32 || !timingSafeEq(given, tok)) return [401, { error: "unauthorized" }];
   const since = unquote(q.since ?? ""); const c = cfg(env); const out: Record<string, unknown[]> = {};
-  for (const n of EXPORT_FILES) out[n.split(".")[0]] = (await rows(n)).filter((r: any) => !since || ((r.startedAt || r.verifiedAt || r.observedAt || r.incurredAt || "") >= since));
+  for (const n of EXPORT_FILES) out[n.split(".")[0]] = (await rows(n)).map((r: any) => n === "outcomes.jsonl" ? reclassify(r, c.PAY_TO, env) : r).filter((r: any) => !since || ((r.startedAt || r.verifiedAt || r.observedAt || r.incurredAt || "") >= since));
   return [200, { payTo: c.PAY_TO, network: c.NETWORK, asset: c.USDC, exportedAt: iso(), records: out }];
 }
 const HDRS = { "Content-Type": "application/json", "X-Content-Type-Options": "nosniff", "Access-Control-Allow-Origin": "*", "Access-Control-Expose-Headers": "PAYMENT-REQUIRED, PAYMENT-RESPONSE" };
@@ -373,7 +373,7 @@ async function handleGet(req: Request, d: Deps): Promise<Response> {
     }
     const pr = required(path, req.headers.get("Host") ?? "", env); return send(402, pr, { "PAYMENT-REQUIRED": b64(pr) });
   }
-  const [code, out, hd] = await paid(path, q, qs, sig, tReq, d, c, rpc, fac, req.headers.get("Host") ?? "");
+  const [code, out, hd] = await paid(path, q, qs, sig, tReq, { ...d, ua: d.ua ?? req.headers.get("User-Agent") }, c, rpc, fac, req.headers.get("Host") ?? "");
   return send(code, out, hd);
 }
 
@@ -465,7 +465,7 @@ async function paid(path: string, q: Record<string, string>, qs: string, sig: st
   const sale = (tx: string) => ({ success: true, transaction: tx, payer: who, network: N });
   const log = (tx: string, oc: any, served: boolean, times: [string, string, string]) => {
     bg((async () => {
-      try { await recordSale(path, r, sale(tx), times, oc, served, env, cleanRef(qs)); await recordObservation(path, (await sha256hex(stripRef(qs))).slice(0, 16), served ? 200 : 402, null); }
+      try { await recordSale(path, r, sale(tx), times, oc, served, env, cleanRef(qs), d.ua ?? null); await recordObservation(path, (await sha256hex(stripRef(qs))).slice(0, 16), served ? 200 : 402, null); }
       catch (e) { console.log("sales log write failed:", (e as Error).name); }
     })());
   };

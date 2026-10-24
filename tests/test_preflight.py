@@ -58,6 +58,29 @@ class T1(unittest.TestCase):
         oc = MS.verify_onchain(lambda m, p: self._rc(me, req["payTo"], 1000), "0x" + "ee" * 32, req["asset"], req["payTo"], "1000", me)
         out = MS.record_sale("/base/network", req, {"success": True, "payer": me, "transaction": "0x" + "ee" * 32}, ("a", "b", "c"), oc)
         self.assertEqual((out["status"], out["reason"], out["category"]), ("excluded", "self_payer", "chain_reads"))
+    def test_payer_classes(self):
+        MS = IX.MS; req = IX.req_for("/base/network"); me, mon = "0x" + "77" * 20, "0x" + "55" * 20
+        oc = {"settled": True}
+        os.environ["MONITOR_WALLETS"] = mon
+        try:
+            self.assertEqual(MS.payer_class(me.upper().replace("X", "x"), req["payTo"]), "self")
+            self.assertEqual(MS.payer_class(req["payTo"], req["payTo"]), "self")
+            self.assertEqual(MS.payer_class(mon, req["payTo"]), "monitor")
+            self.assertEqual(MS.payer_class(W2, req["payTo"], "SettledScout/1.2"), "monitor")
+            self.assertEqual(MS.payer_class(W2, req["payTo"], "vet402-probe"), "monitor")
+            self.assertEqual(MS.payer_class(W2, req["payTo"], "curl/8"), "external")
+            self.assertIsNone(MS.payer_class(None, req["payTo"]))
+            o = MS.record_sale("/base/network", req, {"success": True, "payer": mon, "transaction": "0x" + "a1" * 32}, ("a", "b", "c"), oc)
+            self.assertEqual((o["status"], o["reason"], o["payerClass"], o["externalPayer"]), ("excluded", "monitor_payer", "monitor", False))
+            o = MS.record_sale("/base/network", req, {"success": True, "payer": W2, "transaction": "0x" + "a2" * 32}, ("a", "b", "c"), oc, ua="SettledScout")
+            self.assertEqual(o["payerClass"], "monitor")
+            o = MS.record_sale("/base/network", req, {"success": True, "payer": W2, "transaction": "0x" + "a3" * 32}, ("a", "b", "c"), oc)
+            self.assertEqual((o["status"], o["payerClass"], o["externalPayer"]), ("verified_success", "external", True))
+            old = {"payer": me, "status": "verified_success", "reason": None, "externalPayer": True}
+            self.assertEqual(MS.reclassify(old, req["payTo"]), {"payer": me, "status": "excluded", "reason": "self_payer", "externalPayer": False, "payerClass": "self"})
+            self.assertEqual(MS.reclassify({"payer": W2, "payerClass": "monitor", "status": "excluded"}, req["payTo"])["payerClass"], "monitor")
+            self.assertEqual(MS.reclassify({"payer": W2, "status": "verified_success"}, req["payTo"])["externalPayer"], True)
+        finally: del os.environ["MONITOR_WALLETS"]
     def test_onchain_failures(self):
         MS = IX.MS; req = IX.req_for("/base/network"); f = lambda r: MS.verify_onchain(lambda m, p: r, "0x" + "ab" * 32, req["asset"], req["payTo"], "1000", W2, sleep=lambda x: None)
         self.assertEqual(f(self._rc(W2, req["payTo"], 999))["reason"], "no_matching_usdc_transfer")

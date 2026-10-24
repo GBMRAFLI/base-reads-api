@@ -6,7 +6,7 @@ import { checkUrl, IndexAssembler, validateChallenge, preflight, saveIndex, baza
 import { ROUTES } from "../lib/routes.ts";
 import { rid } from "../lib/util.ts";
 import { useKv, rows } from "../lib/store.ts";
-import { recordSale, verifyOnchain, TRANSFER } from "../lib/stream.ts";
+import { payerClass, reclassify, recordSale, verifyOnchain, TRANSFER } from "../lib/stream.ts";
 import { bazaar, facClient, handler, reqFor, required, resetGuards, root, snapshotMeta, snapshotSummary, wellKnown } from "../main.ts";
 import * as SG from "../lib/settle_guard.ts";
 import { keyHistory, verifyJcs } from "../lib/sign.ts";
@@ -153,6 +153,24 @@ Deno.test("on-chain check and outcome statuses match Python rules", async () => 
   assertEquals([self.status, self.reason, self.category], ["excluded", "self_payer", "endpoint_check"]);
   const inc = await recordSale("/base/network", req, { success: true, payer: W, transaction: "0x" + "ab".repeat(32) }, ["a", "b", "c"], await f(null), true, env) as any;
   assertEquals(inc.status, "inconclusive");
+});
+Deno.test("payer classes: self, monitor (wallet or UA), external; export reclassifies old rows", async () => {
+  const req = reqFor("/base/network", env); const W = "0x" + "02".repeat(20), ME = "0x" + "77".repeat(20), MON = "0x" + "55".repeat(20);
+  const e2 = (k: string) => k === "MONITOR_WALLETS" ? MON : env(k);
+  assertEquals(payerClass(ME, req.payTo, e2), "self"); assertEquals(payerClass(req.payTo, req.payTo, e2), "self");
+  assertEquals(payerClass(MON, req.payTo, e2), "monitor"); assertEquals(payerClass(W, req.payTo, e2, "SettledScout/1.2"), "monitor");
+  assertEquals(payerClass(W, req.payTo, e2, "vet402-probe"), "monitor"); assertEquals(payerClass(W, req.payTo, e2, "curl/8"), "external");
+  assertEquals(payerClass(null, req.payTo, e2), null);
+  let o = await recordSale("/base/network", req, { success: true, payer: MON, transaction: "0x" + "a1".repeat(32) }, ["a", "b", "c"], { settled: true }, true, e2) as any;
+  assertEquals([o.status, o.reason, o.payerClass, o.externalPayer], ["excluded", "monitor_payer", "monitor", false]);
+  o = await recordSale("/base/network", req, { success: true, payer: W, transaction: "0x" + "a2".repeat(32) }, ["a", "b", "c"], { settled: true }, true, e2, null, "SettledScout") as any;
+  assertEquals(o.payerClass, "monitor");
+  o = await recordSale("/base/network", req, { success: true, payer: W, transaction: "0x" + "a3".repeat(32) }, ["a", "b", "c"], { settled: true }, true, e2) as any;
+  assertEquals([o.status, o.payerClass, o.externalPayer], ["verified_success", "external", true]);
+  assertEquals(reclassify({ payer: ME, status: "verified_success", reason: null, externalPayer: true }, req.payTo, e2),
+    { payer: ME, status: "excluded", reason: "self_payer", externalPayer: false, payerClass: "self" });
+  assertEquals(reclassify({ payer: W, payerClass: "monitor", status: "excluded" }, req.payTo, e2).payerClass, "monitor");
+  assertEquals(reclassify({ payer: W, status: "verified_success" }, req.payTo, e2).externalPayer, true);
 });
 Deno.test("pyDumps matches Python spacing", () => { assertEquals(pyDumps({ a: [1, "x"], b: { c: null } }), '{"a": [1, "x"], "b": {"c": null}}'); });
 

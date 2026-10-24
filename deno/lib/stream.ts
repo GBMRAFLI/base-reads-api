@@ -11,6 +11,27 @@ export function selfWallets(payTo: string, env = (k: string) => Deno.env.get(k))
   for (const x of (env("SELF_WALLETS") ?? "").split(",")) if (x.trim()) w.add(x.trim().toLowerCase());
   return w;
 }
+const csv = (v: string | undefined) => new Set((v ?? "").split(",").map((x) => x.trim().toLowerCase()).filter(Boolean));
+export const MONITOR_UA_DEFAULT = "settledscout,vet402";
+/** self = our own wallets; monitor = known verification/monitoring bots (MONITOR_WALLETS, or a User-Agent containing a
+ * MONITOR_UA token); external = everyone else (organic buyer). null when the payer is unknown. Same rules as Python. */
+export function payerClass(payer: string | null, payTo: string, env = (k: string) => Deno.env.get(k), ua?: string | null) {
+  if (!payer) return null;
+  const p = payer.toLowerCase();
+  if (selfWallets(payTo, env).has(p)) return "self";
+  if (csv(env("MONITOR_WALLETS")).has(p)) return "monitor";
+  const u = (ua ?? "").toLowerCase();
+  if (u && [...csv(env("MONITOR_UA") ?? MONITOR_UA_DEFAULT)].some((t) => u.includes(t))) return "monitor";
+  return "external";
+}
+/** Export-time view: re-apply the current wallet config to a stored outcome (older rows predate payerClass). */
+export function reclassify(out: Record<string, any>, payTo: string, env = (k: string) => Deno.env.get(k)) {
+  const o = { ...out }; let cls = payerClass(o.payer ?? null, payTo, env);
+  if (o.payerClass === "monitor" && cls === "external") cls = "monitor"; // UA-based tag is only known at record time
+  o.payerClass = cls; o.externalPayer = cls === "external";
+  if (o.status === "verified_success" && (cls === "self" || cls === "monitor")) { o.status = "excluded"; o.reason = cls + "_payer"; }
+  return o;
+}
 export async function verifyOnchain(rpc: Rpc, tx: string | undefined, asset: string, payTo: string, amount: string, payer: string | undefined,
   network = "eip155:8453", attempts = 4, wait = 2000, sleep = (ms: number) => new Promise((r) => setTimeout(r, ms)), nonce?: string | null, minConf = 1) {
   if (!tx) return { settled: false, reason: "no_tx_hash" };
@@ -48,21 +69,21 @@ function authUsed(rc: any, asset: string, frm: string, nonce: string) {
     return (lg.address ?? "").toLowerCase() === asset.toLowerCase() && t.length === 3 && t[0] === AUTH_USED && t[1].slice(-40) === frm.toLowerCase().slice(2) && t[2] === n; });
 }
 export async function recordSale(route: string, req: Record<string, any>, st: Record<string, any>, times: [string, string, string],
-  onchain: Record<string, any>, servedOk = true, env = (k: string) => Deno.env.get(k), ref: string | null = null) {
+  onchain: Record<string, any>, servedOk = true, env = (k: string) => Deno.env.get(k), ref: string | null = null, ua: string | null = null) {
   const tx = st.transaction ?? null, payer = (st.payer || "").toLowerCase() || null;
   const cand = rid("cand", "v1", category(route), route);
   const ex = await append("executions.jsonl", { id: rid("exec", tx, route), candidateRef: cand, category: category(route), protocolType: "x402",
     role: "seller", adapter: "x402-seller", route, amount: req.amount, asset: req.asset, network: req.network,
     payTo: req.payTo, payer, tx, status: st.success ? "succeeded" : "failed",
     startedAt: times[0], verifiedAt: times[1], settledAt: times[2], receipt: "payment_received", ...(ref ? { ref } : {}) });
-  const isSelf = payer ? selfWallets(req.payTo, env).has(payer) : null;
+  const cls = payerClass(payer, req.payTo, env, ua);
   let status: string, why: string | null;
-  if (onchain.settled === true && isSelf === false && servedOk) { status = "verified_success"; why = null; }
+  if (onchain.settled === true && cls === "external" && servedOk) { status = "verified_success"; why = null; }
   else if (onchain.settled === null || onchain.settled === undefined) { status = "inconclusive"; why = "deferred_onchain_check"; }
-  else if (isSelf) { status = "excluded"; why = "self_payer"; }
+  else if (cls === "self" || cls === "monitor") { status = "excluded"; why = cls + "_payer"; }
   else { status = "verified_failure"; why = onchain.reason || "resource_not_delivered"; }
   const out = await append("outcomes.jsonl", { id: rid("out", tx, route), candidateRef: cand, executionRef: ex.id, category: category(route),
-    status, reason: why, externalPayer: isSelf === false, payer, onchain, outcome: servedOk ? "resource_delivered" : "not_delivered", verifiedAt: iso() });
+    status, reason: why, externalPayer: cls === "external", payerClass: cls, payer, onchain, outcome: servedOk ? "resource_delivered" : "not_delivered", verifiedAt: iso() });
   await append("costs.jsonl", { id: rid("cost", tx, route), candidateRef: cand, executionRef: ex.id, category: "settlement",
     amount: 0.0, currency: "USD", incurredAt: iso(), evidenceRef: `tx:${tx === null ? "None" : tx}`, measured: true,
     allocationMethod: "direct; facilitator pays gas, seller cost 0", revenue: status === "verified_success" ? parseInt(req.amount) / 1e6 : 0.0 });

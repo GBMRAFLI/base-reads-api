@@ -23,6 +23,26 @@ def self_wallets(pay_to):
         if os.environ.get(k): w.add(os.environ[k].strip().lower())
     w |= {x.strip().lower() for x in os.environ.get("SELF_WALLETS", "").split(",") if x.strip()}
     return w
+def _csv(k, default=""): return {x.strip().lower() for x in os.environ.get(k, default).split(",") if x.strip()}
+MONITOR_UA_DEFAULT = "settledscout,vet402"
+def payer_class(payer, pay_to, ua=None):
+    """self = our own wallets; monitor = known verification/monitoring bots (MONITOR_WALLETS, or a User-Agent
+    containing a MONITOR_UA token); external = everyone else (organic buyer). None when the payer is unknown."""
+    if not payer: return None
+    p = payer.lower()
+    if p in self_wallets(pay_to): return "self"
+    if p in _csv("MONITOR_WALLETS"): return "monitor"
+    u = (ua or "").lower()
+    if u and any(t in u for t in _csv("MONITOR_UA", MONITOR_UA_DEFAULT)): return "monitor"
+    return "external"
+def reclassify(out, pay_to):
+    """Export-time view: re-apply the current wallet config to a stored outcome (older rows predate payerClass)."""
+    o = dict(out); stored = o.get("payerClass")
+    cls = payer_class(o.get("payer"), pay_to)
+    if stored == "monitor" and cls == "external": cls = "monitor"  # UA-based tag is only known at record time
+    o["payerClass"], o["externalPayer"] = cls, cls == "external"
+    if o.get("status") == "verified_success" and cls in ("self", "monitor"): o["status"], o["reason"] = "excluded", cls + "_payer"
+    return o
 
 def verify_onchain(rpc, tx, asset, pay_to, amount, payer, network="eip155:8453", attempts=4, wait=2.0, sleep=time.sleep, nonce=None):
     """Read-only Base check: receipt status=1 and a USDC Transfer(payer -> pay_to, value >= amount) in the tx logs.
@@ -50,7 +70,7 @@ def _auth_used(rc, asset, frm, nonce):
         if lg.get("address", "").lower() == asset.lower() and len(t) == 3 and t[0] == AUTH_USED and t[1][-40:] == frm.lower()[2:] and t[2] == n: return True
     return False
 
-def record_sale(route, req, st, times, onchain, served_ok=True, ref=None):
+def record_sale(route, req, st, times, onchain, served_ok=True, ref=None, ua=None):
     """ExecutionRecord (receipt = payment received) + OutcomeRecord (outcome = resource delivered, on-chain verified,
     external payer) + CostEntry. verified_success ONLY if settled on Base AND payer is external AND resource delivered."""
     tx, payer = st.get("transaction"), (st.get("payer") or "").lower() or None
@@ -59,13 +79,13 @@ def record_sale(route, req, st, times, onchain, served_ok=True, ref=None):
         "role": "seller", "adapter": "x402-seller", "route": route, "amount": req["amount"], "asset": req["asset"], "network": req["network"],
         "payTo": req["payTo"], "payer": payer, "tx": tx, "status": "succeeded" if st.get("success") else "failed",
         "startedAt": times[0], "verifiedAt": times[1], "settledAt": times[2], "receipt": "payment_received", **({"ref": ref} if ref else {})})
-    is_self = payer in self_wallets(req["payTo"]) if payer else None
-    if onchain.get("settled") is True and is_self is False and served_ok: status, why = "verified_success", None
+    cls = payer_class(payer, req["payTo"], ua)
+    if onchain.get("settled") is True and cls == "external" and served_ok: status, why = "verified_success", None
     elif onchain.get("settled") is None: status, why = "inconclusive", "deferred_onchain_check"
-    elif is_self: status, why = "excluded", "self_payer"
+    elif cls in ("self", "monitor"): status, why = "excluded", cls + "_payer"
     else: status, why = "verified_failure", onchain.get("reason") or "resource_not_delivered"
     out = append("outcomes.jsonl", {"id": rid("out", tx, route), "candidateRef": cand, "executionRef": ex["id"], "category": category(route),
-        "status": status, "reason": why, "externalPayer": is_self is False, "payer": payer, "onchain": onchain,
+        "status": status, "reason": why, "externalPayer": cls == "external", "payerClass": cls, "payer": payer, "onchain": onchain,
         "outcome": "resource_delivered" if served_ok else "not_delivered", "verifiedAt": iso()})
     append("costs.jsonl", {"id": rid("cost", tx, route), "candidateRef": cand, "executionRef": ex["id"], "category": "settlement",
         "amount": 0.0, "currency": "USD", "incurredAt": iso(), "evidenceRef": f"tx:{tx}", "measured": True,
