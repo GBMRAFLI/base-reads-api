@@ -22,6 +22,7 @@ jobs:
           echo "TOK=$TOK" >> $GITHUB_ENV
           docker run -d --name app -p 7860:7860 -e SNAPSHOT_SCHEDULER=0 -e SIGNING_KEY_PASSPHRASE=$PASS -e EXPORT_TOKEN=$TOK base-reads
           for i in $(seq 1 30); do curl -sf localhost:7860/ >/dev/null && break; sleep 1; done
+          curl -sf localhost:7860/ >/dev/null || { docker logs app 2>&1 | tail -30; exit 1; }
       - name: smoke
         run: |
           curl -sf localhost:7860/ | python3 -c "import json,sys;d=json.load(sys.stdin);assert '/x402/preflight' in d['routes'] and '/base/network' in d['routes']"
@@ -36,6 +37,12 @@ jobs:
     defaults: {run: {working-directory: deno}}
     steps:
       - uses: actions/checkout@v4
+      # Some Deno tests run the official Python verifier (scripts/verify_attestation.py) as a subprocess,
+      # which needs rfc8785 + pycryptodome; without them python3 exits 1 on import.
+      - uses: actions/setup-python@v5
+        with: {python-version: "3.13"}
+      - run: pip install --require-hashes -r requirements.txt
+        working-directory: .
       - uses: denoland/setup-deno@v2
         with: {deno-version: v2.x}
       - run: deno check main.ts
