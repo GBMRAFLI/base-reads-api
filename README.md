@@ -94,15 +94,18 @@ Both paid routes write to one sales log (chain_reads = `/base/*`, endpoint_check
 and writes ExecutionRecord / OutcomeRecord / CostEntry / Observation rows to `DATA_STORE`.
 `verified_success` requires on-chain settlement, an external (non-self) payer, and delivery. URLs and HTTP contracts are unchanged.
 
-## Free tier + on-chain truth
-Render free plan, no disk: snapshots and the sales log live in /tmp (ephemeral). `GET /internal/export`
-(Bearer `EXPORT_TOKEN`) serves the log; an external collector pulls it hourly and rebuilds buyers, calls and timestamps from USDC
+## On-chain truth
+`GET /internal/export` (Bearer `EXPORT_TOKEN`) serves the sales log; an external collector pulls it hourly and rebuilds buyers, calls and timestamps from USDC
 Transfer logs into the payee on Base, matched to the settlement tx hashes from PAYMENT-RESPONSE. The chain is the source of truth.
+In production the log is stored in Deno KV on local disk, so it is durable across restarts.
 
-## Hosting on Hugging Face Spaces (Docker)
-`Dockerfile` listens on port 7860; storage is ephemeral (`/tmp`). Set Space secrets `SIGNING_KEY_PASSPHRASE`,
-`SIGNING_KEY_ENC_B64`, `EXPORT_TOKEN` and the variable `PUBLIC_URL=https://<owner>-<space>.hf.space` (set it on Base mainnet; the Deno server below requires it there: without it paid routes return 503, free routes stay up).
-## Deno Deploy port (`deno/`)
+## Hosting
+Production runs the Deno server below on a VPS: a systemd unit (`deploy/vps/base-reads.service`) runs `deno/main.ts`
+with Deno KV on local disk, secrets come from the env file referenced by the unit, and Caddy terminates TLS.
+Setup, deploys, rollbacks and KV backups are described in [`deploy/vps/README.md`](deploy/vps/README.md).
+The `Dockerfile` is a container build of the Python reference used for smoke tests in CI.
+
+## Deno server (`deno/`, production on a VPS)
 TypeScript port with the same routes, 402 challenges (byte-identical body and `PAYMENT-REQUIRED` header), Ed25519 signed
 facts (same encrypted key and pubkey, byte-identical signatures), `/internal/export` with the same bearer auth, and the same
 record format. Storage: Deno KV.
@@ -119,13 +122,13 @@ Schema stays `prepay-check/v1` (additive optional fields; no version bump). `baz
 - 365+ days: **aggregate** (`listings` + host/wallet counts + status)
 - Preflight `bazaarFacts` uses a **full** snapshot at most **3 days** old; otherwise `{available:false, reason:"snapshot_too_old", snapshot_date, snapshot_age_days, max_age_days:3}` (never `listed:false` / zero counts from a demoted or stale day). Reduced/aggregate days in `payer_trend` are marked with `tier`.
 
-### KV storage (measured from live Bazaar, Deno Free 1 GiB)
+### KV storage (measured from live Bazaar)
 Fetched 3 free public Bazaar pages (3000 listings, `bazaar_total≈38204`) and built the real index:
 - **full gzip = 156 059 bytes, 3 chunks** (~156 write units/day for a new full snap)
 - **reduced gzip ≈ 25 882 bytes** (~16.6% of full)
-- Steady-state year ≈ 30×full + 334×reduced ≈ **12.7 MiB (~1.24% of 1 GiB)**.
+- Steady-state year ≈ 30×full + 334×reduced ≈ **12.7 MiB** on local disk.
 
-The Python reference (`api/`) does **not** yet apply the page cap, status model, or tiering — Deno Deploy is production.
+The Python reference (`api/`) does **not** yet apply the page cap, status model, or tiering — the Deno server is production.
 
 Entry point `deno/main.ts`; env: `SIGNING_KEY_PASSPHRASE`, `SIGNING_KEY_ENC_B64`, `EXPORT_TOKEN` (+ optional `PAY_TO_ADDRESS`,
 `SELF_WALLETS`, `PUBLIC_URL`, `RPC`, `FACILITATOR`, `NETWORK`, `SNAPSHOT_MAX_PAGES`). Contract fixtures come from the Python reference
