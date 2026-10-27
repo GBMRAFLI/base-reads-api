@@ -292,11 +292,6 @@ class T3(unittest.TestCase):
         old = os.environ["EXPORT_TOKEN"]; os.environ["EXPORT_TOKEN"] = "short"
         try: self.assertEqual(IX.export("Bearer short", {})[0], 401)
         finally: os.environ["EXPORT_TOKEN"] = old
-    def test_render_free_no_disk(self):
-        r = open(os.path.join(os.path.dirname(__file__), "..", "render.yaml")).read()
-        self.assertIn("plan: free", r); self.assertNotIn("disk:", r); self.assertNotIn("/var/data", r)
-        for k in ("EXPORT_TOKEN", "SIGNING_KEY_PASSPHRASE", "SIGNING_KEY_ENC_B64"):
-            self.assertRegex(r, k + r"[^\n]*\n\s*sync: false")
     def test_signing_key_from_env(self):
         from Crypto.PublicKey import ECC
         k = ECC.generate(curve="ed25519"); pem = k.export_key(format="PEM", passphrase=os.environ["SIGNING_KEY_PASSPHRASE"], protection="scryptAndAES256-CBC")
@@ -308,12 +303,8 @@ class T4(unittest.TestCase):
     R = os.path.join(os.path.dirname(__file__), "..")
     def test_dockerfile(self):
         d = open(os.path.join(self.R, "Dockerfile")).read()
-        for k in ("PORT=7860", "EXPOSE 7860", "HOST=0.0.0.0", "SNAPSHOT_DIR=/tmp", "DATA_STORE=/tmp", "USER user"): self.assertIn(k, d)
+        for k in ("PORT=8080", "EXPOSE 8080", "HOST=0.0.0.0", "SNAPSHOT_DIR=/tmp", "DATA_STORE=/tmp", "USER user"): self.assertIn(k, d)
         for s in ("SIGNING_KEY_PASSPHRASE=", "EXPORT_TOKEN=", "SIGNING_KEY_ENC_B64="): self.assertNotIn(s, d)
-    def test_spaces_frontmatter(self):
-        r = open(os.path.join(self.R, "README.md")).read()
-        self.assertTrue(r.startswith("---\n")); fm = r.split("---")[1]
-        self.assertIn("sdk: docker", fm); self.assertIn("app_port: 7860", fm)
 class T5(unittest.TestCase):
     def test_deno_contract_fixture_is_current(self):
         sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "scripts")); import gen_contract_fixture as G

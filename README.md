@@ -1,13 +1,3 @@
----
-title: Base Reads x402
-emoji: 🔎
-colorFrom: blue
-colorTo: indigo
-sdk: docker
-app_port: 7860
-pinned: false
----
-
 # Base Reads (x402)
 
 Pay-per-call Base mainnet reads and signed pre-payment checks for x402 endpoints, via [x402](https://x402.org) v2

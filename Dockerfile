@@ -11,7 +11,8 @@ COPY --chown=user scripts ./scripts
 COPY --chown=user static ./static
 COPY --chown=user spec ./spec
 USER user
-ENV HOST=0.0.0.0 PORT=7860 PYTHONUNBUFFERED=1 \
+# CI-only: this image is built for the docker-smoke job; production does not run it.
+ENV HOST=0.0.0.0 PORT=8080 PYTHONUNBUFFERED=1 \
     SNAPSHOT_DIR=/tmp/snapshots DATA_STORE=/tmp/records SIGNING_KEY_PATH=/tmp/signing_key.enc.pem SNAPSHOT_SCHEDULER=1
-EXPOSE 7860
+EXPOSE 8080
 CMD ["python", "api/index.py"]
