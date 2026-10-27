@@ -1,4 +1,4 @@
-// Base Reads on Deno Deploy: receive-only x402 v2 seller on Base mainnet. Never signs or sends funds.
+// Base Reads Deno server (runs on a VPS): receive-only x402 v2 seller on Base mainnet. Never signs or sends funds.
 // Same routes, 402 challenges, signed facts, export endpoint and record format as api/index.py. Zero LLM.
 import { pyDumps } from "./lib/canonical.ts";
 import { Chain, makeRpc, type Rpc } from "./lib/chain.ts";
