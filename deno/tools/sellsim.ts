@@ -1,22 +1,41 @@
 // Local CLI for the sell-simulation prototype. Read-only: eth_call / eth_getCode / eth_getLogs on public RPCs only.
 //   deno run -A tools/sellsim.ts --test-key <file> [--out <dir>] <token> [<token> ...]
 //   deno run -A tools/sellsim.ts --test-key <file> --list <file with "label kind address" lines> --out <dir>
-// Signing: if SIGNING_KEY_ENC_B64 / SIGNING_KEY_PASSPHRASE are set, the production issuer key is used (lib/sign.ts);
-// otherwise a LOCAL THROWAWAY TEST KEY is loaded from --test-key (created with mode 0600 if missing). Keys are never printed.
-// RPCs: SELLSIM_RPC (comma list, tried in order), SELLSIM_LOGS_RPC, SELLSIM_ARCHIVE_RPC.
+// Signing: a LOCAL THROWAWAY TEST KEY from --test-key (created with mode 0600 if missing) by default. The issuer key
+// (SIGNING_KEY_ENC_B64) is used ONLY with the explicit --use-issuer-key flag. Keys are never printed.
+// RPCs: fixed list in RPC_URLS; SELLSIM_RPC / SELLSIM_LOGS_RPC / SELLSIM_ARCHIVE_RPC are read only with --rpc-override.
 import { sellSim, signProof } from "../lib/sellsim.ts";
 import { keyIdOf, type Signer } from "../lib/attestation.ts";
 
-export type RpcStat = { calls: number; errors: Record<string, number>; fallbacks: number };
-export function makeFallbackRpc(urls: string[], stat: RpcStat) {
+export type RpcStat = { calls: number; errors: Record<string, number>; fallbacks: number; budget_used?: number };
+// Fixed public endpoints (free, no keys). Overridable only with the explicit --rpc-override CLI flag (tests/local runs).
+export const RPC_URLS = ["https://mainnet.base.org", "https://base.drpc.org", "https://base-rpc.publicnode.com"];
+export const LOGS_RPC_URLS = ["https://base.gateway.tenderly.co"];
+export const ARCHIVE_RPC_URLS = ["https://mainnet.base.org", "https://base.drpc.org"];
+export const RPC_METHODS = new Set(["eth_call", "eth_getCode", "eth_getBalance", "eth_getLogs", "eth_blockNumber", "eth_getBlockByNumber", "eth_getStorageAt", "eth_chainId", "eth_getTransactionCount"]);
+export const RPC_MAX_RESPONSE_BYTES = 4 * 1024 * 1024;
+export const RPC_DEFAULT_BUDGET = 400; // upstream HTTP calls per check (token or tx); a check uses ~80
+/** Read a response body, aborting once it exceeds `max` bytes. */
+export async function readCapped(r: Response, max: number): Promise<string> {
+  if (!r.body) return "";
+  const rd = r.body.getReader(); const parts: Uint8Array[] = []; let n = 0;
+  for (;;) { const { done, value } = await rd.read(); if (done) break; n += value.length; if (n > max) { await rd.cancel(); throw Object.assign(new Error("response_too_large"), { final: true }); } parts.push(value); }
+  const out = new Uint8Array(n); let o = 0; for (const p of parts) { out.set(p, o); o += p.length; }
+  return new TextDecoder().decode(out);
+}
+/** stat.budget_used is shared by every rpc built on the same stat; reset it per check. */
+export function makeFallbackRpc(urls: string[], stat: RpcStat, opts: { maxBytes?: number; budget?: number; fetchFn?: typeof fetch } = {}) {
+  const maxBytes = opts.maxBytes ?? RPC_MAX_RESPONSE_BYTES, budget = opts.budget ?? RPC_DEFAULT_BUDGET, f = opts.fetchFn ?? fetch;
   return async (m: string, p: unknown[]) => {
+    if (!RPC_METHODS.has(m)) throw Object.assign(new Error("method_not_allowed: " + m), { final: true });
     let last: Error | null = null;
     for (let i = 0; i < urls.length; i++) {
       for (let attempt = 0; attempt < 3; attempt++) {
-        stat.calls++;
+        if ((stat.budget_used ?? 0) >= budget) throw Object.assign(new Error("rpc_budget_exceeded"), { final: true });
+        stat.calls++; stat.budget_used = (stat.budget_used ?? 0) + 1;
         try {
-          const r = await fetch(urls[i], { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: m, params: p }), signal: AbortSignal.timeout(20000) });
-          const txt = await r.text(); let d: any; try { d = JSON.parse(txt); } catch { throw new Error(`http_${r.status}`); }
+          const r = await f(urls[i], { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: m, params: p }), signal: AbortSignal.timeout(20000) });
+          const txt = await readCapped(r, maxBytes); let d: any; try { d = JSON.parse(txt); } catch { throw new Error(`http_${r.status}`); }
           if (d.error) {
             const msg = String(d.error.message ?? "rpc_error");
             // execution reverts are results, not transport failures
@@ -58,7 +77,10 @@ if (import.meta.main) {
   const tokens: { label: string; kind: string; address: string }[] = a.map((x) => ({ label: x, kind: "", address: x }));
   if (list) for (const l of (await Deno.readTextFile(list)).split("\n")) { const [label, kind, address] = l.trim().split(/\s+/); if (address) tokens.push({ label, kind, address }); }
   let signer: Signer, publicKeyB64: string, label: string;
-  if (Deno.env.get("SIGNING_KEY_ENC_B64")) {
+  const useIssuer = a.includes("--use-issuer-key"); if (useIssuer) a.splice(a.indexOf("--use-issuer-key"), 1);
+  const rpcOverride = a.includes("--rpc-override"); if (rpcOverride) a.splice(a.indexOf("--rpc-override"), 1);
+  if (useIssuer) {
+    if (!Deno.env.get("SIGNING_KEY_ENC_B64")) { console.error("--use-issuer-key set but no issuer key in the environment"); Deno.exit(2); }
     const { envSigner, publicKeyInfo } = await import("../lib/sign.ts");
     signer = await envSigner(); publicKeyB64 = (await publicKeyInfo()).public_key_b64; label = "issuer key (server environment)";
   } else {
@@ -66,15 +88,16 @@ if (import.meta.main) {
     ({ signer, publicKeyB64, label } = await testKeySigner(keyPath));
   }
   const stat: RpcStat = { calls: 0, errors: {}, fallbacks: 0 };
-  const urls = (Deno.env.get("SELLSIM_RPC") ?? "https://mainnet.base.org,https://base.drpc.org,https://base-rpc.publicnode.com").split(",");
+  const ov = (n: string, d: string[]) => rpcOverride && Deno.env.get(n) ? Deno.env.get(n)!.split(",") : d;
+  const urls = ov("SELLSIM_RPC", RPC_URLS);
   const rpc = makeFallbackRpc(urls, stat);
-  const logsRpc = makeFallbackRpc((Deno.env.get("SELLSIM_LOGS_RPC") ?? "https://base.gateway.tenderly.co").split(","), stat);
-  const archiveRpc = makeFallbackRpc((Deno.env.get("SELLSIM_ARCHIVE_RPC") ?? "https://mainnet.base.org,https://base.drpc.org").split(","), stat);
+  const logsRpc = makeFallbackRpc(ov("SELLSIM_LOGS_RPC", LOGS_RPC_URLS), stat);
+  const archiveRpc = makeFallbackRpc(ov("SELLSIM_ARCHIVE_RPC", ARCHIVE_RPC_URLS), stat);
   const head = Number(BigInt(await rpc("eth_blockNumber", []))) - 3;
   const blk = await rpc("eth_getBlockByNumber", ["0x" + head.toString(16), false]);
   const rows: any[] = [];
   for (const t of tokens) {
-    const t0 = performance.now(); const before = stat.calls; let claims: any = null, err: string | null = null;
+    stat.budget_used = 0; const t0 = performance.now(); const before = stat.calls; let claims: any = null, err: string | null = null;
     try { claims = await sellSim(rpc, t.address, head, { logsRpc, archiveRpc, blockHash: blk?.hash ?? null, notes: [] }); } catch (e) { err = String((e as Error).message); }
     const ms = Math.round(performance.now() - t0);
     const proof = claims ? await signProof(claims, { token: t.address }, signer, { keyLabel: label }) : null;

@@ -3,7 +3,8 @@ import { assert, assertEquals, assertThrows } from "jsr:@std/assert@1";
 import { decodeRevert, decodeRun, factoryAddr, selectUsable, INITIALIZE_TOPIC, parseInitializeLog, poolId, signProof, taxes, verifyProof, word, virtualQuote } from "../lib/sellsim.ts";
 import { HELPER_SOURCE_SHA256 } from "../lib/sellsim_helper.ts";
 import { call, decode, encode, selector } from "../lib/abi.ts";
-import { decodeTx, evaluate, MAX_UINT, presign, txSimOverrides, v3Path, type Facts } from "../lib/presign.ts";
+import { decodeTx, evaluate, MAX_UINT, presign, signPresign, txSimOverrides, v3Path, type Facts } from "../lib/presign.ts";
+import { makeFallbackRpc, readCapped } from "../tools/sellsim.ts";
 import { keyIdOf, type Signer } from "../lib/attestation.ts";
 
 const ETH = "0x0000000000000000000000000000000000000000";
@@ -137,11 +138,14 @@ Deno.test("policy: approvals", () => {
   const base = { kind: "erc20_approve", token: BRETT, amount: MAX_UINT.toString(), unlimited: true };
   const A = (x: Record<string, unknown>) => evaluate(F({ approvals: [{ ...base, spender: "0xs", spender_known: null, spender_is_contract: true, spender_verification: null, ...x } as any] }));
   assertEquals(A({ spender_known: "uniswap_universal_router_v4" }).verdict, "allow");
-  assertEquals(codes(A({ spender_is_contract: false })), ["unlimited_approval_eoa_spender"]);
-  assertEquals(A({ spender_verification: { address: "0xs", source: "sourcify", status: "verified" } }).verdict, "allow");
+  assertEquals(codes(A({ spender_is_contract: false })), ["approval_eoa_spender"]);
+  const vv = A({ spender_verification: { address: "0xs", source: "sourcify", status: "verified" } }); assertEquals(vv.verdict, "warn"); assertEquals(codes(vv), ["approval_unknown_verified_spender"]);
   const u = A({ spender_verification: { address: "0xs", source: "sourcify", status: "not_found" } }); assertEquals(u.verdict, "warn"); assertEquals(u.reasons[0].verification, "not_found");
   const lf = A({ spender_verification: { address: "0xs", source: "sourcify", status: "lookup_failed" } }); assertEquals(lf.unknowns[0].what, "spender_verification");
-  assertEquals(A({ unlimited: false, spender_is_contract: false }).verdict, "allow");
+  assertEquals(A({ amount: "0", unlimited: false, spender_is_contract: false }).verdict, "allow"); // revocation
+  const small = A({ amount: "1000", unlimited: false, spender_is_contract: false, token_total_supply: (10n ** 27n).toString() });
+  assertEquals(small.verdict, "warn"); assertEquals(small.reasons[0].severity, "normal");
+  const capped = A({ amount: "500", unlimited: false, spender_is_contract: false, token_total_supply: "500" }); assertEquals(capped.reasons[0].severity, "high"); // >= totalSupply
 });
 Deno.test("tx sim overrides only top up when needed", () => {
   assertEquals(txSimOverrides({ to: BRETT, from: UR, value: "0" }, 10n ** 18n), {});
@@ -150,13 +154,14 @@ Deno.test("tx sim overrides only top up when needed", () => {
 Deno.test("presign with stub rpc: max approve to unverified contract -> warn; reverting tx -> block", async () => {
   const spender = "0x1111111111111111111111111111111111111111";
   const rpc = async (m: string, p: any[]) => {
-    if (m === "eth_getBalance") return "0x0"; if (m === "eth_getCode") return "0x6000";
+    if (m === "eth_getBalance") return "0x0"; if (m === "eth_getCode") return "0x6000"; if (m === "eth_getTransactionCount") return "0x1";
+    if (m === "eth_getBlockByNumber") return { hash: "0x" + "ab".repeat(32) };
     if (m === "eth_call") { if (p[0].data.startsWith("0xa9059cbb")) throw new Error("execution reverted data=0x"); return "0x" + word(1); }
     throw new Error("unexpected " + m);
   };
   const lookup = async (a: string) => ({ address: a, source: "sourcify", status: "not_found" as const, http: 404 });
   const r = await presign(rpc, { tx: { to: BRETT, from: UR, data: call("approve(address,uint256)", [spender, MAX_UINT]) } }, 100, { lookup, skipTokens: [BRETT] });
-  assertEquals(r.verdict, "warn"); assertEquals(r.reasons[0].code, "unlimited_approval_unverified_spender"); assertEquals(r.tx_simulation.reverted, false);
+  assertEquals(r.verdict, "warn"); assertEquals(r.reasons[0].code, "approval_unverified_spender"); assertEquals(r.reasons[0].severity, "high"); assertEquals(r.block_hash, "0x" + "ab".repeat(32)); assertEquals(r.tx_simulation.reverted, false);
   const t = await presign(rpc, { tx: { to: BRETT, from: UR, data: call("transfer(address,uint256)", [spender, 1n]) } }, 100, { lookup, skipTokens: [BRETT] });
   assertEquals(t.verdict, "block"); assertEquals(t.reasons[0].code, "tx_reverts");
 });
@@ -177,4 +182,51 @@ Deno.test("regression: empty factory response is an rpc error, not 'no pool'", (
   assertThrows(() => factoryAddr("0x")); assertThrows(() => factoryAddr(null)); assertThrows(() => factoryAddr(""));
   assertEquals(factoryAddr("0x" + "0".repeat(64)), "0x0000000000000000000000000000000000000000");
   assertEquals(factoryAddr("0x" + "0".repeat(24) + "ed3ac538bbb824bf3c8ea9d1075b965d233e96b2"), "0xed3ac538bbb824bf3c8ea9d1075b965d233e96b2");
+});
+
+// M1 regression: finite but huge grants to unknown spenders must not be "allow" (b6f186e returned allow).
+Deno.test("M1: finite huge approvals via approve / increaseAllowance / permit to an unknown EOA -> warn high", async () => {
+  const EOA = "0x1111111111111111111111111111111111111111", USDC_ = "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913";
+  const rpc = async (m: string, p: any[]) => {
+    if (m === "eth_getBlockByNumber") return { hash: "0x" + "cd".repeat(32) }; if (m === "eth_getBalance") return "0x" + (10n ** 18n).toString(16);
+    if (m === "eth_getCode") return "0x"; if (m === "eth_getTransactionCount") return "0x0";
+    if (m === "eth_call") return "0x" + word(10n ** 16n); // tx result / totalSupply = 1e16 (10B USDC)
+    throw new Error("unexpected " + m);
+  };
+  const lookup = async (a: string) => ({ address: a, source: "sourcify", status: "not_found" as const, http: 404 });
+  const amts = [1n << 254n, 10n ** 30n, (1n << 128n) - 1n];
+  const mk = (amt: bigint) => [
+    call("approve(address,uint256)", [EOA, amt]),
+    call("increaseAllowance(address,uint256)", [EOA, amt]),
+    call("permit(address,address,uint256,uint256,uint8,bytes32,bytes32)", [UR, EOA, amt, 9999999999n, 27n, "0x" + "11".repeat(32), "0x" + "22".repeat(32)]),
+  ];
+  for (const amt of amts) for (const data of mk(amt)) {
+    const r = await presign(rpc, { tx: { to: USDC_, from: UR, data } }, 100, { lookup });
+    assertEquals(r.verdict, "warn", `${data.slice(0, 10)} ${amt}`);
+    const x = r.reasons.find((q: any) => q.code === "approval_eoa_spender") as any; assert(x, "missing reason"); assertEquals(x.severity, "high"); assertEquals(x.large, true);
+  }
+});
+Deno.test("L2: presign proof subject carries input_sha256; block_hash required", async () => {
+  const signer = { keyId: "k", sign: async () => new Uint8Array(64) };
+  const claims: any = { block_hash: "0x" + "ab".repeat(32), input: { token: BRETT } };
+  const p: any = await signPresign(claims, signer as any);
+  assertEquals(p.subject.input_sha256.length, 64); assertEquals(p.subject.type, "base_token");
+  let threw = false; try { await signPresign({ input: { token: BRETT } }, signer as any); } catch { threw = true; } assert(threw);
+});
+Deno.test("L3: native transfer / ERC20 transfer to fresh EOA -> warn transfer_to_fresh_eoa", () => {
+  const r = evaluate(F({ fresh_recipients: [{ to: "0x1", token: ETH, amount: "1", kind: "native_transfer" }] }));
+  assertEquals(r.verdict, "warn"); assertEquals(codes(r), ["transfer_to_fresh_eoa"]);
+});
+Deno.test("L4: rpc method allow-list, response cap, budget", async () => {
+  const stat: any = { calls: 0, errors: {}, fallbacks: 0 };
+  const ok = (body: string) => (async () => new Response(body)) as unknown as typeof fetch;
+  const r1 = makeFallbackRpc(["http://x"], stat, { fetchFn: ok('{"result":"0x1"}') });
+  let e = ""; try { await r1("eth_sendRawTransaction", ["0x"]); } catch (x) { e = (x as Error).message; } assert(e.startsWith("method_not_allowed"));
+  e = ""; try { await r1("eth_sign", []); } catch (x) { e = (x as Error).message; } assert(e.startsWith("method_not_allowed"));
+  assertEquals(await r1("eth_chainId", []), "0x1");
+  const big = makeFallbackRpc(["http://x"], { calls: 0, errors: {}, fallbacks: 0 }, { maxBytes: 10, fetchFn: ok('{"result":"0x' + "0".repeat(100) + '"}') });
+  e = ""; try { await big("eth_call", []); } catch (x) { e = (x as Error).message; } assertEquals(e, "response_too_large");
+  const st2: any = { calls: 0, errors: {}, fallbacks: 0 }; const b = makeFallbackRpc(["http://x"], st2, { budget: 2, fetchFn: ok('{"result":"0x1"}') });
+  await b("eth_chainId", []); await b("eth_chainId", []); e = ""; try { await b("eth_chainId", []); } catch (x) { e = (x as Error).message; } assertEquals(e, "rpc_budget_exceeded");
+  assertEquals(await readCapped(new Response("abc"), 3), "abc");
 });

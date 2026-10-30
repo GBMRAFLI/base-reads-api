@@ -4,7 +4,9 @@
 // Never signs or sends a transaction. No network calls except the injected rpc / lookup functions.
 import { decode, selector } from "./abi.ts";
 import { CHAIN_ID, ETH, isAddr, POOL_MANAGER, Rpc, sellSim, signProof, USDC, WETH, decodeRevert } from "./sellsim.ts";
-import type { Signer } from "./attestation.ts";
+import { jcs, type Signer } from "./attestation.ts";
+import { sha256 } from "@noble/hashes/sha2";
+import { hex } from "./util.ts";
 
 export const POLICY_VERSION = "presign-policy/0.2";
 export const POLICY = {
@@ -12,9 +14,15 @@ export const POLICY = {
   warn_tax_above: 0.01,          // buy or sell tax > 1% -> warn (rounding noise below)
   warn_round_trip_below: 0.80,   // buy then sell of the probe amount returns < 80% -> warn (pool fees + impact + tax)
   unlimited_approval_at_or_above: (1n << 255n).toString(), // >= 2^255 treated as unlimited (covers max uint256 and common max-ish values)
+  // 0.2: every approval-type grant (approve, increaseAllowance, permit, Permit2 approve) with amount > 0 to a spender
+  // outside KNOWN_SPENDERS is at least warn. "large" = amount >= min(token totalSupply, 2^128); a large grant to an
+  // EOA or a non-verified contract gets severity "high" (verdict stays warn: no harm has been observed yet).
+  large_approval_cap: (1n << 128n).toString(),
+  // 0.2: native value or ERC20 transfer/transferFrom to an address with no code and nonce 0 -> warn (transfer_to_fresh_eoa)
   verification_source: "sourcify (free public API, chain 8453)",
 } as const;
 const UNLIMITED = 1n << 255n;
+const LARGE_CAP = 1n << 128n;
 export const MAX_UINT = (1n << 256n) - 1n;
 
 // Spenders treated as known: canonical Uniswap / Permit2 deployments on Base.
@@ -156,7 +164,8 @@ export type Reason = { code: string; [k: string]: unknown };
 export type Unknown = { what: string; reason: string; [k: string]: unknown };
 export type Facts = {
   tx_sim?: { reverted: boolean; revert_data?: string | null; message?: string | null; rpc_error?: string | null } | null;
-  approvals: (Approval & { spender_known: string | null; spender_is_contract: boolean | null; spender_verification: Verification | null })[];
+  approvals: (Approval & { spender_known: string | null; spender_is_contract: boolean | null; spender_verification: Verification | null; token_total_supply?: string | null })[];
+  fresh_recipients?: { to: string; token: string; amount: string; kind: string }[];
   token_sims: { token: string; sim: any | null; error?: string | null; hook_verification?: Verification | null; token_verification?: Verification | null }[];
 };
 const r6 = (x: number) => Math.round(x * 1e6) / 1e6;
@@ -168,15 +177,19 @@ export function evaluate(f: Facts): { verdict: "allow" | "warn" | "block"; reaso
     else if (f.tx_sim.reverted) B({ code: "tx_reverts", data: f.tx_sim.revert_data ?? null, message: f.tx_sim.message ?? null });
   }
   for (const a of f.approvals) {
-    if (!a.unlimited || a.spender_known) continue;
-    if (a.spender_is_contract === false) reasons.push({ code: "unlimited_approval_eoa_spender", spender: a.spender, token: a.token, kind: a.kind });
-    else if (a.spender_is_contract === null) { unknowns.push({ what: "spender_code", reason: "eth_getCode failed", spender: a.spender }); reasons.push({ code: "unlimited_approval_unverified_spender", spender: a.spender, token: a.token, verification: "unknown" }); }
-    else if (a.spender_verification?.status === "verified") continue;
+    if (a.spender_known || BigInt(a.amount) === 0n) continue; // revocations and known spenders are fine
+    const ts = a.token_total_supply ? BigInt(a.token_total_supply) : null;
+    const large = a.unlimited || BigInt(a.amount) >= (ts !== null && ts > 0n && ts < LARGE_CAP ? ts : LARGE_CAP);
+    const base = { spender: a.spender, token: a.token, kind: a.kind, amount: a.amount, large };
+    if (a.spender_is_contract === false) reasons.push({ code: "approval_eoa_spender", ...base, severity: large ? "high" : "normal" });
+    else if (a.spender_is_contract === null) { unknowns.push({ what: "spender_code", reason: "eth_getCode failed", spender: a.spender }); reasons.push({ code: "approval_unverified_spender", ...base, verification: "unknown", severity: large ? "high" : "normal" }); }
+    else if (a.spender_verification?.status === "verified") reasons.push({ code: "approval_unknown_verified_spender", ...base, severity: "normal" });
     else {
-      reasons.push({ code: "unlimited_approval_unverified_spender", spender: a.spender, token: a.token, kind: a.kind, verification: a.spender_verification?.status ?? "not_checked" });
+      reasons.push({ code: "approval_unverified_spender", ...base, verification: a.spender_verification?.status ?? "not_checked", severity: large ? "high" : "normal" });
       if (a.spender_verification?.status !== "not_found") unknowns.push({ what: "spender_verification", reason: "free verification lookup failed", spender: a.spender });
     }
   }
+  for (const r of f.fresh_recipients ?? []) reasons.push({ code: "transfer_to_fresh_eoa", ...r, severity: "normal" });
   for (const t of f.token_sims) {
     const s = t.sim;
     if (!s) { unknowns.push({ what: "token_simulation", token: t.token, reason: t.error ?? "not_run" }); continue; }
@@ -217,6 +230,9 @@ export function txSimOverrides(tx: Tx, balanceWei: bigint) {
 }
 export async function presign(rpc: Rpc, input: { tx?: Tx; token?: string }, block: number, opts: { lookup?: Lookup; blockHash?: string; sellSimOpts?: Record<string, unknown>; skipTokens?: string[] } = {}) {
   const t0 = performance.now(); const lookup = opts.lookup ?? sourcifyLookup();
+  const tagH = "0x" + block.toString(16);
+  const blockHash: string = opts.blockHash ?? (await rpc("eth_getBlockByNumber", [tagH, false]))?.hash;
+  if (!/^0x[0-9a-f]{64}$/i.test(blockHash ?? "")) throw new Error("block_hash_unavailable");
   const tag = "0x" + block.toString(16); const unknownsExtra: Unknown[] = [];
   let decoded: Decoded | null = null; let txSim: any = null; let tokens: string[] = [];
   if (input.tx) {
@@ -240,32 +256,48 @@ export async function presign(rpc: Rpc, input: { tx?: Tx; token?: string }, bloc
 
   const approvals: Facts["approvals"] = [];
   for (const a of decoded?.approvals ?? []) {
-    const known = KNOWN_SPENDERS[a.spender] ?? null; let isC: boolean | null = null, ver: Verification | null = null;
-    if (!known && a.unlimited) {
+    const known = KNOWN_SPENDERS[a.spender] ?? null; let isC: boolean | null = null, ver: Verification | null = null, ts: string | null = null;
+    if (!known && BigInt(a.amount) > 0n) {
       try { isC = ((await rpc("eth_getCode", [a.spender, tag])) as string).length > 2; } catch { isC = null; }
       if (isC) ver = await lookup(a.spender);
+      try { const r = await rpc("eth_call", [{ to: a.token, data: "0x18160ddd" }, tag]); ts = typeof r === "string" && r.length >= 66 ? BigInt(r.slice(0, 66)).toString() : null; } catch { ts = null; }
+      if (ts === null) unknownsExtra.push({ what: "token_total_supply", reason: "totalSupply() unavailable; 2^128 cap used", token: a.token });
     }
-    approvals.push({ ...a, spender_known: known, spender_is_contract: isC, spender_verification: ver });
+    approvals.push({ ...a, spender_known: known, spender_is_contract: isC, spender_verification: ver, token_total_supply: ts });
+  }
+  // fresh-EOA recipients: native value transfer (empty calldata) and ERC20 transfer/transferFrom
+  const fresh_recipients: NonNullable<Facts["fresh_recipients"]> = [];
+  if (input.tx) {
+    const recips: { to: string; token: string; amount: string; kind: string }[] = [];
+    const v = BigInt(input.tx.value ?? 0);
+    if (v > 0n && (!input.tx.data || input.tx.data === "0x")) recips.push({ to: lc(input.tx.to), token: ETH, amount: v.toString(), kind: "native_transfer" });
+    for (const t of decoded?.transfers ?? []) recips.push({ ...t, kind: "erc20_transfer" });
+    for (const r of recips) {
+      try {
+        const code = await rpc("eth_getCode", [r.to, tag]) as string; const nonce = BigInt(await rpc("eth_getTransactionCount", [r.to, tag]) as string);
+        if (code.length <= 2 && nonce === 0n) fresh_recipients.push(r);
+      } catch { unknownsExtra.push({ what: "recipient_state", reason: "eth_getCode/eth_getTransactionCount failed", to: r.to }); }
+    }
   }
   // quote assets are skipped for tx input only; a bare token input is always simulated
   const skip = new Set(input.tx ? [...(opts.skipTokens ?? [ETH, WETH, USDC])].map(lc) : []);
   const token_sims: Facts["token_sims"] = [];
   for (const tok of tokens.filter((x) => !skip.has(x))) {
     try {
-      const s = await sellSim(rpc, tok, block, { blockHash: opts.blockHash, ...(opts.sellSimOpts ?? {}) } as any);
+      const s = await sellSim(rpc, tok, block, { blockHash, ...(opts.sellSimOpts ?? {}) } as any);
       let hv: Verification | null = null;
       if (s.selected?.version === 4 && s.selected.hooks && s.selected.hooks !== ETH) hv = await lookup(s.selected.hooks);
       const tv = s.selected ? null : await lookup(tok);
       token_sims.push({ token: tok, sim: s, hook_verification: hv, token_verification: tv });
     } catch (e) { token_sims.push({ token: tok, sim: null, error: String((e as Error).message).slice(0, 200) }); }
   }
-  const ev = evaluate({ tx_sim: txSim, approvals, token_sims });
+  const ev = evaluate({ tx_sim: txSim, approvals, token_sims, fresh_recipients });
   ev.unknowns.push(...unknownsExtra);
   if (decoded && decoded.method === "unknown" && !decoded.swaps.length) ev.unknowns.push({ what: "tx_intent", reason: "calldata selector not in the decoder table; only the raw eth_call outcome is checked" });
   if (ev.verdict === "allow" && ev.unknowns.some((u) => u.what !== "hook_behavior")) ev.verdict = "warn";
   if (approvals.some((a) => a.spender_verification) || token_sims.some((t) => t.hook_verification || t.token_verification)) ev.unknowns.push({ what: "source_verification_coverage", reason: "Sourcify is the only free source used; not_found there does not prove a contract is unverified elsewhere" });
   return {
-    chain_id: CHAIN_ID, block_number: block, block_hash: opts.blockHash ?? null,
+    chain_id: CHAIN_ID, block_number: block, block_hash: blockHash,
     input: input.tx ? { tx: { ...input.tx, value: input.tx.value === undefined ? undefined : String(input.tx.value) } } : { token: lc(input.token!) },
     decoded, tx_simulation: txSim, approvals, token_sims: token_sims.map((t) => ({ token: t.token, error: t.error ?? null, hook_verification: t.hook_verification ?? null, token_verification: t.token_verification ?? null, sell_simulation: t.sim })),
     verdict: ev.verdict, reasons: ev.reasons, unknowns: ev.unknowns, policy: { version: POLICY_VERSION, ...POLICY, known_spenders: KNOWN_SPENDERS, hook_allowlist: HOOK_ALLOWLIST },
@@ -274,5 +306,7 @@ export async function presign(rpc: Rpc, input: { tx?: Tx; token?: string }, bloc
 }
 export async function signPresign(claims: Record<string, unknown>, signer: Signer, opts: { now?: number } = {}) {
   const inp: any = claims.input;
-  return await signProof(claims, { type: inp.tx ? "base_unsigned_tx" : "base_token", ...(inp.tx ? { to: lc(inp.tx.to), data_selector: String(inp.tx.data ?? "0x").slice(0, 10) } : { token: inp.token }) }, signer, opts);
+  if (!claims.block_hash) throw new Error("block_hash required");
+  const input_sha256 = hex(sha256(new TextEncoder().encode(jcs(inp))));
+  return await signProof(claims, { type: inp.tx ? "base_unsigned_tx" : "base_token", input_sha256, ...(inp.tx ? { to: lc(inp.tx.to), data_selector: String(inp.tx.data ?? "0x").slice(0, 10) } : { token: inp.token }) }, signer, opts);
 }

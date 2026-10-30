@@ -36,4 +36,8 @@ tx("tx_ur_wrap_v3_swap", UR, urExec([0x0b, 0x00], ["0x" + encode(["address", "ui
 tx("tx_ur_v4_swap_hookless", UR, v4single(T.POD, 10000, 200, ETHA), IN);
 tx("tx_ur_v4_swap_hooked", UR, v4single(T.WORTH, 0, 200, "0x985c14baa2a18316ffda0aefb3a632fadfca2acc"), IN);
 tx("tx_unknown_selector", T.BRETT, "0xdeadbeef");
+// 0.2 additions (audit M1 / L3)
+tx("tx_approve_2pow254_eoa_usdc", T.USDC, call("approve(address,uint256)", [EOA, 1n << 254n]));
+tx("tx_increase_allowance_1e30_eoa", T.BRETT, call("increaseAllowance(address,uint256)", [EOA, 10n ** 30n]));
+tx("tx_native_transfer_fresh_eoa", EOA, "0x", IN);
 console.log(JSON.stringify(cases, null, 1));
