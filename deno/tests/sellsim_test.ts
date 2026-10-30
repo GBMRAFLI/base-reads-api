@@ -230,3 +230,15 @@ Deno.test("L4: rpc method allow-list, response cap, budget", async () => {
   await b("eth_chainId", []); await b("eth_chainId", []); e = ""; try { await b("eth_chainId", []); } catch (x) { e = (x as Error).message; } assertEquals(e, "rpc_budget_exceeded");
   assertEquals(await readCapped(new Response("abc"), 3), "abc");
 });
+
+// 0.2.1: an allow-looking round trip on a fallback (zero in-range liquidity) pool must not stay allow
+Deno.test("fallback pool mode adds thin_or_out_of_range_liquidity (warn) with pool and quote balance", () => {
+  const sel = { version: 3, pool: "0xed3ac538", quote: "0x4200000000000000000000000000000000000006", hooks: null, quote_balance_raw: "907000000000000" };
+  const fb = { ...okSim({ round_trip_return: 0.95 }, sel), pool_mode: "zero_active_liquidity_fallback" };
+  const r = evaluate(F({ token_sims: [{ token: BRETT, sim: fb as never }] }));
+  assertEquals(r.verdict, "warn");
+  assertEquals(r.reasons, [{ code: "thin_or_out_of_range_liquidity", token: BRETT, pool: "0xed3ac538", version: 3, quote: sel.quote, quote_balance_raw: "907000000000000", severity: "normal" }]);
+  assertEquals(evaluate(F({ token_sims: [{ token: BRETT, sim: { ...okSim({}, sel), pool_mode: "active_liquidity" } as never }] })).verdict, "allow");
+  const hp = evaluate(F({ token_sims: [{ token: BRETT, sim: { ...okSim({ stage: "sell_reverted" }, sel), pool_mode: "zero_active_liquidity_fallback" } as never }] }));
+  assertEquals(hp.verdict, "block"); assertEquals(codes(hp), ["thin_or_out_of_range_liquidity", "honeypot"]);
+});

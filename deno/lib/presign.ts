@@ -8,7 +8,7 @@ import { jcs, type Signer } from "./attestation.ts";
 import { sha256 } from "@noble/hashes/sha2";
 import { hex } from "./util.ts";
 
-export const POLICY_VERSION = "presign-policy/0.2";
+export const POLICY_VERSION = "presign-policy/0.2.1";
 export const POLICY = {
   block_tax_at_or_above: 0.30,   // buy or sell tax >= 30% -> block
   warn_tax_above: 0.01,          // buy or sell tax > 1% -> warn (rounding noise below)
@@ -206,6 +206,8 @@ export function evaluate(f: Facts): { verdict: "allow" | "warn" | "block"; reaso
       reasons.push({ code: "main_liquidity_v4_hook", token: t.token, pool: sel.pool, hook: sel.hooks, hook_verification: t.hook_verification?.status ?? "not_checked" });
       unknowns.push({ what: "hook_behavior", token: t.token, hook: sel.hooks, reason: "hook logic may depend on caller, time, size or state; only the probe trade at the pinned block was simulated" });
     }
+    // 0.2.1: pool chosen only because no pool had in-range liquidity; a probe-size round trip can look fine while a realistic size cannot exit
+    if (s.pool_mode === "zero_active_liquidity_fallback") reasons.push({ code: "thin_or_out_of_range_liquidity", token: t.token, pool: sel.pool, version: sel.version, quote: sel.quote, quote_balance_raw: sel.quote_balance_raw ?? null, severity: "normal" });
     if (!sim || sim.rpc_error) { unknowns.push({ what: "token_simulation", token: t.token, reason: "rpc_error: " + (sim?.rpc_error ?? "none") }); continue; }
     const r = sim.result;
     if (r.stage === "buy_reverted") { unknowns.push({ what: "sellability", token: t.token, reason: "buy leg reverted in all tried pools, so the sell leg could not be simulated", revert: r.revert }); reasons.push({ code: "buy_reverts", token: t.token, revert: r.revert }); continue; }

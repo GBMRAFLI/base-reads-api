@@ -319,7 +319,7 @@ export async function sellSim(rpc: Rpc, token: string, block: number, opts: Disc
   return {
     chain_id: CHAIN_ID, block_number: block, block_hash: opts.blockHash ?? null, token,
     candidates: d.candidates.map(({ key: _k, ...x }) => x), eth_usdc_price: d.eth_usdc, token_created_block: d.token_created_block,
-    selected: top ? { version: top.version, pool: top.pool, quote: top.quote, fee: top.fee, tick_spacing: top.tick_spacing ?? null, hooks: top.hooks ?? null, key: top.key ?? null, selection: (mode === "zero_active_liquidity_fallback" ? "zero in-range liquidity fallback; " : "") + (attempts.length > 1 ? "next candidate after buy-leg failure" : "max quote_depth_eth") } : null,
+    selected: top ? { version: top.version, pool: top.pool, quote: top.quote, fee: top.fee, tick_spacing: top.tick_spacing ?? null, hooks: top.hooks ?? null, key: top.key ?? null, quote_balance_raw: top.quote_balance_raw ?? null, quote_depth_raw: top.quote_depth_raw ?? null, selection: (mode === "zero_active_liquidity_fallback" ? "zero in-range liquidity fallback; " : "") + (attempts.length > 1 ? "next candidate after buy-leg failure" : "max quote_depth_eth") } : null,
     attempts,
     simulation: sim, sellable: sim?.result ? sim.result.sellable : null,
     no_pool_reason: top ? null : "no v2/v3/v4 pool with WETH, ETH or USDC found by the discovery methods used",

@@ -34,7 +34,7 @@ No LLM in the path; the verdict is a pure function of simulated facts and the th
    - Etherscan/Basescan need a key, so they are not used. `not_found` on Sourcify is reported as such, not as proof that a contract is unverified.
 5. **Verdict + proof:** see below.
 
-## Policy `presign-policy/0.2` (deterministic)
+## Policy `presign-policy/0.2.1` (deterministic)
 
 | condition | reason code | effect |
 |---|---|---|
@@ -47,6 +47,7 @@ No LLM in the path; the verdict is a pure function of simulated facts and the th
 | same, to a contract that is not a known spender and not Sourcify-verified | `approval_unverified_spender {spender, amount, large, verification, severity}` | warn |
 | same, to a Sourcify-verified contract that is not a known spender | `approval_unknown_verified_spender {severity: normal}` | warn |
 | native value (empty calldata) or ERC20 transfer/transferFrom to an address with no code and nonce 0 | `transfer_to_fresh_eoa {to, token, amount, severity: normal}` | warn |
+| selected pool was chosen only by the zero-in-range-liquidity fallback (`pool_mode = zero_active_liquidity_fallback`) | `thin_or_out_of_range_liquidity {pool, version, quote, quote_balance_raw, severity: normal}` | warn |
 | main pool is v4 with a non-zero hook not on the allowlist (allowlist is empty) | `main_liquidity_v4_hook {pool, hook}` | warn |
 | buy leg reverts in all tried pools | `buy_reverts` | warn (+ unknown) |
 | no supported pool, token Sourcify-verified | `no_supported_liquidity {severity: normal}` | warn (+ unknown) |
@@ -54,6 +55,8 @@ No LLM in the path; the verdict is a pure function of simulated facts and the th
 | any other unknown (rpc error, undecoded calldata) | in `unknowns` | at least warn |
 
 Otherwise the verdict is **allow**.
+
+Changes in 0.2.1: added `thin_or_out_of_range_liquidity`. When no pool has in-range liquidity, the fallback pool is still simulated. A probe-size swap there can cross to a far tick and come back with a good-looking round trip (≥ 0.80), but that says nothing about exiting at a realistic size. So the check now warns and lists the pool and its raw quote-token balance. Before 0.2.1 such a token could get allow. The rule is deterministic (based only on `pool_mode`), and other 0.2 rules are unchanged. It is a patch bump because it only adds a warn and never relaxes a verdict.
 
 Changes in 0.2: added the `severity` field and the `no_supported_liquidity_unverified_token` code. When there is no simulatable pool, the outcome cannot be measured. A closed-source token in that state cannot be checked by either code reading or simulation, so the warning is stronger. It stays `warn`, not `block`, because block is reserved for observed failures (revert, honeypot, tax), and missing evidence is not proof of a trap.
 
