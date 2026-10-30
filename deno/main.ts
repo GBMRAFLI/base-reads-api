@@ -17,6 +17,7 @@ import ATT_SCHEMA from "../spec/prepay-check-attestation-v1.schema.json" with { 
 import { scheduledSnapshot, latestSnapStatus, loadFail, mapErrorCode } from "./lib/snapshot.ts";
 import { EXPORT_FILES, kv, rows } from "./lib/store.ts";
 import { recordObservation, recordSale, reconcile, verifyOnchain } from "./lib/stream.ts";
+import { acceptTrial, recordTrial, TRIAL_FILE, TRIAL_HEADER } from "./lib/trial.ts";
 import { ADDR, b64json, iso, pyQuery, sha256hex, unquote } from "./lib/util.ts";
 
 const USDCS: Record<string, string> = { "eip155:8453": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913", "eip155:84532": "0x036CbD53842c5426634e7929541eC2318f3dCF7e" };
@@ -304,7 +305,9 @@ export async function exportRecords(auth: string, q: Record<string, string>, env
   for (const n of EXPORT_FILES) all[n.split(".")[0]] = await rows(n);
   reconcile(all, c.PAY_TO, env); // maps built from ALL rows, then filtered
   for (const [k, v] of Object.entries(all)) out[k] = v.filter((r: any) => !since || ((r.startedAt || r.verifiedAt || r.observedAt || r.incurredAt || "") >= since));
-  return [200, { payTo: c.PAY_TO, network: c.NETWORK, asset: c.USDC, exportedAt: iso(), records: out }];
+  // Trial calls are unpaid: kept outside `records` so buyer, revenue and outcome consumers never see them.
+  const trials = (await rows(TRIAL_FILE)).filter((r: any) => !since || (String(r.servedAt ?? "") >= since));
+  return [200, { payTo: c.PAY_TO, network: c.NETWORK, asset: c.USDC, exportedAt: iso(), records: out, ...(trials.length ? { trials } : {}) }];
 }
 const HDRS = { "Content-Type": "application/json", "X-Content-Type-Options": "nosniff", "Access-Control-Allow-Origin": "*", "Access-Control-Expose-Headers": "PAYMENT-REQUIRED, PAYMENT-RESPONSE" };
 const send = (code: number, obj: unknown, hd: Record<string, string> = {}) => new Response(pyDumps(obj), { status: code, headers: { ...HDRS, ...hd } });
@@ -367,6 +370,9 @@ async function handleGet(req: Request, d: Deps): Promise<Response> {
   const sig = req.headers.get("PAYMENT-SIGNATURE") ?? req.headers.get("X-PAYMENT");
   if (publicUrlError(env)) return send(503, { error: "public origin not configured" }); // mainnet without PUBLIC_URL: never use Host
   if (!sig) {
+    const tk = req.headers.get(TRIAL_HEADER);
+    if (tk) { const label = await acceptTrial(tk, env); if (label) { const [code, out] = await trialServe(path, q, label, d, c, rpc); return send(code, out); } }
+    // Not accepted (any reason): fall through to the exact 402 flow a request without the header gets.
     // A6: unpaid 402s are pure computation (no DNS, GET or RPC) and limited per client IP.
     // IPv6: per-/64 key plus a per-/48 aggregate, so a prefix spray is bounded without filling the per-client table.
     const p48 = ipv6Prefix48(d.ip);
@@ -379,6 +385,29 @@ async function handleGet(req: Request, d: Deps): Promise<Response> {
   return send(code, out, hd);
 }
 
+/** Serve one accepted trial call: same handlers as a paid call, no facilitator or chain payment check.
+ * Pre-pay Check keeps its SSRF policy, per-target budget and outbound concurrency limit. */
+async function trialServe(path: string, q: Record<string, string>, label: string, d: Deps, c: Cfg, rpc: Rpc): Promise<[number, unknown]> {
+  const env = d.env; let code = 0, out: unknown = null;
+  try {
+    if (path === "/x402/preflight") {
+      const u = unquote(q.url ?? "");
+      if (!u) return [400, { error: "give ?url=https://..." }];
+      const chk = await checkUrl(u, d.resolver);
+      if (!chk.u) return [400, { error: chk.err, target_url_allowed: false }];
+      const G = abuse(env);
+      if (!G.hostPayer.allow(hostOf(u) + "|trial:" + label) || !G.perHost.allow(hostOf(u))) return [429, { error: "too many checks of this target, retry later" }];
+      [code, out] = await preflight(u, { resolver: d.resolver, fetcher: d.fetcher, env, rpc,
+        issuerUrl: c.PUBLIC ? c.PUBLIC.replace(/\/+$/, "") + "/.well-known/issuer.json" : null });
+    } else [code, out] = await new Chain(rpc, c.USDC).handle(path, q);
+  } catch (e) {
+    if (e instanceof SigningUnavailable) return [503, { error: "signing unavailable" }];
+    return [502, { error: "upstream error" }];
+  }
+  const bg = d.background ?? ((p: Promise<unknown>) => { p.catch(() => {}); });
+  bg(recordTrial(path, label, code, cleanRef(q.ref !== undefined ? "ref=" + q.ref : "")).catch((e) => console.log("trial log write failed:", (e as Error).name)));
+  return [code, out];
+}
 const FAILS = new SG.FailLimiter();
 type Abuse = { unpaid: WindowLimiter; unpaid48: WindowLimiter; hostPayer: WindowLimiter; perHost: WindowLimiter; failNet: WindowLimiter; failedWho: WindowLimiter; cache: ResultCache<unknown>; slots: SlotTable };
 let ABUSE: Abuse | null = null;

@@ -71,3 +71,38 @@
 - At the steady state above (~51 MiB KV) each daily copy is ~50 MiB; 14 daily + 8 weekly = 22 copies, about 1.1 GiB.
   Ledger copies are a few KB. `--restore-kv` deploys add one uncompressed KV copy each (newest 5 kept).
 - The server has ~50 GB free, so this is under 3% of disk; lower the retention in `kv-backup.sh` if disk is tighter.
+
+## Trial keys
+
+A request to a paid route with header `X-Trial-Key: <key>` is served without payment while the key is valid, not revoked,
+not expired and under its daily quota (`TRIAL_DAILY_LIMIT`, default 50 per key per UTC day, clamped to 1..10000). In every
+other case (unknown, revoked, expired, over quota, malformed) the request gets exactly the same 402 as without the header.
+A request that carries `PAYMENT-SIGNATURE` always takes the payment path.
+
+- Storage: `TRIAL_KEYS_FILE` (default `/var/lib/base-reads/trial-keys.json`, mode 600, owned by `basereads`) holds only
+  `{label, hash (SHA-256 hex), created, expires, revoked}`. The plaintext key (`trk_` + 32 random bytes, base64url) is never stored
+  on the server. A missing or empty file turns the feature off.
+- Reload: the server re-checks the file's mtime/size at most every 5 s and re-reads it on change, so generate and revoke take
+  effect within about 5 s without a restart.
+- Quota: counted atomically in Deno KV per key label and UTC day (entries expire after 2 days). A call is counted when it is
+  accepted, before the route runs, so a trial call with bad input (400) still uses one unit.
+- Records: each served trial call is stored in a separate `trials` stream (`kind: "trial"`, `label`, `route`, `httpStatus`,
+  `servedAt`, optional `ref`). Never the key or its hash. Trial calls are never sales: they do not appear in
+  `executions`/`outcomes`/`costs`, so they never count as buyers, verified sales or revenue. `/internal/export` returns them
+  in a top-level `trials` array (only when there are any); `records` is unchanged.
+
+Operator commands (on the server, as root, from the app directory):
+
+```sh
+cd /opt/base-reads/app/deno
+# create a key; the plaintext goes only into the new mode-600 file, stdout shows label and path
+deno run --cached-only --allow-read=/var/lib/base-reads,/root --allow-write=/var/lib/base-reads,/root --allow-env=TRIAL_KEYS_FILE \
+  scripts/trial_key.ts generate --label acme --days 30 --out /root/trial-key-acme.txt
+# hand the file content over through a private channel, then delete it
+shred -u /root/trial-key-acme.txt
+# revoke (effective within ~5 s) and list (labels and dates only, never keys or hashes)
+deno run --cached-only --allow-read=/var/lib/base-reads --allow-write=/var/lib/base-reads --allow-env=TRIAL_KEYS_FILE scripts/trial_key.ts revoke --label acme
+deno run --cached-only --allow-read=/var/lib/base-reads --allow-env=TRIAL_KEYS_FILE scripts/trial_key.ts list
+```
+
+Labels are lowercase `[a-z0-9._-]`, up to 48 characters, and must be unique (a revoked label cannot be reused).
