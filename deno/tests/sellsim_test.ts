@@ -1,6 +1,6 @@
 // Sell simulation + pre-sign verdict: pure unit tests (no network; rpc and lookups are stubs, keys are ephemeral in-memory).
-import { assert, assertEquals } from "jsr:@std/assert@1";
-import { decodeRevert, decodeRun, INITIALIZE_TOPIC, parseInitializeLog, poolId, signProof, taxes, verifyProof, word, virtualQuote } from "../lib/sellsim.ts";
+import { assert, assertEquals, assertThrows } from "jsr:@std/assert@1";
+import { decodeRevert, decodeRun, factoryAddr, selectUsable, INITIALIZE_TOPIC, parseInitializeLog, poolId, signProof, taxes, verifyProof, word, virtualQuote } from "../lib/sellsim.ts";
 import { HELPER_SOURCE_SHA256 } from "../lib/sellsim_helper.ts";
 import { call, decode, encode, selector } from "../lib/abi.ts";
 import { decodeTx, evaluate, MAX_UINT, presign, txSimOverrides, v3Path, type Facts } from "../lib/presign.ts";
@@ -123,7 +123,12 @@ Deno.test("policy thresholds are deterministic", () => {
   assertEquals(codes(evaluate(F({ token_sims: [{ token: BRETT, sim: okSim({ round_trip_return: 0.5 }) }] }))), ["low_round_trip_return"]);
   const hk = evaluate(F({ token_sims: [{ token: WORTH, sim: okSim({}, { version: 4, pool: "0xid", hooks: HOOK }) }] })); assertEquals(hk.verdict, "warn"); assertEquals(hk.reasons[0].hook, HOOK);
   assertEquals(evaluate(F({ token_sims: [{ token: WORTH, sim: okSim({}, { version: 4, pool: "0xid", hooks: ETH }) }] })).verdict, "allow");
-  const np = evaluate(F({ token_sims: [{ token: BRETT, sim: { selected: null, no_pool_reason: "x" } }] })); assertEquals(np.verdict, "warn"); assertEquals(codes(np), ["no_supported_liquidity"]);
+  const np = evaluate(F({ token_sims: [{ token: BRETT, sim: { selected: null, no_pool_reason: "x" }, token_verification: { address: BRETT, source: "sourcify", status: "verified" } }] }));
+  assertEquals(np.verdict, "warn"); assertEquals(np.reasons, [{ code: "no_supported_liquidity", token: BRETT, severity: "normal" }]);
+  for (const st of ["not_found", "lookup_failed"] as const) {
+    const nu = evaluate(F({ token_sims: [{ token: BRETT, sim: { selected: null, no_pool_reason: "x" }, token_verification: { address: BRETT, source: "sourcify", status: st } }] }));
+    assertEquals(nu.verdict, "warn"); assertEquals(nu.reasons, [{ code: "no_supported_liquidity_unverified_token", token: BRETT, severity: "high", verification: st }]);
+  }
   assertEquals(evaluate(F({ token_sims: [{ token: BRETT, sim: null, error: "boom" }] })).verdict, "warn");
   const rv = evaluate(F({ tx_sim: { reverted: true, revert_data: "0x", message: "empty_revert" } })); assertEquals(rv.verdict, "block"); assertEquals(rv.reasons[0], { code: "tx_reverts", data: "0x", message: "empty_revert" });
   assertEquals(evaluate(F({ tx_sim: { reverted: false, rpc_error: "429" } })).verdict, "warn");
@@ -154,4 +159,22 @@ Deno.test("presign with stub rpc: max approve to unverified contract -> warn; re
   assertEquals(r.verdict, "warn"); assertEquals(r.reasons[0].code, "unlimited_approval_unverified_spender"); assertEquals(r.tx_simulation.reverted, false);
   const t = await presign(rpc, { tx: { to: BRETT, from: UR, data: call("transfer(address,uint256)", [spender, 1n]) } }, 100, { lookup, skipTokens: [BRETT] });
   assertEquals(t.verdict, "block"); assertEquals(t.reasons[0].code, "tx_reverts");
+});
+
+// Regression: TRUMP (R3) has two v3 WETH pools whose in-range liquidity is 0 at block 53273610.
+// v0.1 dropped them with the quote_depth_eth > 0 filter and reported "no pool".
+Deno.test("regression: zero in-range liquidity v3 pools are still simulated (TRUMP/WETH 500 + 10000)", () => {
+  const W = "0x4200000000000000000000000000000000000006";
+  const p500 = { version: 3, pool: "0xed3ac538bbb824bf3c8ea9d1075b965d233e96b2", quote: W, fee: 500, liquidity_raw: "0", sqrt_price_x96: "4295128740", quote_depth_raw: "0", quote_depth_eth: 0, quote_balance_raw: "907083172003688", spot_token_per_quote: null, lp_fee_ppm: 500, source: "v3_factory.getPool" } as any;
+  const p10k = { ...p500, pool: "0xd641c602cc11dac140d0bcbf741e42201bf5b03a", fee: 10000, sqrt_price_x96: "142651284308418067891098769", quote_balance_raw: "3", lp_fee_ppm: 10000 };
+  const r = selectUsable([p10k, p500]);
+  assertEquals(r.mode, "zero_active_liquidity_fallback"); assertEquals(r.usable.map((x) => x.fee), [500, 10000]);
+  const live = { ...p500, pool: "0xaaaa", quote_depth_eth: 1 };
+  assertEquals(selectUsable([p500, live, p10k]), { usable: [live], mode: "active_liquidity" });
+  assertEquals(selectUsable([]).mode, "none");
+});
+Deno.test("regression: empty factory response is an rpc error, not 'no pool'", () => {
+  assertThrows(() => factoryAddr("0x")); assertThrows(() => factoryAddr(null)); assertThrows(() => factoryAddr(""));
+  assertEquals(factoryAddr("0x" + "0".repeat(64)), "0x0000000000000000000000000000000000000000");
+  assertEquals(factoryAddr("0x" + "0".repeat(24) + "ed3ac538bbb824bf3c8ea9d1075b965d233e96b2"), "0xed3ac538bbb824bf3c8ea9d1075b965d233e96b2");
 });

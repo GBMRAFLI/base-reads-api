@@ -6,7 +6,7 @@ import { decode, selector } from "./abi.ts";
 import { CHAIN_ID, ETH, isAddr, POOL_MANAGER, Rpc, sellSim, signProof, USDC, WETH, decodeRevert } from "./sellsim.ts";
 import type { Signer } from "./attestation.ts";
 
-export const POLICY_VERSION = "presign-policy/0.1";
+export const POLICY_VERSION = "presign-policy/0.2";
 export const POLICY = {
   block_tax_at_or_above: 0.30,   // buy or sell tax >= 30% -> block
   warn_tax_above: 0.01,          // buy or sell tax > 1% -> warn (rounding noise below)
@@ -157,7 +157,7 @@ export type Unknown = { what: string; reason: string; [k: string]: unknown };
 export type Facts = {
   tx_sim?: { reverted: boolean; revert_data?: string | null; message?: string | null; rpc_error?: string | null } | null;
   approvals: (Approval & { spender_known: string | null; spender_is_contract: boolean | null; spender_verification: Verification | null })[];
-  token_sims: { token: string; sim: any | null; error?: string | null; hook_verification?: Verification | null }[];
+  token_sims: { token: string; sim: any | null; error?: string | null; hook_verification?: Verification | null; token_verification?: Verification | null }[];
 };
 const r6 = (x: number) => Math.round(x * 1e6) / 1e6;
 export function evaluate(f: Facts): { verdict: "allow" | "warn" | "block"; reasons: Reason[]; unknowns: Unknown[] } {
@@ -180,7 +180,14 @@ export function evaluate(f: Facts): { verdict: "allow" | "warn" | "block"; reaso
   for (const t of f.token_sims) {
     const s = t.sim;
     if (!s) { unknowns.push({ what: "token_simulation", token: t.token, reason: t.error ?? "not_run" }); continue; }
-    if (!s.selected) { unknowns.push({ what: "token_simulation", token: t.token, reason: "no_pool_found: " + (s.no_pool_reason ?? "") }); reasons.push({ code: "no_supported_liquidity", token: t.token }); continue; }
+    if (!s.selected) {
+      unknowns.push({ what: "token_simulation", token: t.token, reason: "no_pool_found: " + (s.no_pool_reason ?? "") });
+      // 0.2: closed-source (not Sourcify-verified, or lookup failed) + no simulatable pool = stronger warn; verdict stays warn
+      const vs = t.token_verification?.status ?? "not_checked";
+      if (vs === "verified") reasons.push({ code: "no_supported_liquidity", token: t.token, severity: "normal" });
+      else reasons.push({ code: "no_supported_liquidity_unverified_token", token: t.token, severity: "high", verification: vs });
+      continue;
+    }
     const sel = s.selected; const sim = s.simulation;
     if (sel.version === 4 && sel.hooks && sel.hooks !== ETH && !HOOK_ALLOWLIST[sel.hooks]) {
       reasons.push({ code: "main_liquidity_v4_hook", token: t.token, pool: sel.pool, hook: sel.hooks, hook_verification: t.hook_verification?.status ?? "not_checked" });
@@ -248,18 +255,19 @@ export async function presign(rpc: Rpc, input: { tx?: Tx; token?: string }, bloc
       const s = await sellSim(rpc, tok, block, { blockHash: opts.blockHash, ...(opts.sellSimOpts ?? {}) } as any);
       let hv: Verification | null = null;
       if (s.selected?.version === 4 && s.selected.hooks && s.selected.hooks !== ETH) hv = await lookup(s.selected.hooks);
-      token_sims.push({ token: tok, sim: s, hook_verification: hv });
+      const tv = s.selected ? null : await lookup(tok);
+      token_sims.push({ token: tok, sim: s, hook_verification: hv, token_verification: tv });
     } catch (e) { token_sims.push({ token: tok, sim: null, error: String((e as Error).message).slice(0, 200) }); }
   }
   const ev = evaluate({ tx_sim: txSim, approvals, token_sims });
   ev.unknowns.push(...unknownsExtra);
   if (decoded && decoded.method === "unknown" && !decoded.swaps.length) ev.unknowns.push({ what: "tx_intent", reason: "calldata selector not in the decoder table; only the raw eth_call outcome is checked" });
   if (ev.verdict === "allow" && ev.unknowns.some((u) => u.what !== "hook_behavior")) ev.verdict = "warn";
-  if (approvals.some((a) => a.spender_verification) || token_sims.some((t) => t.hook_verification)) ev.unknowns.push({ what: "source_verification_coverage", reason: "Sourcify is the only free source used; not_found there does not prove a contract is unverified elsewhere" });
+  if (approvals.some((a) => a.spender_verification) || token_sims.some((t) => t.hook_verification || t.token_verification)) ev.unknowns.push({ what: "source_verification_coverage", reason: "Sourcify is the only free source used; not_found there does not prove a contract is unverified elsewhere" });
   return {
     chain_id: CHAIN_ID, block_number: block, block_hash: opts.blockHash ?? null,
     input: input.tx ? { tx: { ...input.tx, value: input.tx.value === undefined ? undefined : String(input.tx.value) } } : { token: lc(input.token!) },
-    decoded, tx_simulation: txSim, approvals, token_sims: token_sims.map((t) => ({ token: t.token, error: t.error ?? null, hook_verification: t.hook_verification ?? null, sell_simulation: t.sim })),
+    decoded, tx_simulation: txSim, approvals, token_sims: token_sims.map((t) => ({ token: t.token, error: t.error ?? null, hook_verification: t.hook_verification ?? null, token_verification: t.token_verification ?? null, sell_simulation: t.sim })),
     verdict: ev.verdict, reasons: ev.reasons, unknowns: ev.unknowns, policy: { version: POLICY_VERSION, ...POLICY, known_spenders: KNOWN_SPENDERS, hook_allowlist: HOOK_ALLOWLIST },
     elapsed_ms: Math.round(performance.now() - t0),
   };

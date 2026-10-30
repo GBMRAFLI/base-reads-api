@@ -108,7 +108,7 @@ export function taxes(r: bigint[], stage: number) {
 
 // ---------- discovery ----------
 export type Candidate = { version: 2 | 3 | 4; pool: string; quote: string; fee: number | null; tick_spacing?: number; hooks?: string; key?: PoolKey;
-  liquidity_raw: string; sqrt_price_x96?: string; reserves?: [string, string]; quote_depth_raw: string; quote_depth_eth: number | null; spot_token_per_quote: number | null;
+  liquidity_raw: string; sqrt_price_x96?: string; quote_balance_raw?: string; reserves?: [string, string]; quote_depth_raw: string; quote_depth_eth: number | null; spot_token_per_quote: number | null;
   lp_fee_ppm: number | null; source: string };
 type Ctx = { rpc: Rpc; tag: string; ethUsdc: number | null };
 const call = (c: Ctx, to: string, data: string) => c.rpc("eth_call", [{ to, data: "0x" + data }, c.tag]);
@@ -124,7 +124,7 @@ export async function ethUsdcPrice(rpc: Rpc, tag: string): Promise<number | null
 async function v2Candidates(c: Ctx, token: string, quotes: string[]): Promise<Candidate[]> {
   const out: Candidate[] = [];
   for (const q of quotes) {
-    const pair = wordAddr(big(await call(c, V2_FACTORY, SEL.getPair + word(token) + word(q)))); if (pair === ETH) continue;
+    const pair = factoryAddr((await call(c, V2_FACTORY, SEL.getPair + word(token) + word(q)))); if (pair === ETH) continue;
     const [r0, r1] = words(await call(c, pair, SEL.getReserves));
     const quoteIs0 = sortPair(token, q)[0] === q; const rq = quoteIs0 ? r0 : r1, rt = quoteIs0 ? r1 : r0;
     out.push({ version: 2, pool: pair, quote: q, fee: 3000, liquidity_raw: (r0 * r1).toString(), reserves: [r0.toString(), r1.toString()], quote_depth_raw: rq.toString(),
@@ -132,14 +132,23 @@ async function v2Candidates(c: Ctx, token: string, quotes: string[]): Promise<Ca
   }
   return out;
 }
-async function v3Candidates(c: Ctx, token: string, quotes: string[]): Promise<Candidate[]> {
+/** Factory getters always return a 32-byte word; "0x"/empty means the RPC gave no answer, NOT "no pool". */
+export function factoryAddr(raw: unknown): string {
+  if (typeof raw !== "string" || raw.length < 66) throw new Error("empty_factory_response");
+  return wordAddr(BigInt(raw));
+}
+async function v3Candidates(c: Ctx, token: string, quotes: string[], notes: string[] = []): Promise<Candidate[]> {
   const out: Candidate[] = [];
+  // every fee tier and quote is checked independently: one failing call must not drop the other pools
   for (const q of quotes) for (const fee of V3_FEES) {
-    const pool = wordAddr(big(await call(c, V3_FACTORY, SEL.getPool + word(token) + word(q) + word(fee)))); if (pool === ETH) continue;
-    const [sp] = words(await call(c, pool, SEL.slot0)); const [L] = words(await call(c, pool, SEL.liquidity));
-    const quoteIs0 = sortPair(token, q)[0] === q; const vq = virtualQuote(L, sp, quoteIs0);
-    out.push({ version: 3, pool, quote: q, fee, liquidity_raw: L.toString(), sqrt_price_x96: sp.toString(), quote_depth_raw: vq.toString(),
-      quote_depth_eth: depthEth(c, q, vq), spot_token_per_quote: sp > 0n ? spotTokenPerQuote(sp, quoteIs0) : null, lp_fee_ppm: fee, source: "v3_factory.getPool" });
+    try {
+      const pool = factoryAddr(await call(c, V3_FACTORY, SEL.getPool + word(token) + word(q) + word(fee))); if (pool === ETH) continue;
+      const [sp] = words(await call(c, pool, SEL.slot0)); const [L] = words(await call(c, pool, SEL.liquidity));
+      const qb = big(await call(c, q, SEL.balanceOf + word(pool)));
+      const quoteIs0 = sortPair(token, q)[0] === q; const vq = virtualQuote(L, sp, quoteIs0);
+      out.push({ version: 3, pool, quote: q, fee, liquidity_raw: L.toString(), sqrt_price_x96: sp.toString(), quote_depth_raw: vq.toString(),
+        quote_depth_eth: depthEth(c, q, vq), quote_balance_raw: qb.toString(), spot_token_per_quote: sp > 0n ? spotTokenPerQuote(sp, quoteIs0) : null, lp_fee_ppm: fee, source: "v3_factory.getPool" });
+    } catch (e) { notes.push(`v3 ${q.slice(0, 6)} fee ${fee}: ${String((e as Error).message).slice(0, 120)}`); }
   }
   return out;
 }
@@ -151,6 +160,15 @@ async function v4Candidate(c: Ctx, token: string, key: PoolKey, source: string):
   const vq = virtualQuote(L, s[0], quoteIs0);
   return { version: 4, pool: id, quote, fee: key.fee, tick_spacing: key.tickSpacing, hooks: key.hooks, key, liquidity_raw: L.toString(), sqrt_price_x96: s[0].toString(),
     quote_depth_raw: vq.toString(), quote_depth_eth: depthEth(c, quote, vq), spot_token_per_quote: spotTokenPerQuote(s[0], quoteIs0), lp_fee_ppm: Number(s[3]), source };
+}
+/** Pools with in-range liquidity first (max 3). If none, pools that exist but have zero in-range liquidity
+ *  (v3 L=0 / out-of-range positions) are still simulated: a swap can cross into out-of-range ticks. */
+export function selectUsable(cands: Candidate[], max = 3): { usable: Candidate[]; mode: "active_liquidity" | "zero_active_liquidity_fallback" | "none" } {
+  const act = cands.filter((x) => (x.quote_depth_eth ?? 0) > 0);
+  if (act.length) return { usable: act.slice(0, max), mode: "active_liquidity" };
+  const z = cands.filter((x) => x.version !== 4 || BigInt(x.sqrt_price_x96 ?? "0") > 0n)
+    .sort((a, b) => { const k = (x: Candidate) => BigInt(x.quote_balance_raw ?? x.quote_depth_raw ?? "0"); const d = k(b) - k(a); return d > 0n ? 1 : d < 0n ? -1 : 0; });
+  return z.length ? { usable: z.slice(0, max), mode: "zero_active_liquidity_fallback" } : { usable: [], mode: "none" };
 }
 /** First block at which `addr` has code (binary search over eth_getCode on an archive-capable RPC). */
 export async function creationBlock(rpc: Rpc, addr: string, head: number): Promise<number | null> {
@@ -182,7 +200,7 @@ export async function discover(rpc: Rpc, token: string, block: number, opts: Dis
   const cands: Candidate[] = [];
   const safe = async <T>(name: string, f: () => Promise<T>): Promise<T | null> => { try { return await f(); } catch (e) { notes.push(`${name}: ${String((e as Error).message).slice(0, 160)}`); return null; } };
   cands.push(...(await safe("v2", () => v2Candidates(c, token, quotes)) ?? []));
-  cands.push(...(await safe("v3", () => v3Candidates(c, token, quotes)) ?? []));
+  cands.push(...(await safe("v3", () => v3Candidates(c, token, quotes, notes)) ?? []));
   const keys = new Map<string, { key: PoolKey; source: string }>();
   for (const q of [ETH, ...quotes]) for (const [fee, ts] of V4_HOOKLESS) {
     const [c0, c1] = sortPair(token, q); const key = { currency0: c0, currency1: c1, fee, tickSpacing: ts, hooks: ETH }; keys.set(poolId(key), { key, source: "v4_hookless_enumeration" });
@@ -289,7 +307,7 @@ export async function sellSim(rpc: Rpc, token: string, block: number, opts: Disc
   const d = await discover(rpc, token, block, opts);
   // deepest pool first; if its buy leg reverts or the call fails, try the next one (max 3).
   // A sell-leg failure is a result, not a reason to switch pools.
-  const usable = d.candidates.filter((x) => (x.quote_depth_eth ?? 0) > 0).slice(0, 3);
+  const { usable, mode } = selectUsable(d.candidates);
   let top: Candidate | null = null, sim: Awaited<ReturnType<typeof simulate>> | null = null;
   const attempts: { pool: string; version: number; outcome: string }[] = [];
   for (const c of usable) {
@@ -301,10 +319,11 @@ export async function sellSim(rpc: Rpc, token: string, block: number, opts: Disc
   return {
     chain_id: CHAIN_ID, block_number: block, block_hash: opts.blockHash ?? null, token,
     candidates: d.candidates.map(({ key: _k, ...x }) => x), eth_usdc_price: d.eth_usdc, token_created_block: d.token_created_block,
-    selected: top ? { version: top.version, pool: top.pool, quote: top.quote, fee: top.fee, tick_spacing: top.tick_spacing ?? null, hooks: top.hooks ?? null, key: top.key ?? null, selection: attempts.length > 1 ? "next deepest after buy-leg failure" : "max quote_depth_eth" } : null,
+    selected: top ? { version: top.version, pool: top.pool, quote: top.quote, fee: top.fee, tick_spacing: top.tick_spacing ?? null, hooks: top.hooks ?? null, key: top.key ?? null, selection: (mode === "zero_active_liquidity_fallback" ? "zero in-range liquidity fallback; " : "") + (attempts.length > 1 ? "next candidate after buy-leg failure" : "max quote_depth_eth") } : null,
     attempts,
     simulation: sim, sellable: sim?.result ? sim.result.sellable : null,
-    no_pool_reason: top ? null : "no v2/v3/v4 pool with WETH, ETH or USDC and non-zero liquidity found by the discovery methods used",
+    no_pool_reason: top ? null : "no v2/v3/v4 pool with WETH, ETH or USDC found by the discovery methods used",
+    pool_mode: mode,
     discovery_notes: d.notes, elapsed_ms: Math.round(performance.now() - t0),
   };
 }

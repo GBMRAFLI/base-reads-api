@@ -34,7 +34,7 @@ No LLM in the path; the verdict is a pure function of simulated facts and the th
    - Etherscan/Basescan need a key, so they are not used. `not_found` on Sourcify is reported as such, not as proof that a contract is unverified.
 5. **Verdict + proof:** see below.
 
-## Policy `presign-policy/0.1` (deterministic)
+## Policy `presign-policy/0.2` (deterministic)
 
 | condition | reason code | effect |
 |---|---|---|
@@ -47,10 +47,15 @@ No LLM in the path; the verdict is a pure function of simulated facts and the th
 | approval ≥ 2^255 to a contract that is not a known spender and not Sourcify-verified | `unlimited_approval_unverified_spender {spender, verification}` | warn |
 | main pool is v4 with a non-zero hook not on the allowlist (allowlist is empty) | `main_liquidity_v4_hook {pool, hook}` | warn |
 | buy leg reverts in all tried pools | `buy_reverts` | warn (+ unknown) |
-| no supported pool | `no_supported_liquidity` | warn (+ unknown) |
+| no supported pool, token Sourcify-verified | `no_supported_liquidity {severity: normal}` | warn (+ unknown) |
+| no supported pool, token not Sourcify-verified (or lookup failed) | `no_supported_liquidity_unverified_token {severity: high, verification}` | warn (+ unknown) |
 | any other unknown (rpc error, undecoded calldata) | in `unknowns` | at least warn |
 
 Otherwise the verdict is **allow**.
+
+Changes in 0.2: added the `severity` field and the `no_supported_liquidity_unverified_token` code. When there is no simulatable pool, the outcome cannot be measured. A closed-source token in that state cannot be checked by either code reading or simulation, so the warning is stronger. It stays `warn`, not `block`, because block is reserved for observed failures (revert, honeypot, tax), and missing evidence is not proof of a trap.
+
+Pool selection: pools with in-range liquidity are tried first. If none exist, pools that exist but have zero in-range liquidity (v3 `liquidity()==0`, positions out of range) are still simulated (`pool_mode: zero_active_liquidity_fallback`), because a swap can cross into out-of-range ticks. An empty factory response (`0x`) is an RPC error recorded in `discovery_notes`, never "no pool". Each v3 fee tier and quote is checked independently.
 
 Known spenders are the canonical Uniswap v2 router, SwapRouter02, the Universal Routers, Permit2 and the v4 PoolManager on Base.
 
