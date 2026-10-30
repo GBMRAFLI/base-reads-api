@@ -85,7 +85,16 @@ A request that carries `PAYMENT-SIGNATURE` always takes the payment path.
 - Reload: the server re-checks the file's mtime/size at most every 5 s and re-reads it on change, so generate and revoke take
   effect within about 5 s without a restart.
 - Quota: counted atomically in Deno KV per key label and UTC day (entries expire after 2 days). A call is counted when it is
-  accepted, before the route runs, so a trial call with bad input (400) still uses one unit.
+  accepted, before the route runs, so a trial call that fails inside the route (bad input, upstream error) still uses one unit.
+  For `/x402/preflight`, the URL/SSRF checks and capacity checks run first and do not use a unit: per key+target limit (429),
+  per-target budget (503), and a probe slot from the same global pool paid checks use (one in-flight check per key: 429;
+  pool full: 503). Trial checks therefore can never exceed the global outbound concurrency cap; the slot is released when
+  the check ends. With a valid key these input/capacity answers can appear before an exhausted quota would give the 402.
+- Attestation: a trial `/x402/preflight` response is signed exactly like a paid one. The attestation describes the target
+  endpoint, not the caller or any payment, so it carries no trial marker.
+- Timing: rejected keys (malformed, unknown, revoked, expired, over quota) get byte-identical status, headers and body, but
+  response times can differ slightly (a malformed key skips the hash lookup; an over-quota key does one KV read). This is
+  only observable by someone who already holds a key and reveals nothing about other keys.
 - Records: each served trial call is stored in a separate `trials` stream (`kind: "trial"`, `label`, `route`, `httpStatus`,
   `servedAt`, optional `ref`). Never the key or its hash. Trial calls are never sales: they do not appear in
   `executions`/`outcomes`/`costs`, so they never count as buyers, verified sales or revenue. `/internal/export` returns them

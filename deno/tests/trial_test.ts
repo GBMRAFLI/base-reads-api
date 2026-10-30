@@ -1,6 +1,8 @@
 // Trial keys: valid key bypasses the 402 within its daily quota; every other case is the unchanged 402.
 import { assert, assertEquals } from "jsr:@std/assert@1";
-import { handler, resetGuards, exportRecords } from "../main.ts";
+import { abuse, handler, resetGuards, exportRecords } from "../main.ts";
+import { kv } from "../lib/store.ts";
+import { utcDay } from "../lib/trial.ts";
 import { useKv, rows, append } from "../lib/store.ts";
 import { reconcile } from "../lib/stream.ts";
 import { dailyLimit, hashKey, KEY_RE, newKey, resetTrialCache, TRIAL_FILE } from "../lib/trial.ts";
@@ -95,4 +97,44 @@ Deno.test("trial CLI: the subprocess stdout never contains the key", async () =>
   const r = await p.output(); const so = new TextDecoder().decode(r.stdout) + new TextDecoder().decode(r.stderr);
   assertEquals(r.code, 0, so); const key = (await Deno.readTextFile(dest)).trim();
   assert(!so.includes(key)); assert(so.includes("label=sub"));
+});
+
+const CH = { x402Version: 2, accepts: [{ scheme: "exact", network: "eip155:8453", amount: "10000", asset: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913", payTo: "0x" + "ab".repeat(20), maxTimeoutSeconds: 60 }] };
+Deno.test("trial preflight: parallel multi-host burst respects the global slot cap; rejections do not use quota; slots released", async () => {
+  await fresh({ TRIAL_DAILY_LIMIT: "50", NETWORK: "eip155:84532" });
+  const keys: string[] = []; const list = [];
+  for (let i = 0; i < 6; i++) { const k = newKey(); keys.push(k); list.push({ label: "burst" + i, hash: await hashKey(k), created: now() }); }
+  await writeKeys(list);
+  let live = 0, peak = 0;
+  const fetcher = async () => { live++; peak = Math.max(peak, live); await new Promise((r) => setTimeout(r, 60)); live--;
+    return new Response("{}", { status: 402, headers: { "PAYMENT-REQUIRED": btoa(JSON.stringify(CH)) } }); };
+  const resolver = async () => ["93.184.216.34"];
+  const bgs: Promise<unknown>[] = [];
+  const one = async (key: string, host: string, ip: string) => {
+    const r = await handler(new Request("http://h.example/x402/preflight?url=" + encodeURIComponent("https://" + host + "/x"), { headers: { Host: "h.example", "X-Trial-Key": key } }),
+      { env, rpc, resolver, fetcher: fetcher as any, background: (p) => { bgs.push(p); }, ip });
+    await r.body?.cancel(); return r.status;
+  };
+  // 6 keys x 3 hosts each, all at once
+  const jobs: Promise<number>[] = []; const who: number[] = [];
+  keys.forEach((k, i) => { for (let j = 0; j < 3; j++) { jobs.push(one(k, `t${i}-${j}.example`, "198.51.100." + (10 + i))); who.push(i); } });
+  const st = await Promise.all(jobs); await Promise.all(bgs);
+  const max = abuse(env).slots.max; const capNew = max < 2 ? max : max - 1;
+  assert(peak <= capNew, `peak ${peak} > cap ${capNew}`);
+  assert(st.some((s) => s === 429) && st.some((s) => s === 503), "expected payer_busy 429 and capacity 503: " + st.join(","));
+  assert(st.every((s) => s !== 402)); assertEquals(abuse(env).slots.active(), 0, "all slots released");
+  const k = await kv(); let used = 0;
+  for (let i = 0; i < 6; i++) used += (await k.get<number>(["trial", "count", "burst" + i, utcDay(Date.now())])).value ?? 0;
+  assertEquals(used, st.filter((s) => s !== 429 && s !== 503).length, "only served calls use quota");
+});
+Deno.test("trial CLI: generate --out refuses an existing path or symlink and does not touch its target", async () => {
+  const kf = dir + "/sym-keys.json"; Deno.env.set("TRIAL_KEYS_FILE", kf);
+  const target = dir + "/victim.txt"; await Deno.writeTextFile(target, "keep\n"); const link = dir + "/link.txt"; await Deno.symlink(target, link);
+  const dangling = dir + "/dangling.txt"; await Deno.symlink(dir + "/nothing-here", dangling);
+  const out: string[] = [], err: string[] = [];
+  for (const dest of [link, dangling, target]) assertEquals(await cli(["generate", "--label", "sym", "--out", dest], (s) => out.push(s), (s) => err.push(s)), 1, dest);
+  assertEquals(await Deno.readTextFile(target), "keep\n");
+  let exists = true; try { await Deno.lstat(dir + "/nothing-here"); } catch { exists = false; } assertEquals(exists, false);
+  let keysFile = true; try { await Deno.stat(kf); } catch { keysFile = false; } assertEquals(keysFile, false, "no entry added");
+  Deno.env.delete("TRIAL_KEYS_FILE");
 });

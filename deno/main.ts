@@ -17,7 +17,7 @@ import ATT_SCHEMA from "../spec/prepay-check-attestation-v1.schema.json" with { 
 import { scheduledSnapshot, latestSnapStatus, loadFail, mapErrorCode } from "./lib/snapshot.ts";
 import { EXPORT_FILES, kv, rows } from "./lib/store.ts";
 import { recordObservation, recordSale, reconcile, verifyOnchain } from "./lib/stream.ts";
-import { acceptTrial, recordTrial, TRIAL_FILE, TRIAL_HEADER } from "./lib/trial.ts";
+import { dailyLimit, recordTrial, resolveTrial, takeQuota, TRIAL_FILE, TRIAL_HEADER } from "./lib/trial.ts";
 import { ADDR, b64json, iso, pyQuery, sha256hex, unquote } from "./lib/util.ts";
 
 const USDCS: Record<string, string> = { "eip155:8453": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913", "eip155:84532": "0x036CbD53842c5426634e7929541eC2318f3dCF7e" };
@@ -371,7 +371,7 @@ async function handleGet(req: Request, d: Deps): Promise<Response> {
   if (publicUrlError(env)) return send(503, { error: "public origin not configured" }); // mainnet without PUBLIC_URL: never use Host
   if (!sig) {
     const tk = req.headers.get(TRIAL_HEADER);
-    if (tk) { const label = await acceptTrial(tk, env); if (label) { const [code, out] = await trialServe(path, q, label, d, c, rpc); return send(code, out); } }
+    if (tk) { const label = await resolveTrial(tk, env); if (label) { const r = await trialServe(path, q, label, d, c, rpc); if (r) return send(r[0], r[1]); } }
     // Not accepted (any reason): fall through to the exact 402 flow a request without the header gets.
     // A6: unpaid 402s are pure computation (no DNS, GET or RPC) and limited per client IP.
     // IPv6: per-/64 key plus a per-/48 aggregate, so a prefix spray is bounded without filling the per-client table.
@@ -385,25 +385,38 @@ async function handleGet(req: Request, d: Deps): Promise<Response> {
   return send(code, out, hd);
 }
 
-/** Serve one accepted trial call: same handlers as a paid call, no facilitator or chain payment check.
- * Pre-pay Check keeps its SSRF policy, per-target budget and outbound concurrency limit. */
-async function trialServe(path: string, q: Record<string, string>, label: string, d: Deps, c: Cfg, rpc: Rpc): Promise<[number, unknown]> {
-  const env = d.env; let code = 0, out: unknown = null;
+/** Serve one trial call for a valid key: same handlers as a paid call, no facilitator or chain payment check.
+ * Returns null when the daily quota is used up (caller falls through to the normal 402).
+ * Pre-pay Check: URL/SSRF checks and capacity (per-key+target limit, per-target budget, probe slot) are checked BEFORE the
+ * quota is taken, so a capacity or input rejection never uses a unit. The probe slot is the same global SlotTable the
+ * paid path uses, held as payer "trial:<label>" (one in-flight check per key), and released in finally. */
+async function trialServe(path: string, q: Record<string, string>, label: string, d: Deps, c: Cfg, rpc: Rpc): Promise<[number, unknown] | null> {
+  const env = d.env; let code = 0, out: unknown = null; let slot: string | null = null; const G = abuse(env);
   try {
     if (path === "/x402/preflight") {
       const u = unquote(q.url ?? "");
       if (!u) return [400, { error: "give ?url=https://..." }];
       const chk = await checkUrl(u, d.resolver);
       if (!chk.u) return [400, { error: chk.err, target_url_allowed: false }];
-      const G = abuse(env);
-      if (!G.hostPayer.allow(hostOf(u) + "|trial:" + label) || !G.perHost.allow(hostOf(u))) return [429, { error: "too many checks of this target, retry later" }];
-      [code, out] = await preflight(u, { resolver: d.resolver, fetcher: d.fetcher, env, rpc,
+      const who = "trial:" + label, h = hostOf(u);
+      if (!G.hostPayer.peek(h + "|" + who)) return [429, { error: "too many checks of this target in the last minute, retry later", scope: "target_payer" }];
+      if (!G.perHost.peek(h)) return [503, { error: "target check capacity is full for this minute, retry later", scope: "target" }];
+      const rv = G.slots.reserve(who, crypto.randomUUID(), h, clock.now());
+      if (rv === "payer_busy") return [429, { error: "this key already has a check in progress", scope: "payer" }];
+      if (rv === "full") return [503, { error: "probe capacity busy, retry shortly" }];
+      slot = rv.id;
+      if (!await takeQuota(label, dailyLimit(env), Date.now())) return null;
+      G.hostPayer.allow(h + "|" + who); G.perHost.allow(h); G.slots.extend(slot, SLOT_PROBE_MS);
+      [code, out] = await preflight(u, { resolver: d.resolver, fetcher: d.fetcher, env, rpc, slotHeld: true,
         issuerUrl: c.PUBLIC ? c.PUBLIC.replace(/\/+$/, "") + "/.well-known/issuer.json" : null });
-    } else [code, out] = await new Chain(rpc, c.USDC).handle(path, q);
+    } else {
+      if (!await takeQuota(label, dailyLimit(env), Date.now())) return null;
+      [code, out] = await new Chain(rpc, c.USDC).handle(path, q);
+    }
   } catch (e) {
     if (e instanceof SigningUnavailable) return [503, { error: "signing unavailable" }];
     return [502, { error: "upstream error" }];
-  }
+  } finally { if (slot) G.slots.release(slot); }
   const bg = d.background ?? ((p: Promise<unknown>) => { p.catch(() => {}); });
   bg(recordTrial(path, label, code, cleanRef(q.ref !== undefined ? "ref=" + q.ref : "")).catch((e) => console.log("trial log write failed:", (e as Error).name)));
   return [code, out];

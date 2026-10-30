@@ -66,14 +66,19 @@ export async function takeQuota(label: string, limit: number, now: number): Prom
   }
   return false;
 }
-/** Returns the key label when the header holds a valid, active, under-quota key; otherwise null (normal 402 flow). */
-export async function acceptTrial(header: string | null, env: Env, now = Date.now()): Promise<string | null> {
+/** Returns the key label when the header holds a valid, active key (quota NOT taken); otherwise null. */
+export async function resolveTrial(header: string | null, env: Env, now = Date.now()): Promise<string | null> {
   if (!header || !KEY_RE.test(header)) return null;
   const byHash = await entries(env, now); if (!byHash.size) return null;
   const e = byHash.get(await hashKey(header)); // lookup by hash: the plaintext is never compared or stored
   if (!e || e.revoked) return null;
   if (e.expires) { const t = Date.parse(e.expires); if (!Number.isFinite(t) || t <= now) return null; }
-  return await takeQuota(e.label, dailyLimit(env), now) ? e.label : null;
+  return e.label;
+}
+/** Valid, active and under quota (takes one unit): the label, else null (normal 402 flow). */
+export async function acceptTrial(header: string | null, env: Env, now = Date.now()): Promise<string | null> {
+  const label = await resolveTrial(header, env, now);
+  return label && await takeQuota(label, dailyLimit(env), now) ? label : null;
 }
 /** One record per served trial call. Label only: never the key or its hash. */
 export function recordTrial(route: string, label: string, code: number, ref: string | null = null) {
