@@ -138,3 +138,36 @@ Deno.test("trial CLI: generate --out refuses an existing path or symlink and doe
   let keysFile = true; try { await Deno.stat(kf); } catch { keysFile = false; } assertEquals(keysFile, false, "no entry added");
   Deno.env.delete("TRIAL_KEYS_FILE");
 });
+Deno.test("trial: exhausted key -> byte-identical 402 with zero resolver calls (valid and invalid url)", async () => {
+  await fresh({ TRIAL_DAILY_LIMIT: "1", NETWORK: "eip155:84532" });
+  const key = newKey(); await writeKeys([{ label: "spent", hash: await hashKey(key), created: now() }]);
+  let dns = 0; const resolver = async () => { dns++; return ["93.184.216.34"]; };
+  const fetcher = async () => new Response("{}", { status: 402, headers: { "PAYMENT-REQUIRED": btoa(JSON.stringify(CH)) } });
+  const go = async (url: string, k?: string) => {
+    const h: Record<string, string> = { Host: "h.example" }; if (k) h["X-Trial-Key"] = k;
+    const r = await handler(new Request("http://h.example/x402/preflight?url=" + encodeURIComponent(url), { headers: h }), { env, rpc, resolver, fetcher: fetcher as any, background: () => {}, ip: "198.51.100.40" });
+    return { status: r.status, body: await r.text(), pr: r.headers.get("PAYMENT-REQUIRED") };
+  };
+  assertEquals((await go("https://ok.example/x", key)).status, 200); // uses the only unit
+  const base = await go("https://ok.example/x"); dns = 0;
+  for (const u of ["https://r1.attacker.example/x", "https://r2.attacker.example/x", "not a url", "http://127.0.0.1/"]) {
+    const r = await go(u, key); assertEquals(r.status, 402, u); assertEquals(r.body, base.body); assertEquals(r.pr, base.pr);
+  }
+  assertEquals(dns, 0, "no DNS for an exhausted key");
+});
+Deno.test("trial: rejected (not served) trial calls count against the per-IP unpaid limit exactly once each", async () => {
+  await fresh({ UNPAID_PER_MIN: "5" });
+  const key = newKey(); await writeKeys([{ label: "noisy", hash: await hashKey(key), created: now() }]);
+  const ip = "198.51.100.50"; const st: number[] = [];
+  for (let i = 0; i < 8; i++) {
+    const r = await handler(new Request("http://h.example/x402/preflight", { headers: { Host: "h.example", "X-Trial-Key": key } }), { env, rpc, background: () => {}, ip });
+    st.push(r.status); if (r.status === 429) assertEquals(await r.text(), (await call("/base/network", undefined, ip)).body); else await r.body?.cancel();
+  }
+  assertEquals(st.slice(0, 5), [400, 400, 400, 400, 400]); assertEquals(st.slice(5), [429, 429, 429]);
+  // unpaid 402s and trial rejections share one budget: 3 rejections + 2 plain unpaid = 5, the 6th is limited
+  await fresh({ UNPAID_PER_MIN: "5" }); const ip2 = "198.51.100.51"; const s2: number[] = [];
+  for (let i = 0; i < 3; i++) s2.push((await handler(new Request("http://h.example/x402/preflight", { headers: { Host: "h.example", "X-Trial-Key": key } }), { env, rpc, background: () => {}, ip: ip2 })).status);
+  for (let i = 0; i < 3; i++) s2.push((await call("/base/network", newKey(), ip2)).status);
+  assertEquals(s2, [400, 400, 400, 402, 402, 429]);
+  assertEquals((await rows(TRIAL_FILE)).filter((x: any) => x.label === "noisy").length, 0, "rejections are not trial records");
+});

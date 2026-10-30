@@ -66,6 +66,10 @@ export async function takeQuota(label: string, limit: number, now: number): Prom
   }
   return false;
 }
+/** Non-consuming quota check (count < limit). takeQuota stays the authoritative consume. */
+export async function peekQuota(label: string, limit: number, now: number): Promise<boolean> {
+  const k = await kv(); return ((await k.get<number>(["trial", "count", label, utcDay(now)])).value ?? 0) < limit;
+}
 /** Returns the key label when the header holds a valid, active key (quota NOT taken); otherwise null. */
 export async function resolveTrial(header: string | null, env: Env, now = Date.now()): Promise<string | null> {
   if (!header || !KEY_RE.test(header)) return null;

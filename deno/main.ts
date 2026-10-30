@@ -17,7 +17,7 @@ import ATT_SCHEMA from "../spec/prepay-check-attestation-v1.schema.json" with { 
 import { scheduledSnapshot, latestSnapStatus, loadFail, mapErrorCode } from "./lib/snapshot.ts";
 import { EXPORT_FILES, kv, rows } from "./lib/store.ts";
 import { recordObservation, recordSale, reconcile, verifyOnchain } from "./lib/stream.ts";
-import { dailyLimit, recordTrial, resolveTrial, takeQuota, TRIAL_FILE, TRIAL_HEADER } from "./lib/trial.ts";
+import { dailyLimit, peekQuota, recordTrial, resolveTrial, takeQuota, TRIAL_FILE, TRIAL_HEADER } from "./lib/trial.ts";
 import { ADDR, b64json, iso, pyQuery, sha256hex, unquote } from "./lib/util.ts";
 
 const USDCS: Record<string, string> = { "eip155:8453": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913", "eip155:84532": "0x036CbD53842c5426634e7929541eC2318f3dCF7e" };
@@ -370,15 +370,28 @@ async function handleGet(req: Request, d: Deps): Promise<Response> {
   const sig = req.headers.get("PAYMENT-SIGNATURE") ?? req.headers.get("X-PAYMENT");
   if (publicUrlError(env)) return send(503, { error: "public origin not configured" }); // mainnet without PUBLIC_URL: never use Host
   if (!sig) {
-    const tk = req.headers.get(TRIAL_HEADER);
-    if (tk) { const label = await resolveTrial(tk, env); if (label) { const r = await trialServe(path, q, label, d, c, rpc); if (r) return send(r[0], r[1]); } }
-    // Not accepted (any reason): fall through to the exact 402 flow a request without the header gets.
     // A6: unpaid 402s are pure computation (no DNS, GET or RPC) and limited per client IP.
     // IPv6: per-/64 key plus a per-/48 aggregate, so a prefix spray is bounded without filling the per-client table.
-    const p48 = ipv6Prefix48(d.ip);
-    if (d.ip && (!abuse(env).unpaid.allow(SG.ipKey(d.ip) ?? d.ip) || (p48 !== null && !abuse(env).unpaid48.allow(p48)))) {
-      return send(429, { error: "too many unpaid requests, retry later", scope: "ip" }, { "Retry-After": "60" });
+    const p48 = ipv6Prefix48(d.ip); const ipk = d.ip ? (SG.ipKey(d.ip) ?? d.ip) : "";
+    const unpaidOk = (take: boolean) => !d.ip || (take
+      ? abuse(env).unpaid.allow(ipk) && (p48 === null || abuse(env).unpaid48.allow(p48))
+      : abuse(env).unpaid.peek(ipk) && (p48 === null || abuse(env).unpaid48.peek(p48)));
+    const UNPAID429 = () => send(429, { error: "too many unpaid requests, retry later", scope: "ip" }, { "Retry-After": "60" });
+    const tk = req.headers.get(TRIAL_HEADER);
+    if (tk) {
+      const label = await resolveTrial(tk, env);
+      // Exhausted quota is checked first (no count taken): no DNS, slot or handler work, straight to the normal 402 below.
+      if (label && await peekQuota(label, dailyLimit(env), Date.now())) {
+        if (!unpaidOk(false)) return UNPAID429(); // this IP is already over the unpaid limit: same answer as unpaid traffic
+        const r = await trialServe(path, q, label, d, c, rpc);
+        if (r && r[2]) return send(r[0], r[1]); // served: does not count as unpaid traffic
+        // Rejected before serving (input/capacity): counted once against the unpaid limit, like an unpaid request.
+        if (r) return unpaidOk(true) ? send(r[0], r[1]) : UNPAID429();
+        // r === null (quota raced to exhausted): falls through and is counted once below.
+      }
     }
+    // Not accepted (any reason): the exact 402 flow a request without the header gets (counted once here).
+    if (!unpaidOk(true)) return UNPAID429();
     const pr = required(path, req.headers.get("Host") ?? "", env); return send(402, pr, { "PAYMENT-REQUIRED": b64(pr) });
   }
   const [code, out, hd] = await paid(path, q, qs, sig, tReq, { ...d, ua: d.ua ?? req.headers.get("User-Agent") }, c, rpc, fac, req.headers.get("Host") ?? "");
@@ -390,36 +403,38 @@ async function handleGet(req: Request, d: Deps): Promise<Response> {
  * Pre-pay Check: URL/SSRF checks and capacity (per-key+target limit, per-target budget, probe slot) are checked BEFORE the
  * quota is taken, so a capacity or input rejection never uses a unit. The probe slot is the same global SlotTable the
  * paid path uses, held as payer "trial:<label>" (one in-flight check per key), and released in finally. */
-async function trialServe(path: string, q: Record<string, string>, label: string, d: Deps, c: Cfg, rpc: Rpc): Promise<[number, unknown] | null> {
-  const env = d.env; let code = 0, out: unknown = null; let slot: string | null = null; const G = abuse(env);
+async function trialServe(path: string, q: Record<string, string>, label: string, d: Deps, c: Cfg, rpc: Rpc): Promise<[number, unknown, boolean] | null> {
+  const env = d.env; let code = 0, out: unknown = null; let slot: string | null = null; let took = false; const G = abuse(env);
   try {
     if (path === "/x402/preflight") {
       const u = unquote(q.url ?? "");
-      if (!u) return [400, { error: "give ?url=https://..." }];
+      if (!u) return [400, { error: "give ?url=https://..." }, false];
       const chk = await checkUrl(u, d.resolver);
-      if (!chk.u) return [400, { error: chk.err, target_url_allowed: false }];
+      if (!chk.u) return [400, { error: chk.err, target_url_allowed: false }, false];
       const who = "trial:" + label, h = hostOf(u);
-      if (!G.hostPayer.peek(h + "|" + who)) return [429, { error: "too many checks of this target in the last minute, retry later", scope: "target_payer" }];
-      if (!G.perHost.peek(h)) return [503, { error: "target check capacity is full for this minute, retry later", scope: "target" }];
+      if (!G.hostPayer.peek(h + "|" + who)) return [429, { error: "too many checks of this target in the last minute, retry later", scope: "target_payer" }, false];
+      if (!G.perHost.peek(h)) return [503, { error: "target check capacity is full for this minute, retry later", scope: "target" }, false];
       const rv = G.slots.reserve(who, crypto.randomUUID(), h, clock.now());
-      if (rv === "payer_busy") return [429, { error: "this key already has a check in progress", scope: "payer" }];
-      if (rv === "full") return [503, { error: "probe capacity busy, retry shortly" }];
+      if (rv === "payer_busy") return [429, { error: "this key already has a check in progress", scope: "payer" }, false];
+      if (rv === "full") return [503, { error: "probe capacity busy, retry shortly" }, false];
       slot = rv.id;
       if (!await takeQuota(label, dailyLimit(env), Date.now())) return null;
+      took = true;
       G.hostPayer.allow(h + "|" + who); G.perHost.allow(h); G.slots.extend(slot, SLOT_PROBE_MS);
       [code, out] = await preflight(u, { resolver: d.resolver, fetcher: d.fetcher, env, rpc, slotHeld: true,
         issuerUrl: c.PUBLIC ? c.PUBLIC.replace(/\/+$/, "") + "/.well-known/issuer.json" : null });
     } else {
       if (!await takeQuota(label, dailyLimit(env), Date.now())) return null;
+      took = true;
       [code, out] = await new Chain(rpc, c.USDC).handle(path, q);
     }
   } catch (e) {
-    if (e instanceof SigningUnavailable) return [503, { error: "signing unavailable" }];
-    return [502, { error: "upstream error" }];
+    if (e instanceof SigningUnavailable) return [503, { error: "signing unavailable" }, took];
+    return [502, { error: "upstream error" }, took];
   } finally { if (slot) G.slots.release(slot); }
   const bg = d.background ?? ((p: Promise<unknown>) => { p.catch(() => {}); });
   bg(recordTrial(path, label, code, cleanRef(q.ref !== undefined ? "ref=" + q.ref : "")).catch((e) => console.log("trial log write failed:", (e as Error).name)));
-  return [code, out];
+  return [code, out, true];
 }
 const FAILS = new SG.FailLimiter();
 type Abuse = { unpaid: WindowLimiter; unpaid48: WindowLimiter; hostPayer: WindowLimiter; perHost: WindowLimiter; failNet: WindowLimiter; failedWho: WindowLimiter; cache: ResultCache<unknown>; slots: SlotTable };
