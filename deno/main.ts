@@ -376,18 +376,32 @@ async function handleGet(req: Request, d: Deps): Promise<Response> {
     const unpaidOk = (take: boolean) => !d.ip || (take
       ? abuse(env).unpaid.allow(ipk) && (p48 === null || abuse(env).unpaid48.allow(p48))
       : abuse(env).unpaid.peek(ipk) && (p48 === null || abuse(env).unpaid48.peek(p48)));
+    /** Take one unpaid unit on every limiter now; on any refusal, return the units already taken. */
+    const takeUnpaid = (): { release: () => void } | null => {
+      if (!d.ip) return { release: () => {} };
+      const G = abuse(env), now = Date.now(); const taken: [WindowLimiter, string, number][] = [];
+      const back = () => { for (const [l, k, st] of taken) l.release(k, st); };
+      for (const [l, k] of [[G.unpaid, ipk], ...(p48 === null ? [] : [[G.unpaid48, p48]])] as [WindowLimiter, string][]) {
+        if (!l.allow(k, now)) { back(); return null; }
+        taken.push([l, k, l.windowStart(k)!]);
+      }
+      return { release: back };
+    };
     const UNPAID429 = () => send(429, { error: "too many unpaid requests, retry later", scope: "ip" }, { "Retry-After": "60" });
     const tk = req.headers.get(TRIAL_HEADER);
     if (tk) {
       const label = await resolveTrial(tk, env);
       // Exhausted quota is checked first (no count taken): no DNS, slot or handler work, straight to the normal 402 below.
       if (label && await peekQuota(label, dailyLimit(env), Date.now())) {
-        if (!unpaidOk(false)) return UNPAID429(); // this IP is already over the unpaid limit: same answer as unpaid traffic
+        // L3: the unpaid unit is taken upfront (atomic, before DNS/slot/handler work), so a parallel burst from one IP is
+        // capped at the limit. A served trial call returns it, so valid trial calls never use the unpaid budget.
+        const held = takeUnpaid();
+        if (!held) return UNPAID429();
         const r = await trialServe(path, q, label, d, c, rpc);
-        if (r && r[2]) return send(r[0], r[1]); // served: does not count as unpaid traffic
-        // Rejected before serving (input/capacity): counted once against the unpaid limit, like an unpaid request.
-        if (r) return unpaidOk(true) ? send(r[0], r[1]) : UNPAID429();
-        // r === null (quota raced to exhausted): falls through and is counted once below.
+        if (r && r[2]) { held.release(); return send(r[0], r[1]); } // served: does not count as unpaid traffic
+        if (r) return send(r[0], r[1]); // rejected before serving (input/capacity): the upfront unit is its one count
+        // r === null (quota raced to exhausted): the upfront unit is its one count; normal 402.
+        const pr = required(path, req.headers.get("Host") ?? "", env); return send(402, pr, { "PAYMENT-REQUIRED": b64(pr) });
       }
     }
     // Not accepted (any reason): the exact 402 flow a request without the header gets (counted once here).

@@ -171,3 +171,25 @@ Deno.test("trial: rejected (not served) trial calls count against the per-IP unp
   assertEquals(s2, [400, 400, 400, 402, 402, 429]);
   assertEquals((await rows(TRIAL_FILE)).filter((x: any) => x.label === "noisy").length, 0, "rejections are not trial records");
 });
+Deno.test("trial L3: parallel burst from one IP reaches DNS at most UNPAID_PER_MIN times (rejected and exhausted keys)", async () => {
+  await fresh({ UNPAID_PER_MIN: "4", TRIAL_DAILY_LIMIT: "50", NETWORK: "eip155:84532" });
+  const key = newKey(); await writeKeys([{ label: "burst", hash: await hashKey(key), created: now() }]);
+  let dns = 0; const resolver = async () => { dns++; await new Promise((r) => setTimeout(r, 5)); return ["10.0.0.1"]; }; // private: rejected after DNS
+  const go = (k: string, ip: string) => handler(new Request("http://h.example/x402/preflight?url=" + encodeURIComponent("https://x.example/p"), { headers: { Host: "h.example", "X-Trial-Key": k } }),
+    { env, rpc, resolver, background: () => {}, ip }).then(async (r) => { await r.body?.cancel(); return r.status; });
+  const st = await Promise.all(Array.from({ length: 20 }, () => go(key, "198.51.100.60")));
+  assert(dns <= 4, "dns calls " + dns); assertEquals(st.filter((s) => s !== 429).length, 4); assertEquals(st.filter((s) => s === 429).length, 16);
+  // exhausted / invalid key burst: no DNS at all, and still capped at the limit
+  await fresh({ UNPAID_PER_MIN: "4", TRIAL_DAILY_LIMIT: "1" }); dns = 0;
+  const st2 = await Promise.all(Array.from({ length: 12 }, () => go(newKey(), "198.51.100.61")));
+  assertEquals(dns, 0); assertEquals(st2.filter((s) => s === 402).length, 4); assertEquals(st2.filter((s) => s === 429).length, 8);
+});
+Deno.test("trial L3: served trial calls (parallel) do not use the per-IP unpaid budget", async () => {
+  await fresh({ UNPAID_PER_MIN: "3", TRIAL_DAILY_LIMIT: "50" });
+  const key = newKey(); await writeKeys([{ label: "good", hash: await hashKey(key), created: now() }]);
+  const ip = "198.51.100.62";
+  const st = await Promise.all(Array.from({ length: 3 }, () => call("/base/network", key, ip)));
+  assertEquals(st.map((r) => r.status), [200, 200, 200]);
+  const s2: number[] = []; for (let i = 0; i < 4; i++) s2.push((await call("/base/network", undefined, ip)).status);
+  assertEquals(s2, [402, 402, 402, 429], "full unpaid budget still available after served trial calls");
+});
