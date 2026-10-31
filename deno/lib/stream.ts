@@ -42,6 +42,8 @@ export function reclassify(out: Record<string, any>, payTo: string, env = (k: st
  * (amount only when verified_success, else 0). Costs without a matching outcome get revenue 0 and revenueUnmatched=true.
  * Pass ALL rows (before any time filter) so cross-references resolve. */
 export function reconcile(recs: Record<string, any[]>, payTo: string, env = (k: string) => Deno.env.get(k)) {
+  // Trial (unpaid) calls live in their own stream; drop any that reach these lists so they never count as sales.
+  for (const k of ["executions", "outcomes", "costs"]) if (recs[k]) recs[k] = recs[k].filter((r) => r?.kind !== "trial");
   recs.outcomes = (recs.outcomes ?? []).map((o) => reclassify(o, payTo, env));
   const st = new Map(recs.outcomes.map((o) => [o.executionRef, o.status]));
   const amt = new Map((recs.executions ?? []).map((e) => [e.id, e.amount]));

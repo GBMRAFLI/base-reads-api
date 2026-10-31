@@ -21,6 +21,8 @@ has not shown the transfer yet you get `202` and the same request (same payment 
 
 Optional `?ref=<tag>` (`A-Z a-z 0-9 . _ -`, max 64; first occurrence wins) is stored with the paid call for attribution. It is self-reported and unverified, and never changes the price, the 402 challenge or the payment requirements.
 
+Trial access: if you were given a trial key, send it as header `X-Trial-Key: <key>` on any paid route to get the normal JSON response without payment, up to a daily limit per key (default 50 calls per UTC day). An invalid, expired, revoked or exhausted key simply gets the usual `402`. Operator setup: [deploy/vps/README.md](deploy/vps/README.md#trial-keys).
+
 ## Free routes (GET)
 
 | Route | Returns |

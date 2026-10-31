@@ -17,6 +17,7 @@ import ATT_SCHEMA from "../spec/prepay-check-attestation-v1.schema.json" with { 
 import { scheduledSnapshot, latestSnapStatus, loadFail, mapErrorCode } from "./lib/snapshot.ts";
 import { EXPORT_FILES, kv, rows } from "./lib/store.ts";
 import { recordObservation, recordSale, reconcile, verifyOnchain } from "./lib/stream.ts";
+import { dailyLimit, peekQuota, recordTrial, resolveTrial, takeQuota, TRIAL_FILE, TRIAL_HEADER } from "./lib/trial.ts";
 import { ADDR, b64json, iso, pyQuery, sha256hex, unquote } from "./lib/util.ts";
 
 const USDCS: Record<string, string> = { "eip155:8453": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913", "eip155:84532": "0x036CbD53842c5426634e7929541eC2318f3dCF7e" };
@@ -304,7 +305,9 @@ export async function exportRecords(auth: string, q: Record<string, string>, env
   for (const n of EXPORT_FILES) all[n.split(".")[0]] = await rows(n);
   reconcile(all, c.PAY_TO, env); // maps built from ALL rows, then filtered
   for (const [k, v] of Object.entries(all)) out[k] = v.filter((r: any) => !since || ((r.startedAt || r.verifiedAt || r.observedAt || r.incurredAt || "") >= since));
-  return [200, { payTo: c.PAY_TO, network: c.NETWORK, asset: c.USDC, exportedAt: iso(), records: out }];
+  // Trial calls are unpaid: kept outside `records` so buyer, revenue and outcome consumers never see them.
+  const trials = (await rows(TRIAL_FILE)).filter((r: any) => !since || (String(r.servedAt ?? "") >= since));
+  return [200, { payTo: c.PAY_TO, network: c.NETWORK, asset: c.USDC, exportedAt: iso(), records: out, ...(trials.length ? { trials } : {}) }];
 }
 const HDRS = { "Content-Type": "application/json", "X-Content-Type-Options": "nosniff", "Access-Control-Allow-Origin": "*", "Access-Control-Expose-Headers": "PAYMENT-REQUIRED, PAYMENT-RESPONSE" };
 const send = (code: number, obj: unknown, hd: Record<string, string> = {}) => new Response(pyDumps(obj), { status: code, headers: { ...HDRS, ...hd } });
@@ -369,16 +372,84 @@ async function handleGet(req: Request, d: Deps): Promise<Response> {
   if (!sig) {
     // A6: unpaid 402s are pure computation (no DNS, GET or RPC) and limited per client IP.
     // IPv6: per-/64 key plus a per-/48 aggregate, so a prefix spray is bounded without filling the per-client table.
-    const p48 = ipv6Prefix48(d.ip);
-    if (d.ip && (!abuse(env).unpaid.allow(SG.ipKey(d.ip) ?? d.ip) || (p48 !== null && !abuse(env).unpaid48.allow(p48)))) {
-      return send(429, { error: "too many unpaid requests, retry later", scope: "ip" }, { "Retry-After": "60" });
+    const p48 = ipv6Prefix48(d.ip); const ipk = d.ip ? (SG.ipKey(d.ip) ?? d.ip) : "";
+    const unpaidOk = (take: boolean) => !d.ip || (take
+      ? abuse(env).unpaid.allow(ipk) && (p48 === null || abuse(env).unpaid48.allow(p48))
+      : abuse(env).unpaid.peek(ipk) && (p48 === null || abuse(env).unpaid48.peek(p48)));
+    /** Take one unpaid unit on every limiter now; on any refusal, return the units already taken. */
+    const takeUnpaid = (): { release: () => void } | null => {
+      if (!d.ip) return { release: () => {} };
+      const G = abuse(env), now = Date.now(); const taken: [WindowLimiter, string, number][] = [];
+      const back = () => { for (const [l, k, st] of taken) l.release(k, st); };
+      for (const [l, k] of [[G.unpaid, ipk], ...(p48 === null ? [] : [[G.unpaid48, p48]])] as [WindowLimiter, string][]) {
+        if (!l.allow(k, now)) { back(); return null; }
+        taken.push([l, k, l.windowStart(k)!]);
+      }
+      return { release: back };
+    };
+    const UNPAID429 = () => send(429, { error: "too many unpaid requests, retry later", scope: "ip" }, { "Retry-After": "60" });
+    const tk = req.headers.get(TRIAL_HEADER);
+    if (tk) {
+      const label = await resolveTrial(tk, env);
+      // Exhausted quota is checked first (no count taken): no DNS, slot or handler work, straight to the normal 402 below.
+      if (label && await peekQuota(label, dailyLimit(env), Date.now())) {
+        // L3: the unpaid unit is taken upfront (atomic, before DNS/slot/handler work), so a parallel burst from one IP is
+        // capped at the limit. A served trial call returns it, so valid trial calls never use the unpaid budget.
+        const held = takeUnpaid();
+        if (!held) return UNPAID429();
+        const r = await trialServe(path, q, label, d, c, rpc);
+        if (r && r[2]) { held.release(); return send(r[0], r[1]); } // served: does not count as unpaid traffic
+        if (r) return send(r[0], r[1]); // rejected before serving (input/capacity): the upfront unit is its one count
+        // r === null (quota raced to exhausted): the upfront unit is its one count; normal 402.
+        const pr = required(path, req.headers.get("Host") ?? "", env); return send(402, pr, { "PAYMENT-REQUIRED": b64(pr) });
+      }
     }
+    // Not accepted (any reason): the exact 402 flow a request without the header gets (counted once here).
+    if (!unpaidOk(true)) return UNPAID429();
     const pr = required(path, req.headers.get("Host") ?? "", env); return send(402, pr, { "PAYMENT-REQUIRED": b64(pr) });
   }
   const [code, out, hd] = await paid(path, q, qs, sig, tReq, { ...d, ua: d.ua ?? req.headers.get("User-Agent") }, c, rpc, fac, req.headers.get("Host") ?? "");
   return send(code, out, hd);
 }
 
+/** Serve one trial call for a valid key: same handlers as a paid call, no facilitator or chain payment check.
+ * Returns null when the daily quota is used up (caller falls through to the normal 402).
+ * Pre-pay Check: URL/SSRF checks and capacity (per-key+target limit, per-target budget, probe slot) are checked BEFORE the
+ * quota is taken, so a capacity or input rejection never uses a unit. The probe slot is the same global SlotTable the
+ * paid path uses, held as payer "trial:<label>" (one in-flight check per key), and released in finally. */
+async function trialServe(path: string, q: Record<string, string>, label: string, d: Deps, c: Cfg, rpc: Rpc): Promise<[number, unknown, boolean] | null> {
+  const env = d.env; let code = 0, out: unknown = null; let slot: string | null = null; let took = false; const G = abuse(env);
+  try {
+    if (path === "/x402/preflight") {
+      const u = unquote(q.url ?? "");
+      if (!u) return [400, { error: "give ?url=https://..." }, false];
+      const chk = await checkUrl(u, d.resolver);
+      if (!chk.u) return [400, { error: chk.err, target_url_allowed: false }, false];
+      const who = "trial:" + label, h = hostOf(u);
+      if (!G.hostPayer.peek(h + "|" + who)) return [429, { error: "too many checks of this target in the last minute, retry later", scope: "target_payer" }, false];
+      if (!G.perHost.peek(h)) return [503, { error: "target check capacity is full for this minute, retry later", scope: "target" }, false];
+      const rv = G.slots.reserve(who, crypto.randomUUID(), h, clock.now());
+      if (rv === "payer_busy") return [429, { error: "this key already has a check in progress", scope: "payer" }, false];
+      if (rv === "full") return [503, { error: "probe capacity busy, retry shortly" }, false];
+      slot = rv.id;
+      if (!await takeQuota(label, dailyLimit(env), Date.now())) return null;
+      took = true;
+      G.hostPayer.allow(h + "|" + who); G.perHost.allow(h); G.slots.extend(slot, SLOT_PROBE_MS);
+      [code, out] = await preflight(u, { resolver: d.resolver, fetcher: d.fetcher, env, rpc, slotHeld: true,
+        issuerUrl: c.PUBLIC ? c.PUBLIC.replace(/\/+$/, "") + "/.well-known/issuer.json" : null });
+    } else {
+      if (!await takeQuota(label, dailyLimit(env), Date.now())) return null;
+      took = true;
+      [code, out] = await new Chain(rpc, c.USDC).handle(path, q);
+    }
+  } catch (e) {
+    if (e instanceof SigningUnavailable) return [503, { error: "signing unavailable" }, took];
+    return [502, { error: "upstream error" }, took];
+  } finally { if (slot) G.slots.release(slot); }
+  const bg = d.background ?? ((p: Promise<unknown>) => { p.catch(() => {}); });
+  bg(recordTrial(path, label, code, cleanRef(q.ref !== undefined ? "ref=" + q.ref : "")).catch((e) => console.log("trial log write failed:", (e as Error).name)));
+  return [code, out, true];
+}
 const FAILS = new SG.FailLimiter();
 type Abuse = { unpaid: WindowLimiter; unpaid48: WindowLimiter; hostPayer: WindowLimiter; perHost: WindowLimiter; failNet: WindowLimiter; failedWho: WindowLimiter; cache: ResultCache<unknown>; slots: SlotTable };
 let ABUSE: Abuse | null = null;
