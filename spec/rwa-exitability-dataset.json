@@ -1,7 +1,7 @@
 {
  "version": "rwa-exitability-dataset/1",
- "dataset_revision": 2,
- "generated_at": "2026-11-05T05:43:44Z",
+ "dataset_revision": 3,
+ "generated_at": "2026-11-05T05:51:39Z",
  "assets": {
   "JAAA": {
    "fields": {
@@ -84,13 +84,7 @@
       "entitlements_contract": "0x902D906b8d988092213bE799B18Bd2cbd64F808C"
      },
      "source_url": "https://usyc.docs.hashnote.com/overview/product-structuring",
-     "retrieved_at": "2026-11-05T05:36:35Z",
-     "onchain": {
-      "chain": "ethereum",
-      "address": "0x902D906b8d988092213bE799B18Bd2cbd64F808C",
-      "function": "paused()",
-      "block": 26346579
-     }
+     "retrieved_at": "2026-11-05T05:36:35Z"
     },
     "nav_freshness": {
      "value": {
@@ -110,13 +104,7 @@
     "redemption_path": {
      "value": "USYC Teller burns USYC for USDC 24/7; optional Private Liquidity Teller for up to 100% instant liquidity",
      "source_url": "https://usyc.docs.hashnote.com/overview/subscription-and-redemption",
-     "retrieved_at": "2026-11-05T05:36:35Z",
-     "onchain": {
-      "chain": "ethereum",
-      "address": "0xeE35F963BFC71b51eC95147f26c030D674ea30e6",
-      "function": "asset()/totalAssets()",
-      "block": 26346579
-     }
+     "retrieved_at": "2026-11-05T05:36:35Z"
     },
     "redemption_timing": {
      "value": {
@@ -156,13 +144,7 @@
       "eligibility": "Non-U.S. Persons; restricted jurisdictions per Midas"
      },
      "source_url": "https://docs.midas.app/legal/eligibility-and-compliance.md",
-     "retrieved_at": "2026-11-05T05:36:35Z",
-     "onchain": {
-      "chain": "ethereum",
-      "address": "0x605704d7b36d1677a8d242ded68eD505523c7924",
-      "function": "greenlistEnabled()",
-      "block": 26346579
-     }
+     "retrieved_at": "2026-11-05T05:36:35Z"
     },
     "nav_freshness": {
      "value": {

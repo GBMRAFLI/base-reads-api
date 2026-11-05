@@ -390,6 +390,8 @@ async function handleGet(req: Request, d: Deps): Promise<Response> {
   const UNPAID429 = () => send(429, { error: "too many unpaid requests, retry later", scope: "ip" }, { "Retry-After": "60" });
   // Unknown asset on the RWA route: pure dataset lookup, answered 400 before any challenge or payment-header parsing,
   // with or without a payment header (always counted as unpaid traffic, so a garbage header cannot bypass the limiter).
+  // Known, accepted difference: on the other routes a malformed payment header is rejected by paid() with 400 and is not
+  // counted against the unpaid limiter (pre-existing; costs one header parse, no network call).
   const rwaErr = path === RWA_PATH ? rwaInputError(q) : null;
   if (rwaErr) { if (!unpaidOk(true)) return UNPAID429(); return send(400, { error: rwaErr }); }
   if (!sig) {

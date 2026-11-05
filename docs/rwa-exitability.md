@@ -54,7 +54,8 @@ A cited field looks like `"fields": {"redemption_path": <value>}` with
 A field read from a contract also carries the call that produced it, and `url` is the contract's block-explorer page:
 `"sources": {"pause_freeze": {"url": "https://<explorer>/address/0x...", "retrieved_at": "2026-...Z",
 "onchain": {"chain": "ethereum", "address": "0x...", "function": "paused()", "block": 12345678}}}`.
-`function` is a signature, up to four signatures joined by `/` when a value combines several calls, or a 4-byte selector. Raw call results are not included; `fields` holds the reported value.
+`onchain` appears only when the field is cited to that contract read (`url` is the explorer page of `onchain.address`);
+values cited to a document carry no `onchain`. `function` is a signature, up to four signatures joined by `/` when a value combines several calls, or a 4-byte selector. Raw call results are not included; `fields` holds the reported value.
 
 | Field | Meaning |
 |---|---|
@@ -90,6 +91,16 @@ Source files for `build` are one per asset (`<source_dir>/JAAA.json`, `USYC.json
 - Entries missing a value, an https source or a retrieval time are dropped and listed, never filled in.
 - `onchain` is reduced to `chain`, `address`, `function` (or `selector`), `block`. If that is not a valid citation, the
   entry is dropped when `source_url` is the explorer page, otherwise it is kept on its document source without `onchain`.
-- A `source_url` that looks like an RPC endpoint, a keyed API URL or an internal address drops the entry.
+- A valid `onchain` is kept only when `source_url` is the explorer page of `onchain.address`; otherwise it is omitted
+  and the document source stands (also enforced by the runtime validator).
+- A `source_url` that looks like an RPC endpoint, a keyed API URL, an internal address or path, or carries
+  `user:pass@` userinfo drops the entry; the runtime validator rejects userinfo and internal paths too.
+- The shipped dataset is validated when the server loads; an invalid file fails startup.
 - Only `<SYMBOL>.json` for the supported symbols is read; other files in the directory are ignored.
 - `result`, `confidence`, `refresh_method` and any other keys are ignored and never shipped.
+
+## Known behaviour
+
+An unknown `asset` is answered 400 (or 429) before the payment header is read and always counts against the per-client
+unpaid limit. On the other routes a malformed payment header is answered 400 without counting against that limit; this
+is pre-existing and costs one header parse, no network call.

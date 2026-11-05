@@ -654,6 +654,10 @@ class RwaOnchainValidation(unittest.TestCase):
                 self.assertEqual((o["fields"][f], o["sources"][f]), ("not_disclosed", "not_disclosed"), f)
             self.assertEqual(o["confidence"]["disclosed_fields"], 1)
             self.assertEqual(R.onchain_errors({"chain": "ethereum", "address": "0x" + "ab" * 20, "function": "asset()/totalAssets()", "block": 1}), [])
+            for u in ("https://u:p@docs.example/a", "https://docs.example/workspace/a", "file:///etc/x", "http://docs.example/a"): self.assertFalse(R.public_https(u), u)
+            self.assertTrue(R.public_https("https://docs.example/variable-rates"))
+            doc_onchain = copy.deepcopy(ok); doc_onchain["source_url"] = "https://docs.example/eligibility"
+            self.assertTrue(R.entry_errors(doc_onchain)); self.assertEqual(R.entry_errors(ok), [])
         finally:
             R.DATA.clear(); R.DATA.update(keep)
 

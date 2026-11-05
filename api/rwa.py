@@ -9,6 +9,14 @@ ISO = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,3})?Z$")
 CHAIN_RE = re.compile(r"^[a-z0-9-]{1,32}$"); ADDR_RE = re.compile(r"^0x[0-9a-fA-F]{40}$")
 _SIG = r"[A-Za-z_][A-Za-z0-9_]{0,63}\([A-Za-z0-9_,\[\] ]{0,200}\)"
 FN_RE = re.compile(r"^(%s(/%s){0,3}|0x[0-9a-fA-F]{8})$" % (_SIG, _SIG))
+INTERNAL_PATH_RE = re.compile(r"/(workspace|home|root|opt|etc|var|tmp|srv|mnt|usr)(/|$)|file:|~/", re.I)
+def public_https(u):
+    if not isinstance(u, str) or INTERNAL_PATH_RE.search(u): return False
+    x = urllib.parse.urlsplit(u)
+    return x.scheme == "https" and bool(x.hostname) and x.username is None and x.password is None
+def explorer_for(u, address):
+    m = re.search(r"/address/(0x[0-9a-fA-F]{40})(?:[/?#]|$)", u)
+    return bool(m) and isinstance(address, str) and m.group(1).lower() == address.lower()
 def onchain_errors(o):
     """Same rules as onchainErrors in deno/lib/rwa.ts (empty list = valid)."""
     if not isinstance(o, dict) or sorted(o) != ["address", "block", "chain", "function"]: return ["onchain must have exactly chain, address, function, block"]
@@ -27,7 +35,8 @@ def entry_errors(v):
     e = []
     if v["value"] is None or v["value"] == "" or v["value"] == ND: e.append("empty value")
     u = v["source_url"]
-    if not isinstance(u, str) or urllib.parse.urlsplit(u).scheme != "https" or not urllib.parse.urlsplit(u).netloc: e.append("source_url")
+    if not public_https(u): e.append("source_url")
+    elif isinstance(v.get("onchain"), dict) and not explorer_for(u, v["onchain"].get("address")): e.append("onchain needs the explorer page of its address")
     if not isinstance(v["retrieved_at"], str) or not ISO.match(v["retrieved_at"]): e.append("retrieved_at")
     if "onchain" in v: e += onchain_errors(v["onchain"])
     return e

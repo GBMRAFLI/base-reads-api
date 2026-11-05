@@ -6,8 +6,8 @@ import { useKv } from "../lib/store.ts";
 import { ROUTES } from "../lib/routes.ts";
 import DISCOVERY from "../lib/discovery.json" with { type: "json" };
 import SHIPPED from "../../spec/rwa-exitability-dataset.json" with { type: "json" };
-import { dataset, NOT_DISCLOSED, RWA_DISCLAIMER, RWA_FIELDS, RWA_PATH, rwaHandle, useDataset, validateDataset, type Dataset } from "../lib/rwa.ts";
-import { buildFrom, sanitizeOnchain } from "../scripts/rwa_dataset.ts";
+import { dataset, loadDataset, NOT_DISCLOSED, publicHttps, RWA_DISCLAIMER, RWA_FIELDS, RWA_PATH, rwaHandle, useDataset, validateDataset, type Dataset } from "../lib/rwa.ts";
+import { buildFrom, looksPrivate, sanitizeOnchain } from "../scripts/rwa_dataset.ts";
 import { hashKey, newKey, resetTrialCache } from "../lib/trial.ts";
 
 const P = JSON.parse(Deno.readTextFileSync(new URL("./fixtures/py_signed.json", import.meta.url)));
@@ -151,7 +151,7 @@ Deno.test("rwa: onchain citation validation", () => {
   assertEquals(sanitizeOnchain({ chain: "base", address: "0x" + "cd".repeat(20), function: "paused()", block: 9 }), { chain: "base", address: "0x" + "cd".repeat(20), function: "paused()", block: 9 });
   for (const o of [null, { chain: "base", address: "0x12", function: "paused()", block: 9 }, { chain: "base", address: "0x" + "cd".repeat(20), function: "paused(); drop", block: 9 },
     { chain: "base", address: "0x" + "cd".repeat(20), function: "paused()", block: -1 }, { chain: "base", address: "0x" + "cd".repeat(20), block: 9 }]) assertEquals(sanitizeOnchain(o), null);
-  const ok = { value: "x", source_url: "https://explorer.example/a", retrieved_at: "2026-01-01T00:00:00Z" };
+  const ok = { value: "x", source_url: "https://explorer.example/address/0x" + "ab".repeat(20), retrieved_at: "2026-01-01T00:00:00Z" };
   const v = (f: unknown) => validateDataset({ version: "rwa-exitability-dataset/1", dataset_revision: 1, generated_at: "2026-01-01T00:00:00Z", assets: { JAAA: { fields: { pause_freeze: f } } } });
   assertEquals(v({ ...ok, onchain: { chain: "ethereum", address: "0x" + "ab".repeat(20), function: "0x5c975abb", block: 1 } }), []);
   assert(v({ ...ok, onchain: { chain: "ethereum", address: "0x" + "ab".repeat(20), function: "0x5c975abb", block: 1, result: "0x00" } }).length > 0);
@@ -165,4 +165,37 @@ Deno.test("rwa: garbage payment header + unknown asset is still counted as unpai
   for (let i = 0; i < 6; i++) { const r = await get("?asset=NOPE", { "PAYMENT-SIGNATURE": "garbage!!" }, "203.0.113.77"); st.push(r.status); assertEquals(r.pr, null); }
   delete E.UNPAID_PER_MIN; await resetGuards();
   assertEquals(st, [400, 400, 400, 400, 400, 429]);
+});
+Deno.test("rwa: shipped dataset is validated at load; an invalid one throws", () => {
+  assertEquals(loadDataset(SHIPPED), SHIPPED);
+  for (const bad of [{}, { ...SHIPPED, version: "x" }, { ...SHIPPED, assets: { JAAA: { fields: { nav_freshness: { value: "x", source_url: "http://a", retrieved_at: "z" } } } } }]) {
+    let threw = false; try { loadDataset(bad); } catch { threw = true; } assert(threw);
+  }
+});
+Deno.test("rwa: internal paths and userinfo URLs are never shipped (build and runtime)", () => {
+  for (const u of ["https://docs.example/workspace/x", "https://docs.example/home/u/a", "https://a.example/root/x", "https://a.example/opt/x", "https://a.example/etc/passwd",
+    "https://a.example/var/x", "file:///tmp/x", "https://user:pass@docs.example/a", "https://user@docs.example/a"]) {
+    assert(looksPrivate(u), u); assert(!publicHttps(u), u);
+  }
+  for (const u of ["https://docs.example/variable-rates", "https://etherscan.io/address/0x" + "ab".repeat(20), "https://blog.example/home-for-treasury"]) {
+    assert(!looksPrivate(u), u); assert(publicHttps(u), u);
+  }
+  const v = (u: string) => validateDataset({ version: "rwa-exitability-dataset/1", dataset_revision: 1, generated_at: "2026-01-01T00:00:00Z",
+    assets: { JAAA: { fields: { redemption_path: { value: "x", source_url: u, retrieved_at: "2026-01-01T00:00:00Z" } } } } });
+  assert(v("https://u:p@docs.example/a").length > 0); assert(v("https://docs.example/workspace/a").length > 0); assertEquals(v("https://docs.example/a"), []);
+});
+Deno.test("rwa: onchain kept only when the field is cited to that contract read", () => {
+  const A = "0x" + "ab".repeat(20), B = "0x" + "cd".repeat(20);
+  const oc = { chain: "ethereum", address: A, function: "paused()", block: 7, result: 0 };
+  const { out, notes } = buildFrom([{ asset: "JAAA", fields: {
+    pause_freeze: { value: "SYNTHETIC", source_url: "https://explorer.example/address/" + A, retrieved_at: "2026-01-01T00:00:00Z", onchain: oc },
+    transfer_eligibility: { value: { SYNTHETIC: 1 }, source_url: "https://docs.example/eligibility", retrieved_at: "2026-01-01T00:00:00Z", onchain: oc },
+    nav_freshness: { value: "SYNTHETIC", source_url: "https://explorer.example/address/" + B, retrieved_at: "2026-01-01T00:00:00Z", onchain: oc } } }],
+    null, new Date("2026-03-01T00:00:00Z"), ["JAAA"]);
+  assertEquals(validateDataset(out), []);
+  const j: any = out.assets.JAAA.fields;
+  assert(j.pause_freeze.onchain); assertEquals(j.transfer_eligibility.onchain, undefined); assertEquals(j.nav_freshness.onchain, undefined);
+  assertEquals(notes.filter((n: string) => n.includes("cited to a document")).length, 2);
+  const bad = { ...out, assets: { JAAA: { fields: { transfer_eligibility: { ...j.transfer_eligibility, onchain: { chain: "ethereum", address: A, function: "paused()", block: 7 } } } } } };
+  assert(validateDataset(bad).length > 0);
 });

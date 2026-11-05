@@ -7,10 +7,11 @@
 // https source_url and an ISO-8601 UTC retrieved_at are kept. An onchain citation is reduced to { chain, address, function,
 // block }. If it is not a valid
 // citation, the entry is dropped when its source_url is the explorer page, else kept on the document source without it.
-// source_url that looks like an RPC endpoint, keyed API or internal URL drops the entry. All other keys (per-field confidence, refresh_method, raw result,
+// A valid onchain is kept only when source_url is the explorer page of onchain.address (the value is that read);
+// otherwise it is omitted and the document source stands. source_url that looks like an RPC endpoint, keyed API or internal URL drops the entry. All other keys (per-field confidence, refresh_method, raw result,
 // notes) are ignored and never shipped. Nothing is filled in or inferred.
-import { DATASET_VERSION, NOT_DISCLOSED, onchainErrors, RWA_FIELDS, validateDataset } from "../lib/rwa.ts";
-import type { Onchain } from "../lib/rwa.ts";
+import { DATASET_VERSION, explorerFor, INTERNAL_PATH_RE, NOT_DISCLOSED, onchainErrors, RWA_FIELDS, validateDataset } from "../lib/rwa_schema.ts";
+import type { Onchain } from "../lib/rwa_schema.ts";
 
 const DEFAULT = new URL("../../spec/rwa-exitability-dataset.json", import.meta.url).pathname;
 const ISO = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,3})?Z$/;
@@ -23,7 +24,9 @@ export function sanitizeOnchain(o: any): Onchain | null {
 }
 /** Source URLs that look like an RPC endpoint, a keyed API URL or a local/internal path are never shipped. */
 export function looksPrivate(u: string): boolean {
+  if (INTERNAL_PATH_RE.test(u)) return true;
   let x: URL; try { x = new URL(u); } catch { return true; }
+  if (x.username || x.password) return true;
   const h = x.hostname.toLowerCase(), all = (h + x.pathname + x.search).toLowerCase();
   return /(^|[.-])(rpc|rpcs|node|nodes)([.-]|$)|infura|alchemy|quiknode|quicknode|publicnode|ankr|llamarpc|drpc|blastapi|chainstack|getblock/.test(h) ||
     /api[_-]?key|apikey|token=|secret|password|\/v3\/[0-9a-f]{16,}/.test(all) || h === "localhost" || /^(\d+\.){3}\d+$/.test(h) || h.endsWith(".internal") || h.endsWith(".local");
@@ -46,7 +49,10 @@ export function buildFrom(sources: { asset: string; fields?: Record<string, any>
       const entry: Record<string, unknown> = { value: v.value, source_url: v.source_url, retrieved_at: v.retrieved_at };
       if (v.onchain !== undefined && v.onchain !== null) {
         const o = sanitizeOnchain(v.onchain);
-        if (o) entry.onchain = o;
+        // Rule: an on-chain citation is kept only when the field is cited to that contract read, i.e. source_url is the
+        // explorer page of onchain.address. A document-cited value (composite or prose) keeps its document source only.
+        if (o && explorerFor(v.source_url, o.address)) entry.onchain = o;
+        else if (o) notes.push(`${sym}.${f}: onchain citation omitted (value is cited to a document, not directly to the call)`);
         else if (explorerPage(v.source_url)) { dropped.push(`${sym}.${f}: onchain citation needs chain, address, function or selector, block`); continue; }
         else notes.push(`${sym}.${f}: onchain citation omitted (not a single readable call); kept on its document source only`);
       }
