@@ -10,7 +10,7 @@
 // A valid onchain is kept only when source_url is the explorer page of onchain.address (the value is that read);
 // otherwise it is omitted and the document source stands. source_url that looks like an RPC endpoint, keyed API or internal URL drops the entry. All other keys (per-field confidence, refresh_method, raw result,
 // notes) are ignored and never shipped. Nothing is filled in or inferred.
-import { DATASET_VERSION, explorerFor, INTERNAL_PATH_RE, NOT_DISCLOSED, onchainErrors, RWA_FIELDS, validateDataset } from "../lib/rwa_schema.ts";
+import { DATASET_VERSION, explorerFor, hasInternalPath, NOT_DISCLOSED, onchainErrors, RWA_FIELDS, validateDataset } from "../lib/rwa_schema.ts";
 import type { Onchain } from "../lib/rwa_schema.ts";
 
 const DEFAULT = new URL("../../spec/rwa-exitability-dataset.json", import.meta.url).pathname;
@@ -24,7 +24,7 @@ export function sanitizeOnchain(o: any): Onchain | null {
 }
 /** Source URLs that look like an RPC endpoint, a keyed API URL or a local/internal path are never shipped. */
 export function looksPrivate(u: string): boolean {
-  if (INTERNAL_PATH_RE.test(u)) return true;
+  if (hasInternalPath(u)) return true;
   let x: URL; try { x = new URL(u); } catch { return true; }
   if (x.username || x.password) return true;
   const h = x.hostname.toLowerCase(), all = (h + x.pathname + x.search).toLowerCase();

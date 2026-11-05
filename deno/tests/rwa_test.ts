@@ -6,7 +6,7 @@ import { useKv } from "../lib/store.ts";
 import { ROUTES } from "../lib/routes.ts";
 import DISCOVERY from "../lib/discovery.json" with { type: "json" };
 import SHIPPED from "../../spec/rwa-exitability-dataset.json" with { type: "json" };
-import { dataset, loadDataset, NOT_DISCLOSED, publicHttps, RWA_DISCLAIMER, RWA_FIELDS, RWA_PATH, rwaHandle, useDataset, validateDataset, type Dataset } from "../lib/rwa.ts";
+import { dataset, explorerFor, loadDataset, NOT_DISCLOSED, publicHttps, RWA_DISCLAIMER, RWA_FIELDS, RWA_PATH, rwaHandle, useDataset, validateDataset, type Dataset } from "../lib/rwa.ts";
 import { buildFrom, looksPrivate, sanitizeOnchain } from "../scripts/rwa_dataset.ts";
 import { hashKey, newKey, resetTrialCache } from "../lib/trial.ts";
 
@@ -108,12 +108,12 @@ Deno.test("rwa: dataset build keeps only cited values and reports the rest", () 
 
 // SYNTHETIC source files in the research hand-off shape (one per asset); made-up values, addresses and blocks.
 const SRC_JAAA = { asset: "JAAA", fields: {
-  pause_freeze: { value: "SYNTHETIC not paused", source_url: "https://explorer.example/address/0x" + "ab".repeat(20), retrieved_at: "2026-01-02T03:04:05Z",
+  pause_freeze: { value: "SYNTHETIC not paused", source_url: "https://etherscan.io/address/0x" + "ab".repeat(20), retrieved_at: "2026-01-02T03:04:05Z",
     confidence: "high", refresh_method: "SYNTHETIC rpc read", note: "SYNTHETIC internal note",
     onchain: { chain: "Ethereum", address: "0x" + "ab".repeat(20), selector: "0x5c975abb", block: "123456", result: "0x" + "00".repeat(32), rpc: "https://rpc.example" } },
   redemption_path: { value: "SYNTHETIC issuer redemption", source_url: "https://issuer.example/synthetic", retrieved_at: "2026-01-02T03:04:05Z", confidence: "medium", refresh_method: "manual" },
   instant_capacity: { value: null, source_url: null, retrieved_at: "2026-01-02T03:04:05Z", confidence: "none" },
-  nav_freshness: { value: "SYNTHETIC", source_url: "https://explorer.example/address/0x" + "12".repeat(20), retrieved_at: "2026-01-02T03:04:05Z", onchain: { chain: "ethereum", address: "0x12" } },
+  nav_freshness: { value: "SYNTHETIC", source_url: "https://etherscan.io/address/0x" + "12".repeat(20), retrieved_at: "2026-01-02T03:04:05Z", onchain: { chain: "ethereum", address: "0x12" } },
   transfer_eligibility: { value: { SYNTHETIC: true }, source_url: "https://docs.example/synthetic", retrieved_at: "2026-01-02T03:04:05Z", onchain: { chain: "ethereum", address: "0x" + "ab".repeat(20), function: "hook (reverted)", block: 1 } },
   redemption_timing: { value: "SYNTHETIC", source_url: "https://eth-mainnet.rpc.example/v3/x", retrieved_at: "2026-01-02T03:04:05Z" } },
   extra_top: "ignored" };
@@ -125,7 +125,7 @@ Deno.test("rwa: research hand-off shape builds; null -> not_disclosed; onchain s
   assertEquals(Object.keys(j).sort(), ["pause_freeze", "redemption_path", "transfer_eligibility"]);
   assertEquals(j.transfer_eligibility, { value: { SYNTHETIC: true }, source_url: "https://docs.example/synthetic", retrieved_at: "2026-01-02T03:04:05Z" });
   assert(dropped.some((d) => d.startsWith("JAAA.redemption_timing: source_url looks like an RPC")));
-  assertEquals(j.pause_freeze, { value: "SYNTHETIC not paused", source_url: "https://explorer.example/address/0x" + "ab".repeat(20), retrieved_at: "2026-01-02T03:04:05Z",
+  assertEquals(j.pause_freeze, { value: "SYNTHETIC not paused", source_url: "https://etherscan.io/address/0x" + "ab".repeat(20), retrieved_at: "2026-01-02T03:04:05Z",
     onchain: { chain: "ethereum", address: "0x" + "ab".repeat(20), function: "0x5c975abb", block: 123456 } });
   assertEquals(Object.keys(j.redemption_path).sort(), ["retrieved_at", "source_url", "value"]);
   assertEquals(Object.keys(out.assets.USYC.fields), []);
@@ -139,7 +139,7 @@ Deno.test("rwa: research hand-off shape builds; null -> not_disclosed; onchain s
     useDataset(out as Dataset);
     const [c, o]: any = rwaHandle({ asset: "JAAA" });
     assertEquals(c, 200);
-    assertEquals(o.sources.pause_freeze, { url: "https://explorer.example/address/0x" + "ab".repeat(20), retrieved_at: "2026-01-02T03:04:05Z",
+    assertEquals(o.sources.pause_freeze, { url: "https://etherscan.io/address/0x" + "ab".repeat(20), retrieved_at: "2026-01-02T03:04:05Z",
       onchain: { chain: "ethereum", address: "0x" + "ab".repeat(20), function: "0x5c975abb", block: 123456 } });
     assertEquals(o.sources.redemption_path, { url: "https://issuer.example/synthetic", retrieved_at: "2026-01-02T03:04:05Z" });
     assertEquals([o.fields.instant_capacity, o.sources.instant_capacity], [NOT_DISCLOSED, NOT_DISCLOSED]);
@@ -151,7 +151,7 @@ Deno.test("rwa: onchain citation validation", () => {
   assertEquals(sanitizeOnchain({ chain: "base", address: "0x" + "cd".repeat(20), function: "paused()", block: 9 }), { chain: "base", address: "0x" + "cd".repeat(20), function: "paused()", block: 9 });
   for (const o of [null, { chain: "base", address: "0x12", function: "paused()", block: 9 }, { chain: "base", address: "0x" + "cd".repeat(20), function: "paused(); drop", block: 9 },
     { chain: "base", address: "0x" + "cd".repeat(20), function: "paused()", block: -1 }, { chain: "base", address: "0x" + "cd".repeat(20), block: 9 }]) assertEquals(sanitizeOnchain(o), null);
-  const ok = { value: "x", source_url: "https://explorer.example/address/0x" + "ab".repeat(20), retrieved_at: "2026-01-01T00:00:00Z" };
+  const ok = { value: "x", source_url: "https://etherscan.io/address/0x" + "ab".repeat(20), retrieved_at: "2026-01-01T00:00:00Z" };
   const v = (f: unknown) => validateDataset({ version: "rwa-exitability-dataset/1", dataset_revision: 1, generated_at: "2026-01-01T00:00:00Z", assets: { JAAA: { fields: { pause_freeze: f } } } });
   assertEquals(v({ ...ok, onchain: { chain: "ethereum", address: "0x" + "ab".repeat(20), function: "0x5c975abb", block: 1 } }), []);
   assert(v({ ...ok, onchain: { chain: "ethereum", address: "0x" + "ab".repeat(20), function: "0x5c975abb", block: 1, result: "0x00" } }).length > 0);
@@ -188,9 +188,9 @@ Deno.test("rwa: onchain kept only when the field is cited to that contract read"
   const A = "0x" + "ab".repeat(20), B = "0x" + "cd".repeat(20);
   const oc = { chain: "ethereum", address: A, function: "paused()", block: 7, result: 0 };
   const { out, notes } = buildFrom([{ asset: "JAAA", fields: {
-    pause_freeze: { value: "SYNTHETIC", source_url: "https://explorer.example/address/" + A, retrieved_at: "2026-01-01T00:00:00Z", onchain: oc },
+    pause_freeze: { value: "SYNTHETIC", source_url: "https://etherscan.io/address/" + A, retrieved_at: "2026-01-01T00:00:00Z", onchain: oc },
     transfer_eligibility: { value: { SYNTHETIC: 1 }, source_url: "https://docs.example/eligibility", retrieved_at: "2026-01-01T00:00:00Z", onchain: oc },
-    nav_freshness: { value: "SYNTHETIC", source_url: "https://explorer.example/address/" + B, retrieved_at: "2026-01-01T00:00:00Z", onchain: oc } } }],
+    nav_freshness: { value: "SYNTHETIC", source_url: "https://etherscan.io/address/" + B, retrieved_at: "2026-01-01T00:00:00Z", onchain: oc } } }],
     null, new Date("2026-03-01T00:00:00Z"), ["JAAA"]);
   assertEquals(validateDataset(out), []);
   const j: any = out.assets.JAAA.fields;
@@ -198,4 +198,18 @@ Deno.test("rwa: onchain kept only when the field is cited to that contract read"
   assertEquals(notes.filter((n: string) => n.includes("cited to a document")).length, 2);
   const bad = { ...out, assets: { JAAA: { fields: { transfer_eligibility: { ...j.transfer_eligibility, onchain: { chain: "ethereum", address: A, function: "paused()", block: 7 } } } } } };
   assert(validateDataset(bad).length > 0);
+});
+Deno.test("rwa: percent-encoded or backslash internal paths are rejected; near-misses pass", () => {
+  for (const u of ["https://docs.example/%2Fworkspace/x", "https://docs.example/a%2fhome%2fu", "https://docs.example/%252Fetc%252Fpasswd", "https://docs.example/%25252Froot/x",
+    "https://docs.example/a\\workspace\\x", "https://docs.example/%5Cworkspace", "https://docs.example/%E0%A4%A", "https://docs.example/bad%zz"]) {
+    assert(!publicHttps(u), u); assert(looksPrivate(u), u);
+  }
+  for (const u of ["https://docs.example/workspaces-guide", "https://docs.example/a%20b", "https://docs.example/homepage", "https://docs.example/%2Fdocs/x"]) assert(publicHttps(u), u);
+});
+Deno.test("rwa: explorer citation needs an allowlisted host, exact match", () => {
+  const A = "0x" + "ab".repeat(20);
+  for (const u of ["https://etherscan.io/address/" + A, "https://basescan.org/address/" + A, "https://etherscan.io/address/" + A + "/"]) assert(explorerFor(u, A), u);
+  for (const u of ["https://evil.example/address/" + A, "https://etherscan.io.evil.example/address/" + A, "https://fakeetherscan.io/address/" + A,
+    "https://sub.etherscan.io/address/" + A, "http://etherscan.io/address/" + A, "https://etherscan.io/x/address/" + A, "https://evil.example/?u=https://etherscan.io/address/" + A,
+    "https://etherscan.io/address/0x" + "cd".repeat(20)]) assert(!explorerFor(u, A), u);
 });

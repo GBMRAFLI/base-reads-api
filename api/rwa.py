@@ -10,12 +10,27 @@ CHAIN_RE = re.compile(r"^[a-z0-9-]{1,32}$"); ADDR_RE = re.compile(r"^0x[0-9a-fA-
 _SIG = r"[A-Za-z_][A-Za-z0-9_]{0,63}\([A-Za-z0-9_,\[\] ]{0,200}\)"
 FN_RE = re.compile(r"^(%s(/%s){0,3}|0x[0-9a-fA-F]{8})$" % (_SIG, _SIG))
 INTERNAL_PATH_RE = re.compile(r"/(workspace|home|root|opt|etc|var|tmp|srv|mnt|usr)(/|$)|file:|~/", re.I)
+def has_internal_path(u):
+    """Same rule as hasInternalPath in deno/lib/rwa_schema.ts."""
+    cur = u
+    for _ in range(5):
+        if "\\" in cur or INTERNAL_PATH_RE.search(cur): return True
+        try: nxt = urllib.parse.unquote(cur, errors="strict")
+        except UnicodeDecodeError: return True
+        if re.search(r"%(?![0-9A-Fa-f]{2})", cur): return True  # malformed escape, as decodeURIComponent rejects
+        if nxt == cur: return False
+        cur = nxt
+    return True
 def public_https(u):
-    if not isinstance(u, str) or INTERNAL_PATH_RE.search(u): return False
+    if not isinstance(u, str) or has_internal_path(u): return False
     x = urllib.parse.urlsplit(u)
     return x.scheme == "https" and bool(x.hostname) and x.username is None and x.password is None
+EXPLORER_HOSTS = ("etherscan.io", "basescan.org")
 def explorer_for(u, address):
-    m = re.search(r"/address/(0x[0-9a-fA-F]{40})(?:[/?#]|$)", u)
+    try: x = urllib.parse.urlsplit(u); host = (x.hostname or "").lower()
+    except ValueError: return False
+    if x.scheme != "https" or host not in EXPLORER_HOSTS: return False
+    m = re.fullmatch(r"/address/(0x[0-9a-fA-F]{40})/?", x.path)
     return bool(m) and isinstance(address, str) and m.group(1).lower() == address.lower()
 def onchain_errors(o):
     """Same rules as onchainErrors in deno/lib/rwa.ts (empty list = valid)."""

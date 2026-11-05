@@ -640,7 +640,7 @@ class RwaOnchainValidation(unittest.TestCase):
         sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "api")); R = importlib.import_module("rwa")
         keep = copy.deepcopy(R.DATA)
         try:
-            ok = {"value": "SYNTHETIC", "source_url": "https://explorer.example/address/0x" + "ab" * 20, "retrieved_at": "2026-01-01T00:00:00Z",
+            ok = {"value": "SYNTHETIC", "source_url": "https://etherscan.io/address/0x" + "ab" * 20, "retrieved_at": "2026-01-01T00:00:00Z",
                   "onchain": {"chain": "ethereum", "address": "0x" + "ab" * 20, "function": "paused()", "block": 5}}
             no_block = copy.deepcopy(ok); del no_block["onchain"]["block"]
             bad_fn = copy.deepcopy(ok); bad_fn["onchain"]["function"] = "paused(); x"
@@ -656,6 +656,14 @@ class RwaOnchainValidation(unittest.TestCase):
             self.assertEqual(R.onchain_errors({"chain": "ethereum", "address": "0x" + "ab" * 20, "function": "asset()/totalAssets()", "block": 1}), [])
             for u in ("https://u:p@docs.example/a", "https://docs.example/workspace/a", "file:///etc/x", "http://docs.example/a"): self.assertFalse(R.public_https(u), u)
             self.assertTrue(R.public_https("https://docs.example/variable-rates"))
+            for u in ("https://docs.example/%2Fworkspace/x", "https://docs.example/a%2fhome%2fu", "https://docs.example/%252Fetc%252Fpasswd", "https://docs.example/%25252Froot/x",
+                      "https://docs.example/a\\workspace", "https://docs.example/%5Cworkspace", "https://docs.example/%E0%A4%A", "https://docs.example/bad%zz"):
+                self.assertFalse(R.public_https(u), u)
+            for u in ("https://docs.example/workspaces-guide", "https://docs.example/a%20b", "https://docs.example/homepage", "https://docs.example/%2Fdocs/x"): self.assertTrue(R.public_https(u), u)
+            A = "0x" + "ab" * 20
+            for u in ("https://etherscan.io/address/" + A, "https://basescan.org/address/" + A): self.assertTrue(R.explorer_for(u, A), u)
+            for u in ("https://evil.example/address/" + A, "https://etherscan.io.evil.example/address/" + A, "https://fakeetherscan.io/address/" + A, "https://sub.etherscan.io/address/" + A,
+                      "http://etherscan.io/address/" + A, "https://etherscan.io/x/address/" + A, "https://evil.example/?u=https://etherscan.io/address/" + A): self.assertFalse(R.explorer_for(u, A), u)
             doc_onchain = copy.deepcopy(ok); doc_onchain["source_url"] = "https://docs.example/eligibility"
             self.assertTrue(R.entry_errors(doc_onchain)); self.assertEqual(R.entry_errors(ok), [])
         finally:

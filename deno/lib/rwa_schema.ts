@@ -21,14 +21,30 @@ const SIG = "[A-Za-z_][A-Za-z0-9_]{0,63}\\([A-Za-z0-9_,\\[\\] ]{0,200}\\)";
 export const FN_RE = new RegExp(`^(${SIG}(/${SIG}){0,3}|0x[0-9a-fA-F]{8})$`);
 /** Internal path fragments that must never appear in a shipped source URL. */
 export const INTERNAL_PATH_RE = /\/(workspace|home|root|opt|etc|var|tmp|srv|mnt|usr)(\/|$)|file:|~\//i;
-/** https, no user:pass@ userinfo, no internal path fragment. */
+/** True when the URL has a backslash, does not percent-decode cleanly, or (after decoding until stable, max 5 rounds)
+ * contains an internal path fragment. */
+export function hasInternalPath(u: string): boolean {
+  let cur = u;
+  for (let i = 0; i < 5; i++) {
+    if (cur.includes("\\") || INTERNAL_PATH_RE.test(cur)) return true;
+    let next: string; try { next = decodeURIComponent(cur); } catch { return true; }
+    if (next === cur) return false; cur = next;
+  }
+  return true; // still changing after 5 rounds: reject
+}
+/** https, no user:pass@ userinfo, no internal path fragment (also when percent-encoded), no backslash. */
 export function publicHttps(u: unknown): boolean {
-  if (typeof u !== "string" || INTERNAL_PATH_RE.test(u)) return false;
+  if (typeof u !== "string" || hasInternalPath(u)) return false;
   try { const x = new URL(u); return x.protocol === "https:" && !x.username && !x.password && !!x.hostname; } catch { return false; }
 }
-/** True when the URL is a block-explorer address page for exactly this contract. */
+/** Block explorers accepted for on-chain citations (exact hostname match). */
+export const EXPLORER_HOSTS: readonly string[] = ["etherscan.io", "basescan.org"];
+/** True when the URL is an https address page on an allowlisted explorer for exactly this contract. */
 export function explorerFor(u: string, address: unknown): boolean {
-  const m = /\/address\/(0x[0-9a-fA-F]{40})(?:[/?#]|$)/.exec(u); return !!m && typeof address === "string" && m[1].toLowerCase() === address.toLowerCase();
+  let x: URL; try { x = new URL(u); } catch { return false; }
+  if (x.protocol !== "https:" || !EXPLORER_HOSTS.includes(x.hostname.toLowerCase())) return false;
+  const m = /^\/address\/(0x[0-9a-fA-F]{40})\/?$/.exec(x.pathname);
+  return !!m && typeof address === "string" && m[1].toLowerCase() === address.toLowerCase();
 }
 /** Problems with a sanitized on-chain citation (empty = valid). */
 export function onchainErrors(o: any): string[] {
