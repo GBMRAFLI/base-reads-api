@@ -118,7 +118,7 @@
       "query_params": [
         "asset"
       ],
-      "description": "RWA Exitability Check: for one tokenized real-world asset (JAAA, USYC or mWIN), the reported transfer and eligibility status, NAV freshness, redemption path and timing, announced instant redemption capacity and pause or freeze status, each with its public source URL and retrieval time, plus a coverage-based confidence. Fields without a cited source are returned as not_disclosed. Use it to see what is publicly stated about exiting a position before acting. Deterministic lookup over a versioned dataset; not a liquidity guarantee and not investment advice. Query: ?asset=JAAA"
+      "description": "Know before you lend against a tokenized RWA. One JSON per asset (JAAA, USYC, mWIN): transfer/eligibility, NAV freshness, redemption path and timing, instant capacity, pause/freeze, sources. Reports issuer-published data; no liquidity guarantee. $5 per check (test price). Call it from your agent."
     }
   ]
 }
