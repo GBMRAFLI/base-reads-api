@@ -24,7 +24,11 @@ def handle(q, now=None):
     f = DATA["assets"][sym]["fields"]; fields, sources, n = {}, {}, 0
     for k in FIELDS:
         v = f.get(k)
-        if v: fields[k] = v["value"]; sources[k] = {"url": v["source_url"], "retrieved_at": v["retrieved_at"]}; n += 1
+        if v:
+            fields[k] = v["value"]; n += 1
+            sources[k] = {"url": v["source_url"], "retrieved_at": v["retrieved_at"]}
+            o = v.get("onchain")
+            if o: sources[k]["onchain"] = {"chain": o["chain"], "address": o["address"], "function": o["function"], "block": o["block"]}
         else: fields[k] = ND; sources[k] = ND
     return 200, {"schema": "rwa-exitability/v1", "asset": sym, "checked_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now or time.time())),
                  "dataset": {"version": DATA["version"], "revision": DATA["dataset_revision"], "generated_at": DATA["generated_at"]},

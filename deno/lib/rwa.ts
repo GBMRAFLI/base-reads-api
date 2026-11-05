@@ -12,11 +12,26 @@ export const RWA_FIELDS = ["transfer_eligibility", "nav_freshness", "redemption_
 export type RwaField = typeof RWA_FIELDS[number];
 export const RWA_DISCLAIMER = "Reported facts from cited public sources at the stated retrieval times. Not a liquidity guarantee, not a redemption promise, and not investment advice. Fields marked not_disclosed had no cited source in this dataset revision.";
 
-type Entry = { value: unknown; source_url: string; retrieved_at: string };
+export type Onchain = { chain: string; address: string; function: string; block: number };
+type Entry = { value: unknown; source_url: string; retrieved_at: string; onchain?: Onchain };
 export type Dataset = { version: string; dataset_revision: number; generated_at: string; assets: Record<string, { fields: Partial<Record<RwaField, Entry>> }> };
 
 const ISO = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,3})?Z$/;
 const SYM = /^[A-Za-z0-9]{1,16}$/;
+export const CHAIN_RE = /^[a-z0-9-]{1,32}$/;
+export const ADDR_RE = /^0x[0-9a-fA-F]{40}$/;
+/** Function signature like "paused()" or a 4-byte selector like "0x5c975abb". */
+export const FN_RE = /^([A-Za-z_][A-Za-z0-9_]{0,63}\([A-Za-z0-9_,\[\] ]{0,200}\)|0x[0-9a-fA-F]{8})$/;
+/** Problems with a sanitized on-chain citation (empty = valid). */
+export function onchainErrors(o: any): string[] {
+  if (!o || typeof o !== "object" || Array.isArray(o) || Object.keys(o).sort().join(",") !== "address,block,chain,function") return ["onchain must have exactly chain, address, function, block"];
+  const e: string[] = [];
+  if (typeof o.chain !== "string" || !CHAIN_RE.test(o.chain)) e.push("onchain.chain must be a lowercase chain name");
+  if (typeof o.address !== "string" || !ADDR_RE.test(o.address)) e.push("onchain.address must be a 0x 20-byte address");
+  if (typeof o.function !== "string" || !FN_RE.test(o.function)) e.push("onchain.function must be a signature or 4-byte selector");
+  if (!Number.isSafeInteger(o.block) || o.block < 1) e.push("onchain.block must be a positive integer");
+  return e;
+}
 /** Structural validation; returns a list of problems (empty = valid). Used by tests and scripts/rwa_dataset.ts. */
 export function validateDataset(d: any): string[] {
   const e: string[] = [];
@@ -32,7 +47,9 @@ export function validateDataset(d: any): string[] {
     if (!a || typeof a !== "object" || Object.keys(a).join(",") !== "fields" || typeof a.fields !== "object" || Array.isArray(a.fields)) { e.push(`${sym}: must be { fields: {...} }`); continue; }
     for (const [f, v] of Object.entries<any>(a.fields)) {
       if (!(RWA_FIELDS as readonly string[]).includes(f)) { e.push(`${sym}.${f}: unknown field`); continue; }
-      if (!v || typeof v !== "object" || Object.keys(v).sort().join(",") !== "retrieved_at,source_url,value") { e.push(`${sym}.${f}: must have exactly value, source_url, retrieved_at`); continue; }
+      const ks = v && typeof v === "object" ? Object.keys(v).sort().join(",") : "";
+      if (ks !== "retrieved_at,source_url,value" && ks !== "onchain,retrieved_at,source_url,value") { e.push(`${sym}.${f}: must have exactly value, source_url, retrieved_at and optionally onchain`); continue; }
+      if ("onchain" in v) for (const m of onchainErrors(v.onchain)) e.push(`${sym}.${f}: ${m}`);
       if (v.value === null || v.value === undefined || v.value === "" || v.value === NOT_DISCLOSED) e.push(`${sym}.${f}: empty value (omit the field instead)`);
       let ok = false; try { ok = new URL(v.source_url).protocol === "https:"; } catch { /* invalid */ }
       if (!ok) e.push(`${sym}.${f}: source_url must be an https URL`);
@@ -74,7 +91,12 @@ export function rwaHandle(q: Record<string, string>, now: Date = new Date()): [n
   const f = DS.assets[sym].fields; const fields: Record<string, unknown> = {}, sources: Record<string, unknown> = {}; let n = 0;
   for (const k of RWA_FIELDS) {
     const v = f[k];
-    if (v) { fields[k] = v.value; sources[k] = { url: v.source_url, retrieved_at: v.retrieved_at }; n++; }
+    if (v) {
+      fields[k] = v.value; n++;
+      const o = v.onchain;
+      sources[k] = o ? { url: v.source_url, retrieved_at: v.retrieved_at, onchain: { chain: o.chain, address: o.address, function: o.function, block: o.block } }
+        : { url: v.source_url, retrieved_at: v.retrieved_at };
+    }
     else { fields[k] = NOT_DISCLOSED; sources[k] = NOT_DISCLOSED; }
   }
   return [200, { schema: RWA_SCHEMA, asset: sym, checked_at: now.toISOString().replace(/\.\d{3}Z$/, "Z"),

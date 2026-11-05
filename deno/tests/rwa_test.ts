@@ -7,7 +7,7 @@ import { ROUTES } from "../lib/routes.ts";
 import DISCOVERY from "../lib/discovery.json" with { type: "json" };
 import SHIPPED from "../../spec/rwa-exitability-dataset.json" with { type: "json" };
 import { dataset, NOT_DISCLOSED, RWA_DISCLAIMER, RWA_FIELDS, RWA_PATH, rwaHandle, useDataset, validateDataset, type Dataset } from "../lib/rwa.ts";
-import { buildFrom } from "../scripts/rwa_dataset.ts";
+import { buildFrom, sanitizeOnchain } from "../scripts/rwa_dataset.ts";
 import { hashKey, newKey, resetTrialCache } from "../lib/trial.ts";
 
 const P = JSON.parse(Deno.readTextFileSync(new URL("./fixtures/py_signed.json", import.meta.url)));
@@ -104,4 +104,52 @@ Deno.test("rwa: dataset build keeps only cited values and reports the rest", () 
     { dataset_revision: 3 }, new Date("2026-03-01T00:00:00Z"), ["JAAA", "USYC", "mWIN"]);
   assertEquals(validateDataset(out), []); assertEquals(out.dataset_revision, 4);
   assertEquals(Object.keys(out.assets.JAAA.fields), ["nav_freshness"]); assertEquals(dropped.length, 3);
+});
+
+// SYNTHETIC source files in the research hand-off shape (one per asset); made-up values, addresses and blocks.
+const SRC_JAAA = { asset: "JAAA", fields: {
+  pause_freeze: { value: "SYNTHETIC not paused", source_url: "https://explorer.example/address/0x" + "ab".repeat(20), retrieved_at: "2026-01-02T03:04:05Z",
+    confidence: "high", refresh_method: "SYNTHETIC rpc read", note: "SYNTHETIC internal note",
+    onchain: { chain: "Ethereum", address: "0x" + "ab".repeat(20), selector: "0x5c975abb", block: "123456", result: "0x" + "00".repeat(32), rpc: "https://rpc.example" } },
+  redemption_path: { value: "SYNTHETIC issuer redemption", source_url: "https://issuer.example/synthetic", retrieved_at: "2026-01-02T03:04:05Z", confidence: "medium", refresh_method: "manual" },
+  instant_capacity: { value: null, source_url: null, retrieved_at: "2026-01-02T03:04:05Z", confidence: "none" },
+  nav_freshness: { value: "SYNTHETIC", source_url: "https://explorer.example/x", retrieved_at: "2026-01-02T03:04:05Z", onchain: { chain: "ethereum", address: "0x12" } } },
+  extra_top: "ignored" };
+const SRC_USYC = { asset: "USYC", fields: { transfer_eligibility: { value: null, source_url: null, retrieved_at: null } } };
+Deno.test("rwa: research hand-off shape builds; null -> not_disclosed; onchain sanitized; extra keys ignored", () => {
+  const { out, dropped } = buildFrom([SRC_JAAA as any, SRC_USYC], null, new Date("2026-03-01T00:00:00Z"), ["JAAA", "USYC", "mWIN"]);
+  assertEquals(validateDataset(out), []); assertEquals(out.dataset_revision, 1);
+  const j: any = out.assets.JAAA.fields;
+  assertEquals(Object.keys(j).sort(), ["pause_freeze", "redemption_path"]);
+  assertEquals(j.pause_freeze, { value: "SYNTHETIC not paused", source_url: "https://explorer.example/address/0x" + "ab".repeat(20), retrieved_at: "2026-01-02T03:04:05Z",
+    onchain: { chain: "ethereum", address: "0x" + "ab".repeat(20), function: "0x5c975abb", block: 123456 } });
+  assertEquals(Object.keys(j.redemption_path).sort(), ["retrieved_at", "source_url", "value"]);
+  assertEquals(Object.keys(out.assets.USYC.fields), []);
+  assert(dropped.some((d) => d.startsWith("JAAA.instant_capacity: no public source")));
+  assert(dropped.some((d) => d.startsWith("USYC.transfer_eligibility: no public source")));
+  assert(dropped.some((d) => d.startsWith("JAAA.nav_freshness: onchain")));
+  const txt = JSON.stringify(out);
+  for (const w of ["internal note", "rpc.example", "refresh_method", "\"confidence\"", "\"result\"", "extra_top", "selector"]) assert(!txt.includes(w), w);
+  const keep = dataset();
+  try {
+    useDataset(out as Dataset);
+    const [c, o]: any = rwaHandle({ asset: "JAAA" });
+    assertEquals(c, 200);
+    assertEquals(o.sources.pause_freeze, { url: "https://explorer.example/address/0x" + "ab".repeat(20), retrieved_at: "2026-01-02T03:04:05Z",
+      onchain: { chain: "ethereum", address: "0x" + "ab".repeat(20), function: "0x5c975abb", block: 123456 } });
+    assertEquals(o.sources.redemption_path, { url: "https://issuer.example/synthetic", retrieved_at: "2026-01-02T03:04:05Z" });
+    assertEquals([o.fields.instant_capacity, o.sources.instant_capacity], [NOT_DISCLOSED, NOT_DISCLOSED]);
+    assertEquals([o.confidence.level, o.confidence.disclosed_fields], ["low", 2]);
+    assert(!JSON.stringify(o.sources).includes("medium") && !JSON.stringify(o.fields).includes("refresh"));
+  } finally { useDataset(keep); }
+});
+Deno.test("rwa: onchain citation validation", () => {
+  assertEquals(sanitizeOnchain({ chain: "base", address: "0x" + "cd".repeat(20), function: "paused()", block: 9 }), { chain: "base", address: "0x" + "cd".repeat(20), function: "paused()", block: 9 });
+  for (const o of [null, { chain: "base", address: "0x12", function: "paused()", block: 9 }, { chain: "base", address: "0x" + "cd".repeat(20), function: "paused(); drop", block: 9 },
+    { chain: "base", address: "0x" + "cd".repeat(20), function: "paused()", block: -1 }, { chain: "base", address: "0x" + "cd".repeat(20), block: 9 }]) assertEquals(sanitizeOnchain(o), null);
+  const ok = { value: "x", source_url: "https://explorer.example/a", retrieved_at: "2026-01-01T00:00:00Z" };
+  const v = (f: unknown) => validateDataset({ version: "rwa-exitability-dataset/1", dataset_revision: 1, generated_at: "2026-01-01T00:00:00Z", assets: { JAAA: { fields: { pause_freeze: f } } } });
+  assertEquals(v({ ...ok, onchain: { chain: "ethereum", address: "0x" + "ab".repeat(20), function: "0x5c975abb", block: 1 } }), []);
+  assert(v({ ...ok, onchain: { chain: "ethereum", address: "0x" + "ab".repeat(20), function: "0x5c975abb", block: 1, result: "0x00" } }).length > 0);
+  assert(v({ ...ok, confidence: "high" }).length > 0);
 });

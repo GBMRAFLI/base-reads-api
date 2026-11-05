@@ -51,6 +51,10 @@ returned as `"not_disclosed"`. No language model, no scoring of the asset, no pr
 
 A cited field looks like `"fields": {"redemption_path": <value>}` with
 `"sources": {"redemption_path": {"url": "https://...", "retrieved_at": "2026-...Z"}}`.
+A field read from a contract also carries the call that produced it, and `url` is the contract's block-explorer page:
+`"sources": {"pause_freeze": {"url": "https://<explorer>/address/0x...", "retrieved_at": "2026-...Z",
+"onchain": {"chain": "ethereum", "address": "0x...", "function": "paused()", "block": 12345678}}}`.
+`function` is a signature or a 4-byte selector. Raw call results are not included; `fields` holds the reported value.
 
 | Field | Meaning |
 |---|---|
@@ -62,13 +66,16 @@ A cited field looks like `"fields": {"redemption_path": <value>}` with
 | `pause_freeze` | whether the token or redemptions are stated or observed as paused / frozen |
 
 `confidence.level` is computed from coverage only: `none` (0 of 6 fields cited), `low` (< 3), `medium` (3-5), `high` (6).
-It says how much is documented, not whether the asset is liquid.
+It says how much is documented, not whether the asset is liquid. There is no per-field confidence in the response:
+every served field meets the same bar (a value, a cited source and a retrieval time), and a second, subjective score
+per field would read like a quality rating.
 
 ## Dataset
 
 The data ships in the repo as `spec/rwa-exitability-dataset.json` (`rwa-exitability-dataset/1`), versioned by
-`dataset_revision`. Each field entry must have exactly `value`, `source_url` (https) and `retrieved_at` (ISO-8601 UTC);
-a field with no cited source is simply omitted and is served as `not_disclosed`.
+`dataset_revision`. Each field entry has exactly `value`, `source_url` (https) and `retrieved_at` (ISO-8601 UTC), plus
+an optional `onchain` with exactly `chain`, `address`, `function`, `block` (positive integer); a field with no cited
+source is simply omitted and is served as `not_disclosed`.
 
 ```sh
 cd deno
@@ -76,6 +83,10 @@ deno run -A scripts/rwa_dataset.ts validate                 # schema check (also
 deno run -A scripts/rwa_dataset.ts build <source_dir>       # rebuild from per-asset source files, bumps the revision
 ```
 
-Source files for `build` are `<source_dir>/*.json`, each
-`{"asset": "JAAA", "fields": {"<field>": {"value": ..., "source_url": "https://...", "retrieved_at": "...Z"}}}`.
-Entries missing a value, an https source or a retrieval time are dropped and listed, never filled in.
+Source files for `build` are one per asset (`<source_dir>/JAAA.json`, `USYC.json`, `mWIN.json`), each
+`{"asset": "JAAA", "fields": {"<field>": {"value": ..., "source_url": "https://...", "retrieved_at": "...Z",
+"confidence": ..., "refresh_method": ..., "onchain": {"chain", "address", "function" | "selector", "block", "result"}}}}`.
+- `value: null` means no public source: the field is dropped and served as `not_disclosed`.
+- Entries missing a value, an https source or a retrieval time are dropped and listed, never filled in.
+- `onchain` is reduced to `chain`, `address`, `function` (or `selector`), `block`; an incomplete one drops the entry.
+- `result`, `confidence`, `refresh_method` and any other keys are ignored and never shipped.
