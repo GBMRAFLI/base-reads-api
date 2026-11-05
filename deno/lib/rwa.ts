@@ -20,8 +20,9 @@ const ISO = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,3})?Z$/;
 const SYM = /^[A-Za-z0-9]{1,16}$/;
 export const CHAIN_RE = /^[a-z0-9-]{1,32}$/;
 export const ADDR_RE = /^0x[0-9a-fA-F]{40}$/;
-/** Function signature like "paused()" or a 4-byte selector like "0x5c975abb". */
-export const FN_RE = /^([A-Za-z_][A-Za-z0-9_]{0,63}\([A-Za-z0-9_,\[\] ]{0,200}\)|0x[0-9a-fA-F]{8})$/;
+/** Function signature like "paused()", up to 4 signatures joined by "/" for a value read from several calls, or a 4-byte selector. */
+const SIG = "[A-Za-z_][A-Za-z0-9_]{0,63}\\([A-Za-z0-9_,\\[\\] ]{0,200}\\)";
+export const FN_RE = new RegExp(`^(${SIG}(/${SIG}){0,3}|0x[0-9a-fA-F]{8})$`);
 /** Problems with a sanitized on-chain citation (empty = valid). */
 export function onchainErrors(o: any): string[] {
   if (!o || typeof o !== "object" || Array.isArray(o) || Object.keys(o).sort().join(",") !== "address,block,chain,function") return ["onchain must have exactly chain, address, function, block"];

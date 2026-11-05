@@ -113,14 +113,18 @@ const SRC_JAAA = { asset: "JAAA", fields: {
     onchain: { chain: "Ethereum", address: "0x" + "ab".repeat(20), selector: "0x5c975abb", block: "123456", result: "0x" + "00".repeat(32), rpc: "https://rpc.example" } },
   redemption_path: { value: "SYNTHETIC issuer redemption", source_url: "https://issuer.example/synthetic", retrieved_at: "2026-01-02T03:04:05Z", confidence: "medium", refresh_method: "manual" },
   instant_capacity: { value: null, source_url: null, retrieved_at: "2026-01-02T03:04:05Z", confidence: "none" },
-  nav_freshness: { value: "SYNTHETIC", source_url: "https://explorer.example/x", retrieved_at: "2026-01-02T03:04:05Z", onchain: { chain: "ethereum", address: "0x12" } } },
+  nav_freshness: { value: "SYNTHETIC", source_url: "https://explorer.example/address/0x" + "12".repeat(20), retrieved_at: "2026-01-02T03:04:05Z", onchain: { chain: "ethereum", address: "0x12" } },
+  transfer_eligibility: { value: { SYNTHETIC: true }, source_url: "https://docs.example/synthetic", retrieved_at: "2026-01-02T03:04:05Z", onchain: { chain: "ethereum", address: "0x" + "ab".repeat(20), function: "hook (reverted)", block: 1 } },
+  redemption_timing: { value: "SYNTHETIC", source_url: "https://eth-mainnet.rpc.example/v3/x", retrieved_at: "2026-01-02T03:04:05Z" } },
   extra_top: "ignored" };
 const SRC_USYC = { asset: "USYC", fields: { transfer_eligibility: { value: null, source_url: null, retrieved_at: null } } };
 Deno.test("rwa: research hand-off shape builds; null -> not_disclosed; onchain sanitized; extra keys ignored", () => {
   const { out, dropped } = buildFrom([SRC_JAAA as any, SRC_USYC], null, new Date("2026-03-01T00:00:00Z"), ["JAAA", "USYC", "mWIN"]);
   assertEquals(validateDataset(out), []); assertEquals(out.dataset_revision, 1);
   const j: any = out.assets.JAAA.fields;
-  assertEquals(Object.keys(j).sort(), ["pause_freeze", "redemption_path"]);
+  assertEquals(Object.keys(j).sort(), ["pause_freeze", "redemption_path", "transfer_eligibility"]);
+  assertEquals(j.transfer_eligibility, { value: { SYNTHETIC: true }, source_url: "https://docs.example/synthetic", retrieved_at: "2026-01-02T03:04:05Z" });
+  assert(dropped.some((d) => d.startsWith("JAAA.redemption_timing: source_url looks like an RPC")));
   assertEquals(j.pause_freeze, { value: "SYNTHETIC not paused", source_url: "https://explorer.example/address/0x" + "ab".repeat(20), retrieved_at: "2026-01-02T03:04:05Z",
     onchain: { chain: "ethereum", address: "0x" + "ab".repeat(20), function: "0x5c975abb", block: 123456 } });
   assertEquals(Object.keys(j.redemption_path).sort(), ["retrieved_at", "source_url", "value"]);
@@ -139,7 +143,7 @@ Deno.test("rwa: research hand-off shape builds; null -> not_disclosed; onchain s
       onchain: { chain: "ethereum", address: "0x" + "ab".repeat(20), function: "0x5c975abb", block: 123456 } });
     assertEquals(o.sources.redemption_path, { url: "https://issuer.example/synthetic", retrieved_at: "2026-01-02T03:04:05Z" });
     assertEquals([o.fields.instant_capacity, o.sources.instant_capacity], [NOT_DISCLOSED, NOT_DISCLOSED]);
-    assertEquals([o.confidence.level, o.confidence.disclosed_fields], ["low", 2]);
+    assertEquals([o.confidence.level, o.confidence.disclosed_fields], ["medium", 3]);
     assert(!JSON.stringify(o.sources).includes("medium") && !JSON.stringify(o.fields).includes("refresh"));
   } finally { useDataset(keep); }
 });
@@ -152,4 +156,6 @@ Deno.test("rwa: onchain citation validation", () => {
   assertEquals(v({ ...ok, onchain: { chain: "ethereum", address: "0x" + "ab".repeat(20), function: "0x5c975abb", block: 1 } }), []);
   assert(v({ ...ok, onchain: { chain: "ethereum", address: "0x" + "ab".repeat(20), function: "0x5c975abb", block: 1, result: "0x00" } }).length > 0);
   assert(v({ ...ok, confidence: "high" }).length > 0);
+  assertEquals(v({ ...ok, onchain: { chain: "ethereum", address: "0x" + "ab".repeat(20), function: "asset()/totalAssets()", block: 1 } }), []);
+  assert(v({ ...ok, onchain: { chain: "ethereum", address: "0x" + "ab".repeat(20), function: "hook (reverted)", block: 1 } }).length > 0);
 });

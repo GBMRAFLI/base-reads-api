@@ -54,7 +54,7 @@ A cited field looks like `"fields": {"redemption_path": <value>}` with
 A field read from a contract also carries the call that produced it, and `url` is the contract's block-explorer page:
 `"sources": {"pause_freeze": {"url": "https://<explorer>/address/0x...", "retrieved_at": "2026-...Z",
 "onchain": {"chain": "ethereum", "address": "0x...", "function": "paused()", "block": 12345678}}}`.
-`function` is a signature or a 4-byte selector. Raw call results are not included; `fields` holds the reported value.
+`function` is a signature, up to four signatures joined by `/` when a value combines several calls, or a 4-byte selector. Raw call results are not included; `fields` holds the reported value.
 
 | Field | Meaning |
 |---|---|
@@ -88,5 +88,8 @@ Source files for `build` are one per asset (`<source_dir>/JAAA.json`, `USYC.json
 "confidence": ..., "refresh_method": ..., "onchain": {"chain", "address", "function" | "selector", "block", "result"}}}}`.
 - `value: null` means no public source: the field is dropped and served as `not_disclosed`.
 - Entries missing a value, an https source or a retrieval time are dropped and listed, never filled in.
-- `onchain` is reduced to `chain`, `address`, `function` (or `selector`), `block`; an incomplete one drops the entry.
+- `onchain` is reduced to `chain`, `address`, `function` (or `selector`), `block`. If that is not a valid citation, the
+  entry is dropped when `source_url` is the explorer page, otherwise it is kept on its document source without `onchain`.
+- A `source_url` that looks like an RPC endpoint, a keyed API URL or an internal address drops the entry.
+- Only `<SYMBOL>.json` for the supported symbols is read; other files in the directory are ignored.
 - `result`, `confidence`, `refresh_method` and any other keys are ignored and never shipped.
