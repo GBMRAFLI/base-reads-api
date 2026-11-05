@@ -438,7 +438,7 @@ class handler(BaseHTTPRequestHandler):
         if path == "/x402/preflight" and not ADDR.match(PAY_TO): return s._send(503, {"error": "payee not configured"})
         t_req = iso(time.time())
         sig = s.headers.get("PAYMENT-SIGNATURE") or s.headers.get("X-PAYMENT")
-        if not sig and path == "/rwa/exitability" and RWA.input_error(q): return s._send(400, {"error": RWA.input_error(q)})  # pure lookup, before the 402
+        if path == "/rwa/exitability" and RWA.input_error(q): return s._send(400, {"error": RWA.input_error(q)})  # pure lookup, before the 402
         if not sig: pr = required(path, s.headers.get("Host", "")); return s._send(402, pr, {"PAYMENT-REQUIRED": b64(pr)})
         _REQ.ua = s.headers.get("User-Agent")
         code, out, hd = paid(path, q, qs, sig, t_req, ip=s.client_address[0])

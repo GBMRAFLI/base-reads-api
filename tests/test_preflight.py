@@ -634,4 +634,27 @@ class T9(unittest.TestCase):
         vm(md)
         self.assertGreaterEqual(md["total_snapshots"], 1); self.assertNotIn("resources", json.dumps(m))
         md["covered_listings"] += 1; self.assertRaises(ValueError, vm, md)
+class RwaOnchainValidation(unittest.TestCase):
+    def test_malformed_onchain_entry_is_not_disclosed_not_500(self):
+        import importlib, copy
+        sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "api")); R = importlib.import_module("rwa")
+        keep = copy.deepcopy(R.DATA)
+        try:
+            ok = {"value": "SYNTHETIC", "source_url": "https://explorer.example/address/0x" + "ab" * 20, "retrieved_at": "2026-01-01T00:00:00Z",
+                  "onchain": {"chain": "ethereum", "address": "0x" + "ab" * 20, "function": "paused()", "block": 5}}
+            no_block = copy.deepcopy(ok); del no_block["onchain"]["block"]
+            bad_fn = copy.deepcopy(ok); bad_fn["onchain"]["function"] = "paused(); x"
+            extra = copy.deepcopy(ok); extra["onchain"]["result"] = "0x00"
+            R.DATA["assets"]["JAAA"]["fields"] = {"pause_freeze": ok, "nav_freshness": no_block, "redemption_path": bad_fn, "instant_capacity": extra,
+                                                  "redemption_timing": {"value": None, "source_url": "https://a.example", "retrieved_at": "2026-01-01T00:00:00Z"}}
+            c, o = R.handle({"asset": "JAAA"})
+            self.assertEqual(c, 200)
+            self.assertEqual(o["sources"]["pause_freeze"]["onchain"], {"chain": "ethereum", "address": "0x" + "ab" * 20, "function": "paused()", "block": 5})
+            for f in ("nav_freshness", "redemption_path", "instant_capacity", "redemption_timing", "transfer_eligibility"):
+                self.assertEqual((o["fields"][f], o["sources"][f]), ("not_disclosed", "not_disclosed"), f)
+            self.assertEqual(o["confidence"]["disclosed_fields"], 1)
+            self.assertEqual(R.onchain_errors({"chain": "ethereum", "address": "0x" + "ab" * 20, "function": "asset()/totalAssets()", "block": 1}), [])
+        finally:
+            R.DATA.clear(); R.DATA.update(keep)
+
 if __name__ == "__main__": unittest.main(verbosity=2)

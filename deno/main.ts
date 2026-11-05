@@ -370,28 +370,29 @@ async function handleGet(req: Request, d: Deps): Promise<Response> {
   const tReq = iso();
   const sig = req.headers.get("PAYMENT-SIGNATURE") ?? req.headers.get("X-PAYMENT");
   if (publicUrlError(env)) return send(503, { error: "public origin not configured" }); // mainnet without PUBLIC_URL: never use Host
+  // A6: unpaid 402s are pure computation (no DNS, GET or RPC) and limited per client IP.
+  // IPv6: per-/64 key plus a per-/48 aggregate, so a prefix spray is bounded without filling the per-client table.
+  const p48 = ipv6Prefix48(d.ip); const ipk = d.ip ? (SG.ipKey(d.ip) ?? d.ip) : "";
+  const unpaidOk = (take: boolean) => !d.ip || (take
+    ? abuse(env).unpaid.allow(ipk) && (p48 === null || abuse(env).unpaid48.allow(p48))
+    : abuse(env).unpaid.peek(ipk) && (p48 === null || abuse(env).unpaid48.peek(p48)));
+  /** Take one unpaid unit on every limiter now; on any refusal, return the units already taken. */
+  const takeUnpaid = (): { release: () => void } | null => {
+    if (!d.ip) return { release: () => {} };
+    const G = abuse(env), now = Date.now(); const taken: [WindowLimiter, string, number][] = [];
+    const back = () => { for (const [l, k, st] of taken) l.release(k, st); };
+    for (const [l, k] of [[G.unpaid, ipk], ...(p48 === null ? [] : [[G.unpaid48, p48]])] as [WindowLimiter, string][]) {
+      if (!l.allow(k, now)) { back(); return null; }
+      taken.push([l, k, l.windowStart(k)!]);
+    }
+    return { release: back };
+  };
+  const UNPAID429 = () => send(429, { error: "too many unpaid requests, retry later", scope: "ip" }, { "Retry-After": "60" });
+  // Unknown asset on the RWA route: pure dataset lookup, answered 400 before any challenge or payment-header parsing,
+  // with or without a payment header (always counted as unpaid traffic, so a garbage header cannot bypass the limiter).
+  const rwaErr = path === RWA_PATH ? rwaInputError(q) : null;
+  if (rwaErr) { if (!unpaidOk(true)) return UNPAID429(); return send(400, { error: rwaErr }); }
   if (!sig) {
-    // A6: unpaid 402s are pure computation (no DNS, GET or RPC) and limited per client IP.
-    // IPv6: per-/64 key plus a per-/48 aggregate, so a prefix spray is bounded without filling the per-client table.
-    const p48 = ipv6Prefix48(d.ip); const ipk = d.ip ? (SG.ipKey(d.ip) ?? d.ip) : "";
-    const unpaidOk = (take: boolean) => !d.ip || (take
-      ? abuse(env).unpaid.allow(ipk) && (p48 === null || abuse(env).unpaid48.allow(p48))
-      : abuse(env).unpaid.peek(ipk) && (p48 === null || abuse(env).unpaid48.peek(p48)));
-    /** Take one unpaid unit on every limiter now; on any refusal, return the units already taken. */
-    const takeUnpaid = (): { release: () => void } | null => {
-      if (!d.ip) return { release: () => {} };
-      const G = abuse(env), now = Date.now(); const taken: [WindowLimiter, string, number][] = [];
-      const back = () => { for (const [l, k, st] of taken) l.release(k, st); };
-      for (const [l, k] of [[G.unpaid, ipk], ...(p48 === null ? [] : [[G.unpaid48, p48]])] as [WindowLimiter, string][]) {
-        if (!l.allow(k, now)) { back(); return null; }
-        taken.push([l, k, l.windowStart(k)!]);
-      }
-      return { release: back };
-    };
-    const UNPAID429 = () => send(429, { error: "too many unpaid requests, retry later", scope: "ip" }, { "Retry-After": "60" });
-    // Unknown asset on the RWA route: pure dataset lookup, answered 400 before any challenge (counted as unpaid traffic).
-    const rwaErr = path === RWA_PATH ? rwaInputError(q) : null;
-    if (rwaErr) { if (!unpaidOk(true)) return UNPAID429(); return send(400, { error: rwaErr }); }
     const tk = req.headers.get(TRIAL_HEADER);
     if (tk) {
       const label = await resolveTrial(tk, env);

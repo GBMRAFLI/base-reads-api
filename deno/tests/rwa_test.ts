@@ -159,3 +159,10 @@ Deno.test("rwa: onchain citation validation", () => {
   assertEquals(v({ ...ok, onchain: { chain: "ethereum", address: "0x" + "ab".repeat(20), function: "asset()/totalAssets()", block: 1 } }), []);
   assert(v({ ...ok, onchain: { chain: "ethereum", address: "0x" + "ab".repeat(20), function: "hook (reverted)", block: 1 } }).length > 0);
 });
+Deno.test("rwa: garbage payment header + unknown asset is still counted as unpaid (400 then 429)", async () => {
+  E.UNPAID_PER_MIN = "5"; await resetGuards();
+  const st: number[] = [];
+  for (let i = 0; i < 6; i++) { const r = await get("?asset=NOPE", { "PAYMENT-SIGNATURE": "garbage!!" }, "203.0.113.77"); st.push(r.status); assertEquals(r.pr, null); }
+  delete E.UNPAID_PER_MIN; await resetGuards();
+  assertEquals(st, [400, 400, 400, 400, 400, 429]);
+});

@@ -1,10 +1,36 @@
 """RWA Exitability Check (reference implementation; same output as deno/lib/rwa.ts). Deterministic lookup over
 spec/rwa-exitability-dataset.json. Values only with a cited source; otherwise "not_disclosed". Zero LLM."""
-import json, os, time, urllib.parse
+import json, os, re, time, urllib.parse
 DATA = json.load(open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "spec", "rwa-exitability-dataset.json")))
 FIELDS = ["transfer_eligibility", "nav_freshness", "redemption_path", "redemption_timing", "instant_capacity", "pause_freeze"]
 ND = "not_disclosed"
 DISCLAIMER = "Reported facts from cited public sources at the stated retrieval times. Not a liquidity guarantee, not a redemption promise, and not investment advice. Fields marked not_disclosed had no cited source in this dataset revision."
+ISO = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,3})?Z$")
+CHAIN_RE = re.compile(r"^[a-z0-9-]{1,32}$"); ADDR_RE = re.compile(r"^0x[0-9a-fA-F]{40}$")
+_SIG = r"[A-Za-z_][A-Za-z0-9_]{0,63}\([A-Za-z0-9_,\[\] ]{0,200}\)"
+FN_RE = re.compile(r"^(%s(/%s){0,3}|0x[0-9a-fA-F]{8})$" % (_SIG, _SIG))
+def onchain_errors(o):
+    """Same rules as onchainErrors in deno/lib/rwa.ts (empty list = valid)."""
+    if not isinstance(o, dict) or sorted(o) != ["address", "block", "chain", "function"]: return ["onchain must have exactly chain, address, function, block"]
+    e = []
+    if not isinstance(o["chain"], str) or not CHAIN_RE.match(o["chain"]): e.append("onchain.chain")
+    if not isinstance(o["address"], str) or not ADDR_RE.match(o["address"]): e.append("onchain.address")
+    if not isinstance(o["function"], str) or not FN_RE.match(o["function"]): e.append("onchain.function")
+    b = o["block"]
+    if not isinstance(b, int) or isinstance(b, bool) or b < 1 or b > 2**53 - 1: e.append("onchain.block")
+    return e
+def entry_errors(v):
+    """Per-field rules of validateDataset in deno/lib/rwa.ts. An invalid entry is served as not_disclosed, never a 500."""
+    if not isinstance(v, dict): return ["entry must be an object"]
+    ks = sorted(v)
+    if ks not in (["retrieved_at", "source_url", "value"], ["onchain", "retrieved_at", "source_url", "value"]): return ["entry keys"]
+    e = []
+    if v["value"] is None or v["value"] == "" or v["value"] == ND: e.append("empty value")
+    u = v["source_url"]
+    if not isinstance(u, str) or urllib.parse.urlsplit(u).scheme != "https" or not urllib.parse.urlsplit(u).netloc: e.append("source_url")
+    if not isinstance(v["retrieved_at"], str) or not ISO.match(v["retrieved_at"]): e.append("retrieved_at")
+    if "onchain" in v: e += onchain_errors(v["onchain"])
+    return e
 def resolve(s):
     t = s.strip().lower()
     return next((k for k in DATA["assets"] if k.lower() == t), None)
@@ -24,6 +50,7 @@ def handle(q, now=None):
     f = DATA["assets"][sym]["fields"]; fields, sources, n = {}, {}, 0
     for k in FIELDS:
         v = f.get(k)
+        if v is not None and entry_errors(v): v = None
         if v:
             fields[k] = v["value"]; n += 1
             sources[k] = {"url": v["source_url"], "retrieved_at": v["retrieved_at"]}
