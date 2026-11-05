@@ -4,6 +4,7 @@ import { pyDumps } from "./lib/canonical.ts";
 import { Chain, makeRpc, type Rpc } from "./lib/chain.ts";
 import { preflight, type Fetcher, type Resolver } from "./lib/preflight.ts";
 import { PAY_TO_DEFAULT, ROUTES } from "./lib/routes.ts";
+import { RWA_PATH, rwaHandle, rwaInputError } from "./lib/rwa.ts";
 import DISCOVERY from "./lib/discovery.json" with { type: "json" };
 import { CDP_HOST, enabled as cdpEnabled, headers as cdpHeaders } from "./lib/cdp_auth.ts";
 import * as SG from "./lib/settle_guard.ts";
@@ -369,25 +370,31 @@ async function handleGet(req: Request, d: Deps): Promise<Response> {
   const tReq = iso();
   const sig = req.headers.get("PAYMENT-SIGNATURE") ?? req.headers.get("X-PAYMENT");
   if (publicUrlError(env)) return send(503, { error: "public origin not configured" }); // mainnet without PUBLIC_URL: never use Host
+  // A6: unpaid 402s are pure computation (no DNS, GET or RPC) and limited per client IP.
+  // IPv6: per-/64 key plus a per-/48 aggregate, so a prefix spray is bounded without filling the per-client table.
+  const p48 = ipv6Prefix48(d.ip); const ipk = d.ip ? (SG.ipKey(d.ip) ?? d.ip) : "";
+  const unpaidOk = (take: boolean) => !d.ip || (take
+    ? abuse(env).unpaid.allow(ipk) && (p48 === null || abuse(env).unpaid48.allow(p48))
+    : abuse(env).unpaid.peek(ipk) && (p48 === null || abuse(env).unpaid48.peek(p48)));
+  /** Take one unpaid unit on every limiter now; on any refusal, return the units already taken. */
+  const takeUnpaid = (): { release: () => void } | null => {
+    if (!d.ip) return { release: () => {} };
+    const G = abuse(env), now = Date.now(); const taken: [WindowLimiter, string, number][] = [];
+    const back = () => { for (const [l, k, st] of taken) l.release(k, st); };
+    for (const [l, k] of [[G.unpaid, ipk], ...(p48 === null ? [] : [[G.unpaid48, p48]])] as [WindowLimiter, string][]) {
+      if (!l.allow(k, now)) { back(); return null; }
+      taken.push([l, k, l.windowStart(k)!]);
+    }
+    return { release: back };
+  };
+  const UNPAID429 = () => send(429, { error: "too many unpaid requests, retry later", scope: "ip" }, { "Retry-After": "60" });
+  // Unknown asset on the RWA route: pure dataset lookup, answered 400 before any challenge or payment-header parsing,
+  // with or without a payment header (always counted as unpaid traffic, so a garbage header cannot bypass the limiter).
+  // Known, accepted difference: on the other routes a malformed payment header is rejected by paid() with 400 and is not
+  // counted against the unpaid limiter (pre-existing; costs one header parse, no network call).
+  const rwaErr = path === RWA_PATH ? rwaInputError(q) : null;
+  if (rwaErr) { if (!unpaidOk(true)) return UNPAID429(); return send(400, { error: rwaErr }); }
   if (!sig) {
-    // A6: unpaid 402s are pure computation (no DNS, GET or RPC) and limited per client IP.
-    // IPv6: per-/64 key plus a per-/48 aggregate, so a prefix spray is bounded without filling the per-client table.
-    const p48 = ipv6Prefix48(d.ip); const ipk = d.ip ? (SG.ipKey(d.ip) ?? d.ip) : "";
-    const unpaidOk = (take: boolean) => !d.ip || (take
-      ? abuse(env).unpaid.allow(ipk) && (p48 === null || abuse(env).unpaid48.allow(p48))
-      : abuse(env).unpaid.peek(ipk) && (p48 === null || abuse(env).unpaid48.peek(p48)));
-    /** Take one unpaid unit on every limiter now; on any refusal, return the units already taken. */
-    const takeUnpaid = (): { release: () => void } | null => {
-      if (!d.ip) return { release: () => {} };
-      const G = abuse(env), now = Date.now(); const taken: [WindowLimiter, string, number][] = [];
-      const back = () => { for (const [l, k, st] of taken) l.release(k, st); };
-      for (const [l, k] of [[G.unpaid, ipk], ...(p48 === null ? [] : [[G.unpaid48, p48]])] as [WindowLimiter, string][]) {
-        if (!l.allow(k, now)) { back(); return null; }
-        taken.push([l, k, l.windowStart(k)!]);
-      }
-      return { release: back };
-    };
-    const UNPAID429 = () => send(429, { error: "too many unpaid requests, retry later", scope: "ip" }, { "Retry-After": "60" });
     const tk = req.headers.get(TRIAL_HEADER);
     if (tk) {
       const label = await resolveTrial(tk, env);
@@ -440,7 +447,7 @@ async function trialServe(path: string, q: Record<string, string>, label: string
     } else {
       if (!await takeQuota(label, dailyLimit(env), Date.now())) return null;
       took = true;
-      [code, out] = await new Chain(rpc, c.USDC).handle(path, q);
+      [code, out] = path === RWA_PATH ? rwaHandle(q) : await new Chain(rpc, c.USDC).handle(path, q);
     }
   } catch (e) {
     if (e instanceof SigningUnavailable) return [503, { error: "signing unavailable" }, took];
@@ -559,6 +566,7 @@ async function paid(path: string, q: Record<string, string>, qs: string, sig: st
   };
   const run = async (): Promise<[number, unknown]> => {
     if (path === "/x402/preflight") return await runPreflight(unquote(q.url ?? ""));
+    if (path === RWA_PATH) return rwaHandle(q);
     return await new Chain(rpc, c.USDC).handle(path, q);
   };
   /** Probe slot: one synchronous reservation bound to payer + payment nonce + target, 15 s TTL, one per payer. */

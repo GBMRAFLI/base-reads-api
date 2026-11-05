@@ -604,7 +604,7 @@ class T8(unittest.TestCase):
         self.assertEqual(IX.latest_of([{"date": "2026-10-20", "status": "complete", "resources": 5}], now=1792454400 + 86400 + 3600), {"date": "2026-10-20", "status": "complete", "listings": 5, "age_days": 1, "fresh": True})
         self.assertFalse(IX.latest_of([{"date": "2026-10-16", "status": "complete", "resources": 5}], now=1792454400 + 86400 + 3600)["fresh"]); self.assertTrue(IX.latest_of([{"date": "2026-10-18", "resources": 1}], now=1792454400 + 86400 + 3600)["fresh"])
     def test_pricing_related_and_llms(self):
-        self.assertEqual({k: v[0] for k, v in IX.ROUTES.items()}, {"/base/usdc-balance": 1000, "/base/tx-status": 2000, "/base/basename": 3000, "/base/address-intel": 10000, "/x402/preflight": 10000, "/base/network": 1000})
+        self.assertEqual({k: v[0] for k, v in IX.ROUTES.items()}, {"/base/usdc-balance": 1000, "/base/tx-status": 2000, "/base/basename": 3000, "/base/address-intel": 10000, "/x402/preflight": 10000, "/base/network": 1000, "/rwa/exitability": 5000000})
         self.assertEqual(IX.related("/base/network"), [{"path": "/base/tx-status", "price_usdc": "0.002"}, {"path": "/x402/preflight", "price_usdc": "0.010"}])
         self.assertEqual(IX.related("/base/usdc-balance"), [{"path": "/base/address-intel", "price_usdc": "0.010"}, {"path": "/x402/preflight", "price_usdc": "0.010"}])
         t = IX.llms_txt(); self.assertIn("before paying it, you can call /x402/preflight?url=<endpoint> (0.010 USDC). Facts only, no guarantee.", t); self.assertNotIn("before every", t); self.assertNotIn("every chain reading", t); self.assertIn("no language model", t); self.assertIn("pinned to a block number", t)
@@ -634,4 +634,39 @@ class T9(unittest.TestCase):
         vm(md)
         self.assertGreaterEqual(md["total_snapshots"], 1); self.assertNotIn("resources", json.dumps(m))
         md["covered_listings"] += 1; self.assertRaises(ValueError, vm, md)
+class RwaOnchainValidation(unittest.TestCase):
+    def test_malformed_onchain_entry_is_not_disclosed_not_500(self):
+        import importlib, copy
+        sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "api")); R = importlib.import_module("rwa")
+        keep = copy.deepcopy(R.DATA)
+        try:
+            ok = {"value": "SYNTHETIC", "source_url": "https://etherscan.io/address/0x" + "ab" * 20, "retrieved_at": "2026-01-01T00:00:00Z",
+                  "onchain": {"chain": "ethereum", "address": "0x" + "ab" * 20, "function": "paused()", "block": 5}}
+            no_block = copy.deepcopy(ok); del no_block["onchain"]["block"]
+            bad_fn = copy.deepcopy(ok); bad_fn["onchain"]["function"] = "paused(); x"
+            extra = copy.deepcopy(ok); extra["onchain"]["result"] = "0x00"
+            R.DATA["assets"]["JAAA"]["fields"] = {"pause_freeze": ok, "nav_freshness": no_block, "redemption_path": bad_fn, "instant_capacity": extra,
+                                                  "redemption_timing": {"value": None, "source_url": "https://a.example", "retrieved_at": "2026-01-01T00:00:00Z"}}
+            c, o = R.handle({"asset": "JAAA"})
+            self.assertEqual(c, 200)
+            self.assertEqual(o["sources"]["pause_freeze"]["onchain"], {"chain": "ethereum", "address": "0x" + "ab" * 20, "function": "paused()", "block": 5})
+            for f in ("nav_freshness", "redemption_path", "instant_capacity", "redemption_timing", "transfer_eligibility"):
+                self.assertEqual((o["fields"][f], o["sources"][f]), ("not_disclosed", "not_disclosed"), f)
+            self.assertEqual(o["confidence"]["disclosed_fields"], 1)
+            self.assertEqual(R.onchain_errors({"chain": "ethereum", "address": "0x" + "ab" * 20, "function": "asset()/totalAssets()", "block": 1}), [])
+            for u in ("https://u:p@docs.example/a", "https://docs.example/workspace/a", "file:///etc/x", "http://docs.example/a"): self.assertFalse(R.public_https(u), u)
+            self.assertTrue(R.public_https("https://docs.example/variable-rates"))
+            for u in ("https://docs.example/%2Fworkspace/x", "https://docs.example/a%2fhome%2fu", "https://docs.example/%252Fetc%252Fpasswd", "https://docs.example/%25252Froot/x",
+                      "https://docs.example/a\\workspace", "https://docs.example/%5Cworkspace", "https://docs.example/%E0%A4%A", "https://docs.example/bad%zz"):
+                self.assertFalse(R.public_https(u), u)
+            for u in ("https://docs.example/workspaces-guide", "https://docs.example/a%20b", "https://docs.example/homepage", "https://docs.example/%2Fdocs/x"): self.assertTrue(R.public_https(u), u)
+            A = "0x" + "ab" * 20
+            for u in ("https://etherscan.io/address/" + A, "https://basescan.org/address/" + A): self.assertTrue(R.explorer_for(u, A), u)
+            for u in ("https://evil.example/address/" + A, "https://etherscan.io.evil.example/address/" + A, "https://fakeetherscan.io/address/" + A, "https://sub.etherscan.io/address/" + A,
+                      "http://etherscan.io/address/" + A, "https://etherscan.io/x/address/" + A, "https://evil.example/?u=https://etherscan.io/address/" + A): self.assertFalse(R.explorer_for(u, A), u)
+            doc_onchain = copy.deepcopy(ok); doc_onchain["source_url"] = "https://docs.example/eligibility"
+            self.assertTrue(R.entry_errors(doc_onchain)); self.assertEqual(R.entry_errors(ok), [])
+        finally:
+            R.DATA.clear(); R.DATA.update(keep)
+
 if __name__ == "__main__": unittest.main(verbosity=2)

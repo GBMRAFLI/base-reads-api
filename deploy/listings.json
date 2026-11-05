@@ -109,6 +109,16 @@
       "amount_atomic": "1000",
       "query_params": [],
       "description": "Base mainnet head: latest block number, block age in seconds, base fee and gas price in gwei. Use it to check the chain is advancing and to estimate fees before sending a transaction. One small JSON read instead of several raw RPC calls and unit conversions."
+    },
+    {
+      "path": "/rwa/exitability",
+      "method": "GET",
+      "price_usdc": "5.000",
+      "amount_atomic": "5000000",
+      "query_params": [
+        "asset"
+      ],
+      "description": "RWA Exitability Check: for one tokenized real-world asset (JAAA, USYC or mWIN), the reported transfer and eligibility status, NAV freshness, redemption path and timing, announced instant redemption capacity and pause or freeze status, each with its public source URL and retrieval time, plus a coverage-based confidence. Fields without a cited source are returned as not_disclosed. Use it to see what is publicly stated about exiting a position before acting. Deterministic lookup over a versioned dataset; not a liquidity guarantee and not investment advice. Query: ?asset=JAAA"
     }
   ]
 }

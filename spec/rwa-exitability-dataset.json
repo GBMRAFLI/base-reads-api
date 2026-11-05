@@ -1,0 +1,213 @@
+{
+ "version": "rwa-exitability-dataset/1",
+ "dataset_revision": 3,
+ "generated_at": "2026-11-05T05:51:39Z",
+ "assets": {
+  "JAAA": {
+   "fields": {
+    "transfer_eligibility": {
+     "value": {
+      "model": "FullRestrictions allowlist",
+      "holder": true,
+      "recipient": true,
+      "liquidator": true,
+      "eligibility": "Non-US Professional Investors",
+      "min_usd": 500000
+     },
+     "source_url": "https://app.centrifuge.io/pool/281474976710663",
+     "retrieved_at": "2026-11-05T05:36:35Z"
+    },
+    "nav_freshness": {
+     "value": {
+      "implied_nav_usdc": 1.05536,
+      "arm_priceLastUpdated_utc": "2026-11-03T12:00:00Z",
+      "nav_feed_updatedAt_utc": "2026-11-04T13:26:35Z",
+      "interval": "daily business-day typical"
+     },
+     "source_url": "https://etherscan.io/address/0xF48256AbDDf96EcDDc4B3DbD23E8C1921f9761Ae",
+     "retrieved_at": "2026-11-05T05:36:35Z",
+     "onchain": {
+      "chain": "ethereum",
+      "address": "0xF48256AbDDf96EcDDc4B3DbD23E8C1921f9761Ae",
+      "function": "priceLastUpdated(address)/convertToAssets(address,uint256)",
+      "block": 26346579
+     }
+    },
+    "redemption_path": {
+     "value": "Async ERC-7540: requestRedeem via AsyncVault → pool manager batch fulfill → withdraw USDC",
+     "source_url": "https://app.centrifuge.io/pool/281474976710663",
+     "retrieved_at": "2026-11-05T05:36:35Z"
+    },
+    "redemption_timing": {
+     "value": {
+      "ui_cutoff": "T+0 by 10:00 ET; T+1 by 15:00 ET",
+      "settlement_evidence": {
+       "orders": 93,
+       "usd": 717300000,
+       "T0": 63,
+       "T1": 28,
+       "T2": 2,
+       "T3plus": 0,
+       "period": "2025-10-10..2026-10-05"
+      }
+     },
+     "source_url": "https://governance.aave.com/t/risk-stewards-jaaa-reserve-parameter-update-on-aave-v3-horizon-2026-10-15/25854",
+     "retrieved_at": "2026-11-05T05:36:35Z"
+    },
+    "pause_freeze": {
+     "value": {
+      "root_paused": false,
+      "who": "ProtocolGuardian / 4-of-9 Safe; per-user freeze via FullRestrictions",
+      "user_freeze_possible": true
+     },
+     "source_url": "https://etherscan.io/address/0x7Ed48C31f2fdC40d37407cBaBf0870B2b688368f",
+     "retrieved_at": "2026-11-05T05:36:35Z",
+     "onchain": {
+      "chain": "ethereum",
+      "address": "0x7Ed48C31f2fdC40d37407cBaBf0870B2b688368f",
+      "function": "paused()",
+      "block": 26346579
+     }
+    }
+   }
+  },
+  "USYC": {
+   "fields": {
+    "transfer_eligibility": {
+     "value": {
+      "model": "Entitlements allowlist + roles",
+      "holder": true,
+      "recipient": true,
+      "liquidator": null,
+      "eligibility": "Non-U.S. Persons; KYC/AML; OFAC via Chainalysis",
+      "min_usd": 100000,
+      "entitlements_contract": "0x902D906b8d988092213bE799B18Bd2cbd64F808C"
+     },
+     "source_url": "https://usyc.docs.hashnote.com/overview/product-structuring",
+     "retrieved_at": "2026-11-05T05:36:35Z"
+    },
+    "nav_freshness": {
+     "value": {
+      "price": 1.14254497,
+      "updatedAt_utc": "2026-11-04T13:58:59Z",
+      "interval": "once per business day ~9am ET"
+     },
+     "source_url": "https://etherscan.io/address/0x74f2199AEb743f68f05943e5715A33EaF2b61f53",
+     "retrieved_at": "2026-11-05T05:36:35Z",
+     "onchain": {
+      "chain": "ethereum",
+      "address": "0x74f2199AEb743f68f05943e5715A33EaF2b61f53",
+      "function": "latestRoundData()",
+      "block": 26346579
+     }
+    },
+    "redemption_path": {
+     "value": "USYC Teller burns USYC for USDC 24/7; optional Private Liquidity Teller for up to 100% instant liquidity",
+     "source_url": "https://usyc.docs.hashnote.com/overview/subscription-and-redemption",
+     "retrieved_at": "2026-11-05T05:36:35Z"
+    },
+    "redemption_timing": {
+     "value": {
+      "below_instant_capacity": "1 block",
+      "above_instant_capacity": "T+0 or T+1",
+      "subscription_after_hours": "after 2pm ET → next BD"
+     },
+     "source_url": "https://www.circle.com/usyc",
+     "retrieved_at": "2026-11-05T05:36:35Z"
+    },
+    "pause_freeze": {
+     "value": {
+      "entitlements_paused": false,
+      "mechanism": "Entitlements System Halt can freeze all USYC transactions",
+      "contract": "0x902D906b8d988092213bE799B18Bd2cbd64F808C",
+      "label": "USYC Entitlements"
+     },
+     "source_url": "https://etherscan.io/address/0x902D906b8d988092213bE799B18Bd2cbd64F808C",
+     "retrieved_at": "2026-11-05T05:36:35Z",
+     "onchain": {
+      "chain": "ethereum",
+      "address": "0x902D906b8d988092213bE799B18Bd2cbd64F808C",
+      "function": "paused()",
+      "block": 26346579
+     }
+    }
+   }
+  },
+  "mWIN": {
+   "fields": {
+    "transfer_eligibility": {
+     "value": {
+      "model": "mWIN-specific greenlist at token level",
+      "holder": true,
+      "recipient": true,
+      "liquidator": null,
+      "eligibility": "Non-U.S. Persons; restricted jurisdictions per Midas"
+     },
+     "source_url": "https://docs.midas.app/legal/eligibility-and-compliance.md",
+     "retrieved_at": "2026-11-05T05:36:35Z"
+    },
+    "nav_freshness": {
+     "value": {
+      "price_usd_per_mwin": 131790.67761499,
+      "updatedAt_utc": "2026-11-04T09:30:47Z",
+      "interval": "daily business-day operational"
+     },
+     "source_url": "https://etherscan.io/address/0x1725A66D810C0775f6B3B0FD85646D371dA19517",
+     "retrieved_at": "2026-11-05T05:36:35Z",
+     "onchain": {
+      "chain": "ethereum",
+      "address": "0x1725A66D810C0775f6B3B0FD85646D371dA19517",
+      "function": "latestRoundData()",
+      "block": 26346579
+     }
+    },
+    "redemption_path": {
+     "value": "Standard (0 bps) or Instant (0.50% fee) via Open Liquidity Architecture; sleeve → MSL → external MM",
+     "source_url": "https://docs.midas.app/liquidity-and-composability/open-liquidity-architecture",
+     "retrieved_at": "2026-11-05T05:36:35Z"
+    },
+    "redemption_timing": {
+     "value": {
+      "standard": "typically T+1/T+2 (Midas blog); Vault Street 1pm Lux cutoff, pay ≤2 BD after Underlying Asset Receipt",
+      "instant": "atomic / subject to capacity"
+     },
+     "source_url": "https://blog.midas.app/mwin-a-home-for-treasury-runway/",
+     "retrieved_at": "2026-11-05T05:36:35Z"
+    },
+    "instant_capacity": {
+     "value": {
+      "onchain_rv_instantDailyLimit_tokens": 17,
+      "onchain_rvi_instantDailyLimit_tokens": 4,
+      "implied_usd_at_nav_rv": 2240441.52,
+      "implied_usd_at_nav_rvi": 527162.71,
+      "vault_street_msl_usd_secondary": 10000000,
+      "instant_fee_bps": 50
+     },
+     "source_url": "https://etherscan.io/address/0x605704d7b36d1677a8d242ded68eD505523c7924",
+     "retrieved_at": "2026-11-05T05:36:35Z",
+     "onchain": {
+      "chain": "ethereum",
+      "address": "0x605704d7b36d1677a8d242ded68eD505523c7924",
+      "function": "instantDailyLimit()/instantFee()",
+      "block": 26346579
+     }
+    },
+    "pause_freeze": {
+     "value": {
+      "paused": false,
+      "policy": "Midas may pause deposits/redemptions on disruption/security/depeg/uncertain NAV; per-user pause possible",
+      "who": "vault/pauser roles"
+     },
+     "source_url": "https://etherscan.io/address/0x4E72025984424E52838cf8953E2863eFf036B67A",
+     "retrieved_at": "2026-11-05T05:36:35Z",
+     "onchain": {
+      "chain": "ethereum",
+      "address": "0x4E72025984424E52838cf8953E2863eFf036B67A",
+      "function": "paused()",
+      "block": 26346579
+     }
+    }
+   }
+  }
+ }
+}

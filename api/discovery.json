@@ -151,5 +151,57 @@
    "base_fee_gwei": 0.005,
    "gas_price_gwei": 0.006
   }
+ },
+ "/rwa/exitability": {
+  "params": {
+   "asset": {
+    "type": "string",
+    "enum": [
+     "JAAA",
+     "USYC",
+     "mWIN"
+    ],
+    "description": "Asset symbol: JAAA, USYC or mWIN (matched case-insensitively)"
+   }
+  },
+  "required": [
+   "asset"
+  ],
+  "output": {
+   "schema": "rwa-exitability/v1",
+   "asset": "JAAA",
+   "checked_at": "2026-11-05T00:00:00Z",
+   "dataset": {
+    "version": "rwa-exitability-dataset/1",
+    "revision": 1,
+    "generated_at": "2026-11-05T00:00:00Z"
+   },
+   "fields": {
+    "transfer_eligibility": "not_disclosed",
+    "nav_freshness": "not_disclosed",
+    "redemption_path": "example value (synthetic)",
+    "redemption_timing": "not_disclosed",
+    "instant_capacity": "not_disclosed",
+    "pause_freeze": "not_disclosed"
+   },
+   "sources": {
+    "transfer_eligibility": "not_disclosed",
+    "nav_freshness": "not_disclosed",
+    "redemption_path": {
+     "url": "https://issuer.example/redemption",
+     "retrieved_at": "2026-11-04T00:00:00Z"
+    },
+    "redemption_timing": "not_disclosed",
+    "instant_capacity": "not_disclosed",
+    "pause_freeze": "not_disclosed"
+   },
+   "confidence": {
+    "level": "low",
+    "disclosed_fields": 1,
+    "total_fields": 6,
+    "basis": "share of fields with a cited public source; not a quality or risk rating"
+   },
+   "disclaimer": "Reported facts from cited public sources at the stated retrieval times. Not a liquidity guarantee, not a redemption promise, and not investment advice. Fields marked not_disclosed had no cited source in this dataset revision."
+  }
  }
 }
