@@ -13,6 +13,7 @@ Pay-per-call Base mainnet reads and signed pre-payment checks for x402 endpoints
 | `/base/network` | $0.001 | block, block age, base fee, gas price |
 | `/base/address-intel?address=0x…` | $0.010 | USDC+ETH, verified Basename, tx count, is_contract |
 | `/x402/preflight?url=https://…` | $0.010 | Pre-pay Check: Ed25519-signed facts about another x402 endpoint |
+| `/rwa/exitability?asset=JAAA` | $5.000 | RWA Exitability Check: cited public facts on transfer, NAV freshness, redemption and pause status for JAAA, USYC or mWIN ([schema](docs/rwa-exitability.md)) |
 
 Unpaid requests return `402` with a `PAYMENT-REQUIRED` header (x402 v2, with Bazaar discovery metadata).
 Invalid input or upstream errors are never settled, so you are not charged for them. A paid response is returned only

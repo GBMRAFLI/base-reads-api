@@ -12,7 +12,7 @@ const rpc = (async (m: string) => m === "eth_getBlockByNumber" ? { number: "0x10
 
 Deno.test("prices: address-intel and preflight 0.010 USDC, others unchanged", () => {
   assertEquals(Object.fromEntries(Object.entries(ROUTES).map(([k, v]) => [k, v[0]])),
-    { "/base/usdc-balance": 1000, "/base/tx-status": 2000, "/base/basename": 3000, "/base/address-intel": 10000, "/x402/preflight": 10000, "/base/network": 1000 });
+    { "/base/usdc-balance": 1000, "/base/tx-status": 2000, "/base/basename": 3000, "/base/address-intel": 10000, "/x402/preflight": 10000, "/base/network": 1000, "/rwa/exitability": 5000000 });
 });
 Deno.test("related_routes on /base/network and /base/usdc-balance only, path and price only", async () => {
   const c = new Chain(rpc, USDC);

@@ -1,0 +1,10 @@
+{
+ "version": "rwa-exitability-dataset/1",
+ "dataset_revision": 1,
+ "generated_at": "2026-11-05T05:40:00Z",
+ "assets": {
+  "JAAA": { "fields": {} },
+  "USYC": { "fields": {} },
+  "mWIN": { "fields": {} }
+ }
+}

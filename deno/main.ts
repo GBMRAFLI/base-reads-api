@@ -4,6 +4,7 @@ import { pyDumps } from "./lib/canonical.ts";
 import { Chain, makeRpc, type Rpc } from "./lib/chain.ts";
 import { preflight, type Fetcher, type Resolver } from "./lib/preflight.ts";
 import { PAY_TO_DEFAULT, ROUTES } from "./lib/routes.ts";
+import { RWA_PATH, rwaHandle, rwaInputError } from "./lib/rwa.ts";
 import DISCOVERY from "./lib/discovery.json" with { type: "json" };
 import { CDP_HOST, enabled as cdpEnabled, headers as cdpHeaders } from "./lib/cdp_auth.ts";
 import * as SG from "./lib/settle_guard.ts";
@@ -388,6 +389,9 @@ async function handleGet(req: Request, d: Deps): Promise<Response> {
       return { release: back };
     };
     const UNPAID429 = () => send(429, { error: "too many unpaid requests, retry later", scope: "ip" }, { "Retry-After": "60" });
+    // Unknown asset on the RWA route: pure dataset lookup, answered 400 before any challenge (counted as unpaid traffic).
+    const rwaErr = path === RWA_PATH ? rwaInputError(q) : null;
+    if (rwaErr) { if (!unpaidOk(true)) return UNPAID429(); return send(400, { error: rwaErr }); }
     const tk = req.headers.get(TRIAL_HEADER);
     if (tk) {
       const label = await resolveTrial(tk, env);
@@ -440,7 +444,7 @@ async function trialServe(path: string, q: Record<string, string>, label: string
     } else {
       if (!await takeQuota(label, dailyLimit(env), Date.now())) return null;
       took = true;
-      [code, out] = await new Chain(rpc, c.USDC).handle(path, q);
+      [code, out] = path === RWA_PATH ? rwaHandle(q) : await new Chain(rpc, c.USDC).handle(path, q);
     }
   } catch (e) {
     if (e instanceof SigningUnavailable) return [503, { error: "signing unavailable" }, took];
@@ -559,6 +563,7 @@ async function paid(path: string, q: Record<string, string>, qs: string, sig: st
   };
   const run = async (): Promise<[number, unknown]> => {
     if (path === "/x402/preflight") return await runPreflight(unquote(q.url ?? ""));
+    if (path === RWA_PATH) return rwaHandle(q);
     return await new Chain(rpc, c.USDC).handle(path, q);
   };
   /** Probe slot: one synchronous reservation bound to payer + payment nonce + target, 15 s TTL, one per payer. */

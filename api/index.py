@@ -4,6 +4,7 @@ import calendar, json, os, re, base64, time, urllib.request, urllib.parse, sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import preflight as PF, attestation as AT
 import sales_log as MS, cdp_auth, settle_guard as SG
+import rwa as RWA
 iso = lambda t: time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(t)) + ".%03dZ" % int((t % 1) * 1000)
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from Crypto.Hash import keccak as _k
@@ -25,6 +26,7 @@ ROUTES = {
  "/base/address-intel": (10000, "One call for an address on Base: USDC balance, ETH balance, verified primary Basename, transaction count (nonce) and whether it is a contract. Use it to profile a counterparty or payout wallet before interacting. Replaces four or five separate reads with a single priced request. Query: ?address=0x...", {"address": "0x2211d1d0020daea8039e46cf1367962070d77da9"}),
  "/x402/preflight": (10000, "Pre-pay Check: Ed25519-signed, deterministic facts about another x402 endpoint before you pay it: challenge validity, reachability and latency, host listing count, payout wallet reuse across hosts, last-called and payer trend from daily Bazaar snapshots. Use it when choosing between paid endpoints. Signed facts you can verify against the published key, not ratings; facts only, no advice. Query: ?url=https://...", {"url": "https://x402.org/protected"}),
  "/base/network": (1000, "Base mainnet head: latest block number, block age in seconds, base fee and gas price in gwei. Use it to check the chain is advancing and to estimate fees before sending a transaction. One small JSON read instead of several raw RPC calls and unit conversions.", {}),
+ "/rwa/exitability": (5000000, "RWA Exitability Check: for one tokenized real-world asset (JAAA, USYC or mWIN), the reported transfer and eligibility status, NAV freshness, redemption path and timing, announced instant redemption capacity and pause or freeze status, each with its public source URL and retrieval time, plus a coverage-based confidence. Fields without a cited source are returned as not_disclosed. Use it to see what is publicly stated about exiting a position before acting. Deterministic lookup over a versioned dataset; not a liquidity guarantee and not investment advice. Query: ?asset=JAAA", {"asset": "JAAA"}),
 }
 def rpc(m, p):
     r = urllib.request.Request(RPC, json.dumps({"jsonrpc": "2.0", "id": 1, "method": m, "params": p}).encode(), {"Content-Type": "application/json", "User-Agent": "base-reads/1.0"})
@@ -91,6 +93,7 @@ def handle(path, q):
             fn = namehash(nm); fr = resolver(fn)
             if not int(fr, 16) or ("0x" + call(fr, "0x3b3b57de" + fn.hex())[-40:]).lower() != a.lower(): nm = None
         return 200, {"address": a, "primary_basename": nm}
+    if path == "/rwa/exitability": return RWA.handle(q)
     if path == "/base/network":
         b = rpc("eth_getBlockByNumber", ["latest", False])
         return 200, {"chain": "base", "chain_id": 8453, "block": int(b["number"], 16), "block_age_s": max(0, int(time.time()) - int(b["timestamp"], 16)), "base_fee_gwei": int(b.get("baseFeePerGas", "0x0"), 16) / 1e9, "gas_price_gwei": int(rpc("eth_gasPrice", []), 16) / 1e9, "related_routes": related(path)}
@@ -145,7 +148,7 @@ REPO_URL = os.environ.get("REPO_URL", "https://github.com/GBMRAFLI/base-reads-ap
 def root():
     return {"service": "Base Reads", "network": NETWORK, "protocol": "x402 v2", "facilitator": facilitator_info(),
             "free": ["/llms.txt", "/openapi.json", "/.well-known/402index-verify.txt", "/.well-known/x402-preflight", "/.well-known/x402-preflight-key-history.json", "/.well-known/issuer.json", "/.well-known/prepay-check-attestation-v1.schema.json", "/.well-known/bazaar-snapshot.json", "/x402/preflight/pubkey", "/bazaar/snapshots"],
-            "routes": {k: {"price_usdc": v[0] / 1e6, "description": v[1]} for k, v in ROUTES.items()}}
+            "routes": {k: {"price_usdc": v[0] // 10**6 if v[0] % 10**6 == 0 else v[0] / 1e6, "description": v[1]} for k, v in ROUTES.items()}}  # whole-dollar prices as int (same JSON as the Deno port)
 REF_RE = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
 def clean_ref(qs):
     """Optional ?ref= attribution tag: logged with paid calls only, never part of the price, challenge or requirements.
@@ -435,6 +438,7 @@ class handler(BaseHTTPRequestHandler):
         if path == "/x402/preflight" and not ADDR.match(PAY_TO): return s._send(503, {"error": "payee not configured"})
         t_req = iso(time.time())
         sig = s.headers.get("PAYMENT-SIGNATURE") or s.headers.get("X-PAYMENT")
+        if not sig and path == "/rwa/exitability" and RWA.input_error(q): return s._send(400, {"error": RWA.input_error(q)})  # pure lookup, before the 402
         if not sig: pr = required(path, s.headers.get("Host", "")); return s._send(402, pr, {"PAYMENT-REQUIRED": b64(pr)})
         _REQ.ua = s.headers.get("User-Agent")
         code, out, hd = paid(path, q, qs, sig, t_req, ip=s.client_address[0])
